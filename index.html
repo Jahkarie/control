@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>J'Ouvertween by Chattabox</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;800;900&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Montserrat', -apple-system, BlinkMacSystemFont, sans-serif;
+      background-color: #ffffff;
+      color: #111111;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+      padding: 20px 15px;
+    }
+    .container {
+      width: 100%;
+      max-width: 420px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+    }
+    .sponsor-bar {
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 1px;
+      color: #000000;
+      margin-bottom: 25px;
+      word-spacing: 8px;
+    }
+    .title-banner {
+      color: #8c52ff;
+      font-size: 32px;
+      font-weight: 900;
+      line-height: 0.95;
+      text-transform: uppercase;
+      margin-bottom: 35px;
+      letter-spacing: -0.5px;
+    }
+    .title-banner span {
+      display: block;
+      font-size: 18px;
+      font-weight: 800;
+      color: #8c52ff;
+      margin-top: 2px;
+    }
+    .btn-black {
+      background-color: #000000;
+      color: #ffffff;
+      font-size: 15px;
+      font-weight: 800;
+      border: none;
+      padding: 16px 32px;
+      border-radius: 30px;
+      width: 100%;
+      cursor: pointer;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 30px;
+    }
+    .discount-label {
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.5px;
+      margin-bottom: 12px;
+      text-transform: uppercase;
+    }
+    .input-code {
+      width: 100%;
+      border: 2px solid #000000;
+      border-radius: 25px;
+      padding: 12px 20px;
+      font-size: 14px;
+      text-align: center;
+      margin-bottom: 14px;
+      outline: none;
+      font-family: inherit;
+    }
+    .btn-apply {
+      background-color: #000000;
+      color: #ffffff;
+      font-size: 13px;
+      font-weight: 800;
+      border: none;
+      padding: 10px 28px;
+      border-radius: 20px;
+      cursor: pointer;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+    .subtext {
+      font-size: 12px;
+      color: #555555;
+      font-weight: 500;
+    }
+    .status-check {
+      font-weight: 800;
+      font-size: 15px;
+      margin-top: 15px;
+    }
+    .status-sub {
+      font-size: 13px;
+      color: #333333;
+      margin-top: 4px;
+      margin-bottom: 25px;
+    }
+    .form-group {
+      width: 100%;
+      text-align: left;
+      margin-bottom: 18px;
+    }
+    .form-label {
+      font-size: 13px;
+      font-weight: 700;
+      margin-bottom: 8px;
+      display: block;
+    }
+    .text-input, .textarea-input {
+      width: 100%;
+      border: 1px solid #cccccc;
+      border-radius: 8px;
+      padding: 12px 14px;
+      font-size: 14px;
+      font-family: inherit;
+      outline: none;
+    }
+    .textarea-input { height: 90px; resize: none; }
+    .btn-send-blue {
+      background-color: #4a7bb0;
+      color: #ffffff;
+      border: none;
+      padding: 12px 20px;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .invite-counter {
+      font-size: 13px;
+      font-style: italic;
+      color: #333333;
+      margin-left: 10px;
+    }
+    .size-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+      width: 100%;
+      margin: 20px 0;
+    }
+    .size-btn {
+      border: 2px solid #000000;
+      background: #fff;
+      padding: 12px;
+      border-radius: 8px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    .size-btn.active {
+      background: #000000;
+      color: #fff;
+    }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <div class="sponsor-bar">Carib &nbsp; Tortillaz &nbsp; Western Union &nbsp; Brydens &nbsp; Brew</div>
+    <div class="title-banner">J'OUVERTWEEN<span>BY CHATTABOX.</span></div>
+
+    <!-- VIEW 1: GATEWAY / VERIFY -->
+    <div id="view-gateway" style="width: 100%;">
+      <div class="form-group">
+        <label class="form-label" style="text-align: center;">Enter Invited E-mail Address</label>
+        <input type="email" id="email-entry" class="input-code" placeholder="yourname@gmail.com" />
+      </div>
+      <button class="btn-black" onclick="checkGuestStatus()">Access Invitation</button>
+      
+      <div style="margin-top: 20px;">
+        <div class="discount-label">HAVE A DISCOUNT OR COMP CODE ?</div>
+        <input type="text" class="input-code" placeholder="ENTER CODE" />
+        <button class="btn-apply">APPLY</button>
+        <div class="subtext">Discount Status</div>
+      </div>
+    </div>
+
+    <!-- VIEW 2: SELECT SHIRT SIZE -->
+    <div id="view-select-size" class="hidden" style="width: 100%;">
+      <p style="font-weight: 700; font-size: 15px;">Select Your Tee Shirt Size:</p>
+      <div class="size-grid">
+        <button class="size-btn" onclick="selectSize('XS')">XS</button>
+        <button class="size-btn" onclick="selectSize('S')">S</button>
+        <button class="size-btn" onclick="selectSize('M')">M</button>
+        <button class="size-btn" onclick="selectSize('L')">L</button>
+        <button class="size-btn" onclick="selectSize('XL')">XL</button>
+        <button class="size-btn" onclick="selectSize('XXL')">XXL</button>
+      </div>
+      <button class="btn-black" onclick="confirmPackage()">SECURE MY PACKAGE</button>
+    </div>
+
+    <!-- VIEW 3: REGISTRATION APPROVED & INVITE FRIENDS -->
+    <div id="view-approved" class="hidden" style="width: 100%;">
+      <div class="status-check">REGISTRATION APPROVED &#10003;</div>
+      <div class="status-sub">Your registration has been approved.</div>
+
+      <div class="status-check">PACKAGE SELECTED &#10003;</div>
+      <div class="status-sub">You selected a <span id="confirmed-size">XS</span> Tee Shirt.<br>This selection cannot be changed.</div>
+
+      <div class="form-group" style="margin-top: 25px;">
+        <label class="form-label">Your friend's e-mail address *</label>
+        <input type="email" id="friend-email" class="text-input" />
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Add a note to this invitation (optional)</label>
+        <textarea id="invite-note" class="textarea-input"></textarea>
+      </div>
+
+      <div style="display: flex; align-items: center; justify-content: flex-start; width: 100%; margin-top: 10px;">
+        <button class="btn-send-blue" onclick="sendFriendInvite()">Send Invitation</button>
+        <span class="invite-counter"><span id="remaining-count">2</span> invitation(s) remaining.</span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const API_BASE = "https://control-1-0baa.onrender.com";
+    let currentGuestEmail = "";
+    let selectedSize = "";
+
+    // Check URL parameters for auto-email entry
+    window.addEventListener('DOMContentLoaded', () => {
+      const urlParams = new URLSearchParams(window.location.search);
+      const emailParam = urlParams.get('email');
+      if (emailParam) {
+        document.getElementById('email-entry').value = emailParam;
+        checkGuestStatus();
+      }
+    });
+
+    async function checkGuestStatus() {
+      const email = document.getElementById('email-entry').value.trim();
+      if (!email) return alert("Please enter your email address.");
+
+      try {
+        const res = await fetch(`${API_BASE}/api/guest-status?email=${encodeURIComponent(email)}`);
+        const data = await res.json();
+
+        if (!res.ok || !data.authorized) {
+          return alert("This email has not been invited yet.");
+        }
+
+        currentGuestEmail = email;
+        if (data.guest.status === 'APPROVED') {
+          showApprovedView(data.guest.shirt_size, data.guest.invites_remaining);
+        } else {
+          document.getElementById('view-gateway').classList.add('hidden');
+          document.getElementById('view-select-size').classList.remove('hidden');
+        }
+      } catch (err) {
+        alert("Failed to connect to backend server.");
+      }
+    }
+
+    function selectSize(size) {
+      selectedSize = size;
+      document.querySelectorAll('.size-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.innerText === size);
+      });
+    }
+
+    async function confirmPackage() {
+      if (!selectedSize) return alert("Please select a T-Shirt size.");
+
+      try {
+        const res = await fetch(`${API_BASE}/api/secure-package`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: currentGuestEmail, shirtSize: selectedSize })
+        });
+        const data = await res.json();
+        if (data.success) {
+          showApprovedView(data.guest.shirt_size, data.guest.invites_remaining);
+        }
+      } catch (err) {
+        alert("Error saving your selection.");
+      }
+    }
+
+    function showApprovedView(size, remaining) {
+      document.getElementById('confirmed-size').innerText = size || 'XS';
+      document.getElementById('remaining-count').innerText = remaining;
+      document.getElementById('view-gateway').classList.add('hidden');
+      document.getElementById('view-select-size').classList.add('hidden');
+      document.getElementById('view-approved').classList.remove('hidden');
+    }
+
+    async function sendFriendInvite() {
+      const friendEmail = document.getElementById('friend-email').value.trim();
+      const note = document.getElementById('invite-note').value.trim();
+
+      if (!friendEmail) return alert("Please enter your friend's email address.");
+
+      try {
+        const res = await fetch(`${API_BASE}/api/send-invite`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ inviterEmail: currentGuestEmail, friendEmail, note })
+        });
+        const data = await res.json();
+
+        if (data.success) {
+          alert(`Invitation sent to ${friendEmail}!`);
+          document.getElementById('remaining-count').innerText = data.remaining;
+          document.getElementById('friend-email').value = "";
+          document.getElementById('invite-note').value = "";
+        } else {
+          alert(data.error || "Could not send invitation.");
+        }
+      } catch (err) {
+        alert("Failed to send invitation.");
+      }
+    }
+  </script>
+</body>
+</html>
