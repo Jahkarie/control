@@ -1,6 +1,6 @@
-const express = require('express');
-const cors = require('cors');
-const nodemailer = require('nodemailer');
+import express from 'express';
+import cors from 'cors';
+import nodemailer from 'nodemailer';
 
 const app = express();
 
@@ -18,7 +18,7 @@ const transporter = nodemailer.createTransport({
   }
 });
 
-// Database placeholder (In-memory storage or replace with DB query)
+// Database placeholder
 let guests = [
   { email: 'test@example.com', status: 'PENDING', shirt_size: null, invites_remaining: 2 }
 ];
@@ -37,13 +37,10 @@ const generateInviteEmail = (inviteUrl, note = '') => {
       <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: #030407; padding: 40px 10px;">
         <tr>
           <td align="center">
-            
             <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width: 500px; background-color: #0b0e17; border: 1px solid rgba(0, 240, 255, 0.2); border-radius: 20px; overflow: hidden; box-shadow: 0 20px 50px rgba(0,0,0,0.8);">
-              
               <tr>
                 <td style="height: 4px; background: linear-gradient(90deg, #00f0ff 0%, #7000ff 100%);"></td>
               </tr>
-
               <tr>
                 <td style="padding: 40px 30px 20px 30px; text-align: center;">
                   <p style="margin: 0 0 8px 0; font-size: 11px; font-weight: 800; letter-spacing: 3px; color: #838a9e; text-transform: uppercase;">
@@ -54,20 +51,17 @@ const generateInviteEmail = (inviteUrl, note = '') => {
                   </h1>
                 </td>
               </tr>
-
               <tr>
                 <td style="padding: 0 30px 30px 30px; text-align: center;">
                   <p style="margin: 0 0 24px 0; font-size: 15px; line-height: 1.6; color: #a1a8bd;">
                     You have been issued clearance for <strong style="color: #ffffff;">CONTROL</strong>. Confirm your access pass and secure your package below.
                   </p>
-
                   ${note ? `
                   <div style="background-color: rgba(255, 255, 255, 0.04); border-left: 3px solid #00f0ff; border-radius: 8px; padding: 16px; margin-bottom: 28px; text-align: left;">
                     <p style="margin: 0 0 4px 0; font-size: 10px; font-weight: 700; color: #00f0ff; letter-spacing: 1.5px; text-transform: uppercase;">Message attached:</p>
                     <p style="margin: 0; font-size: 14px; color: #ffffff; font-style: italic;">"${note}"</p>
                   </div>
                   ` : ''}
-
                   <table role="presentation" border="0" cellspacing="0" cellpadding="0" style="margin: 0 auto;">
                     <tr>
                       <td align="center" style="border-radius: 12px; background: #00f0ff;">
@@ -77,14 +71,12 @@ const generateInviteEmail = (inviteUrl, note = '') => {
                       </td>
                     </tr>
                   </table>
-
                   <p style="margin: 28px 0 0 0; font-size: 12px; color: #5a6072;">
                     If the button doesn't work, copy and paste this link:<br>
                     <a href="${inviteUrl}" style="color: #00f0ff; text-decoration: underline; word-break: break-all;">${inviteUrl}</a>
                   </p>
                 </td>
               </tr>
-
               <tr>
                 <td style="padding: 20px; background-color: #06080f; text-align: center; border-top: 1px solid rgba(255, 255, 255, 0.05);">
                   <p style="margin: 0; font-size: 11px; color: #434857; letter-spacing: 1px; text-transform: uppercase;">
@@ -92,9 +84,7 @@ const generateInviteEmail = (inviteUrl, note = '') => {
                   </p>
                 </td>
               </tr>
-
             </table>
-
           </td>
         </tr>
       </table>
@@ -130,7 +120,7 @@ app.post('/api/secure-package', (req, res) => {
   res.json({ success: true, guest });
 });
 
-// 3. Dispatch invitation email with CASHCXDE design
+// 3. Dispatch invitation email
 app.post('/api/send-invite', async (req, res) => {
   const { inviterEmail, friendEmail, note } = req.body;
   const inviter = guests.find(g => g.email.toLowerCase() === (inviterEmail || '').toLowerCase());
@@ -167,7 +157,7 @@ app.post('/api/send-invite', async (req, res) => {
   }
 });
 
-// 4. Admin Command Center Interface
+// 4. Admin Command Center
 app.get('/admin', (req, res) => {
   const guestRows = guests.map((g, index) => `
     <tr>
@@ -317,7 +307,7 @@ app.get('/admin', (req, res) => {
   `);
 });
 
-// 5. Admin Add-Guest Action Route
+// 5. Admin Add Guest
 app.post('/admin/add-guest', (req, res) => {
   const email = (req.body.email || '').toLowerCase().trim();
   if (email && !guests.some(g => g.email.toLowerCase() === email)) {
