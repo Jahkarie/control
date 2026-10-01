@@ -122,6 +122,23 @@ app.post('/api/send-invite', async (req, res) => {
     res.status(500).json({ error: 'Failed to process invitation' });
   }
 });
-
+// Endpoint 4: Easy Browser Seed (Add initial guest without SQL)
+app.get('/api/seed', async (req, res) => {
+  const { email } = req.query;
+  if (!email) return res.status(400).send('Please provide an email. Example: /api/seed?email=yourname@gmail.com');
+  
+  try {
+    await pool.query(
+      `INSERT INTO guests (email, status, invites_remaining) 
+       VALUES (LOWER($1), 'INVITED', 2) 
+       ON CONFLICT (email) DO NOTHING`,
+      [email]
+    );
+    res.send(`Success! ${email} has been added as an invited guest.`);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Database error.');
+  }
+});
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
