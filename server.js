@@ -17,7 +17,7 @@ const pool = new Pool({
   user: process.env.DB_USER || 'postgres',
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME || 'postgres',
-  port: 5432,
+  port: 25432,
   ssl: { rejectUnauthorized: false }
 });
 
