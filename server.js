@@ -11,14 +11,18 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Database Connection (Google Cloud SQL PostgreSQL)
+// Database Connection (AIVEN)
+const { Pool } = require('pg');
+
 const pool = new Pool({
-  host: process.env.DB_HOST, // Google Cloud SQL Public IP
-  user: process.env.DB_USER || 'postgres',
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER || 'avnadmin',
   password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME || 'postgres',
-  port: 20403,
-  ssl: { rejectUnauthorized: false }
+  database: process.env.DB_NAME || 'defaultdb',
+  port: parseInt(process.env.DB_PORT || '25432', 10),
+  ssl: {
+    rejectUnauthorized: false // REQUIRED for Aiven
+  }
 });
 
 // Auto-initialize tables
