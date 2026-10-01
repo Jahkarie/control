@@ -88,33 +88,91 @@ app.post('/api/send-invite', async (req, res) => {
     );
 
     // Trigger Email via Resend
-    const inviteLink = `${process.env.FRONTEND_URL || 'https://your-frontend.onrender.com'}?email=${encodeURIComponent(friendEmail)}`;
-    
-    await resend.emails.send({
-      from: "J'Ouvertween <onboarding@resend.dev>",
-      to: [friendEmail],
-      subject: "You have been invited to J'Ouvertween by Chattabox",
-      html: `
-        <div style="background-color: #2b501e; color: #ffffff; padding: 30px; font-family: sans-serif; text-align: center;">
-          <h2 style="text-transform: uppercase;">YOU'VE BEEN INVITED TO J'OUVERTWEEN</h2>
-          <p><strong>${inviterEmail}</strong> chose you as one of their two J'Ouvertween invites.</p>
-          <p>Your personal invitation gives you access to register for J'Ouvertween by Chattabox.</p>
-          <p>Once you accept your invitation, you'll receive <strong>two invitations of your own</strong> to extend to the people you want beside you.</p>
-          ${note ? `<p style="font-style: italic; margin: 20px 0;">"${note}"</p>` : ''}
-          <div style="margin: 30px 0;">
-            <a href="${inviteLink}" style="background-color: #000000; color: #ffffff; padding: 14px 28px; text-decoration: none; border-radius: 25px; font-weight: bold; display: inline-block;">
-              ME A COME!
-            </a>
-            <br>
-            <small style="display: block; margin-top: 8px;">(Accept your invitation)</small>
-          </div>
-          <p style="font-size: 11px; opacity: 0.8; margin-top: 40px;">
-            INVITES ARE NOT TRANSFERRABLE & ARE SINGLE USE.<br>
-            REGISTRATION WILL ONLY BE APPROVED FOR THE PERSON INVITED.
-          </p>
-        </div>
-      `
-    });
+const generateInviteEmail = (guestEmail, inviteUrl, note = '') => {
+  return `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>CONTROL Access Granted</title>
+    </head>
+    <body style="margin: 0; padding: 0; background-color: #030407; font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; color: #ffffff;">
+      <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: #030407; padding: 40px 10px;">
+        <tr>
+          <td align="center">
+            
+            <!-- MAIN CARD CONTAINER -->
+            <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width: 500px; background-color: #0b0e17; border: 1px solid rgba(0, 240, 255, 0.2); border-radius: 20px; overflow: hidden; box-shadow: 0 20px 50px rgba(0,0,0,0.8);">
+              
+              <!-- TOP GLOW BAR -->
+              <tr>
+                <td style="height: 4px; background: linear-gradient(90deg, #00f0ff 0%, #7000ff 100%);"></td>
+              </tr>
+
+              <!-- HEADER -->
+              <tr>
+                <td style="padding: 40px 30px 20px 30px; text-align: center;">
+                  <p style="margin: 0 0 8px 0; font-size: 11px; font-weight: 800; letter-spacing: 3px; color: #838a9e; text-transform: uppercase;">
+                    PRESENTED BY <span style="color: #00f0ff;">CASHCXDE</span>
+                  </p>
+                  <h1 style="margin: 0; font-size: 42px; font-weight: 900; letter-spacing: 8px; color: #ffffff; text-transform: uppercase; line-height: 1;">
+                    CONTROL
+                  </h1>
+                </td>
+              </tr>
+
+              <!-- BODY CONTENT -->
+              <tr>
+                <td style="padding: 0 30px 30px 30px; text-align: center;">
+                  <p style="margin: 0 0 24px 0; font-size: 15px; line-height: 1.6; color: #a1a8bd;">
+                    You have been issued clearance for <strong style="color: #ffffff;">CONTROL</strong>. Secure your package tier and confirm your access pass below.
+                  </p>
+
+                  ${note ? `
+                  <!-- PERSONAL NOTE BOX -->
+                  <div style="background-color: rgba(255, 255, 255, 0.04); border-left: 3px solid #00f0ff; border-radius: 8px; padding: 16px; margin-bottom: 28px; text-align: left;">
+                    <p style="margin: 0 0 4px 0; font-size: 10px; font-weight: 700; color: #00f0ff; letter-spacing: 1.5px; text-transform: uppercase;">Message attached:</p>
+                    <p style="margin: 0; font-size: 14px; color: #ffffff; font-style: italic;">"${note}"</p>
+                  </div>
+                  ` : ''}
+
+                  <!-- ACTION BUTTON -->
+                  <table role="presentation" border="0" cellspacing="0" cellpadding="0" style="margin: 0 auto;">
+                    <tr>
+                      <td align="center" style="border-radius: 12px; background: #00f0ff;">
+                        <a href="${inviteUrl}" target="_blank" style="display: inline-block; padding: 18px 36px; font-size: 14px; font-weight: 800; color: #000000; text-decoration: none; letter-spacing: 2px; text-transform: uppercase; border-radius: 12px;">
+                          ME A COME!
+                        </a>
+                      </td>
+                    </tr>
+                  </table>
+
+                  <p style="margin: 28px 0 0 0; font-size: 12px; color: #5a6072;">
+                    If the button above doesn't work, copy and paste this link in your browser:<br>
+                    <a href="${inviteUrl}" style="color: #00f0ff; text-decoration: underline; word-break: break-all;">${inviteUrl}</a>
+                  </p>
+                </td>
+              </tr>
+
+              <!-- FOOTER -->
+              <tr>
+                <td style="padding: 20px; background-color: #06080f; text-align: center; border-top: 1px solid rgba(255, 255, 255, 0.05);">
+                  <p style="margin: 0; font-size: 11px; color: #434857; letter-spacing: 1px; text-transform: uppercase;">
+                    CONTROL &bull; POWERED BY CASHCXDE
+                  </p>
+                </td>
+              </tr>
+
+            </table>
+
+          </td>
+        </tr>
+      </table>
+    </body>
+    </html>
+  `;
+};
 
     res.json({ success: true, remaining: inviter.invites_remaining - 1 });
   } catch (err) {
