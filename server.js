@@ -3,8 +3,11 @@ const cors = require('cors');
 const nodemailer = require('nodemailer');
 
 const app = express();
+
+// Middleware
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // Nodemailer Transporter
 const transporter = nodemailer.createTransport({
@@ -15,12 +18,12 @@ const transporter = nodemailer.createTransport({
   }
 });
 
-// Database placeholder (Connect to your DB or keeping in-memory)
+// Database placeholder (In-memory storage or replace with DB query)
 let guests = [
   { email: 'test@example.com', status: 'PENDING', shirt_size: null, invites_remaining: 2 }
 ];
 
-// CASHCXDE x CONTROL Email Design
+// CASHCXDE x CONTROL Email Design Template
 const generateInviteEmail = (inviteUrl, note = '') => {
   return `
     <!DOCTYPE html>
@@ -164,11 +167,7 @@ app.post('/api/send-invite', async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
-// Admin Panel Route - View Guest List & Allocations
+// 4. Admin Command Center Interface
 app.get('/admin', (req, res) => {
   const guestRows = guests.map((g, index) => `
     <tr>
@@ -192,7 +191,6 @@ app.get('/admin', (req, res) => {
     </tr>
   `).join('');
 
-  // Calculate quick stats
   const totalGuests = guests.length;
   const totalApproved = guests.filter(g => g.status === 'APPROVED').length;
   const totalPending = guests.filter(g => g.status === 'PENDING').length;
@@ -292,7 +290,6 @@ app.get('/admin', (req, res) => {
           </div>
         </div>
 
-        <!-- ADD GUEST DIRECTLY -->
         <form class="add-guest-box" action="/admin/add-guest" method="POST">
           <input type="email" name="email" class="admin-input" placeholder="Add guest email address..." required />
           <button type="submit" class="btn-add">Authorize Guest</button>
@@ -320,12 +317,17 @@ app.get('/admin', (req, res) => {
   `);
 });
 
-// Endpoint to quickly authorize a guest from the admin panel
-app.use(express.urlencoded({ extended: true }));
+// 5. Admin Add-Guest Action Route
 app.post('/admin/add-guest', (req, res) => {
   const email = (req.body.email || '').toLowerCase().trim();
   if (email && !guests.some(g => g.email.toLowerCase() === email)) {
     guests.push({ email, status: 'PENDING', shirt_size: null, invites_remaining: 2 });
   }
   res.redirect('/admin');
+});
+
+// Start Server
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
