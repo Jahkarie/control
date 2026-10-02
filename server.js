@@ -90,6 +90,24 @@ app.post('/api/send-invite', async (req, res) => {
 
 // --- ADMIN ENDPOINTS ---
 
+// Guest Login Authorization Check
+app.post('/api/login', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email is required' });
+
+  try {
+    const cleanEmail = email.trim().toLowerCase();
+    const result = await pool.query('SELECT * FROM guests WHERE LOWER(email) = $1', [cleanEmail]);
+
+    if (result.rows.length === 0) {
+      return res.status(403).json({ error: 'ACCESS DENIED: Email not found on VIP roster.' });
+    }
+
+    res.json({ success: true, user: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 // Admin API JSON Data
 app.get('/api/admin/guests', async (req, res) => {
   try {
