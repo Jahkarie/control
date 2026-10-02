@@ -1,247 +1,235 @@
 import express from 'express';
 import cors from 'cors';
-import nodemailer from 'nodemailer';
 import pkg from 'pg';
 const { Pool } = pkg;
+import { Resend } from 'resend';
 
 const app = express();
-
-// Middleware
 app.use(cors());
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
-// Database Connection (AIVEN)
+const resend = new Resend(process.env.EMAIL_PASS);
+
 const pool = new Pool({
   host: process.env.DB_HOST,
   user: process.env.DB_USER || 'avnadmin',
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME || 'defaultdb',
   port: parseInt(process.env.DB_PORT || '25432', 10),
-  ssl: {
-    rejectUnauthorized: false // REQUIRED for Aiven
-  }
+  ssl: { rejectUnauthorized: false },
+  connectionTimeoutMillis: 5000
 });
 
-// Auto-initialize tables
-const initDB = async () => {
+// --- USER API ENDPOINTS ---
+
+// Fetch User Data for Portal
+app.get('/api/user-status', async (req, res) => {
+  const { email } = req.query;
   try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS guests (
-        id SERIAL PRIMARY KEY,
-        email VARCHAR(255) UNIQUE NOT NULL,
-        status VARCHAR(50) DEFAULT 'PENDING',
-        shirt_size VARCHAR(20),
-        invites_remaining INT DEFAULT 2
-      );
-
-      CREATE TABLE IF NOT EXISTS settings (
-        key VARCHAR(100) PRIMARY KEY,
-        value TEXT
-      );
-    `);
-    console.log('Database tables ready.');
+    const result = await pool.query('SELECT * FROM guests WHERE email = $1', [email]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Guest not found' });
+    res.json(result.rows[0]);
   } catch (err) {
-    console.error('Database connection error:', err);
-  }
-};
-initDB();
-
-// Email Transporter
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS
+    res.status(500).json({ error: err.message });
   }
 });
 
-// --- API ENDPOINTS ---
-
-app.get('/api/guest-status', async (req, res) => {
-  const email = (req.query.email || '').toLowerCase().trim();
+// Update Shirt Size
+app.post('/api/update-shirt', async (req, res) => {
+  const { email, shirt_size } = req.body;
   try {
-    const result = await pool.query('SELECT * FROM guests WHERE LOWER(email) = $1', [email]);
-    if (result.rows.length === 0) {
-      return res.status(404).json({ authorized: false, error: 'Not invited' });
-    }
-    res.json({ authorized: true, guest: result.rows[0] });
+    await pool.query('UPDATE guests SET shirt_size = $1 WHERE email = $2', [shirt_size, email]);
+    res.json({ success: true, shirt_size });
   } catch (err) {
-    res.status(500).json({ error: 'Database error' });
+    res.status(500).json({ error: err.message });
   }
 });
 
-app.post('/api/secure-package', async (req, res) => {
-  const { email, shirtSize } = req.body;
+// Update RSVP Status
+app.post('/api/update-rsvp', async (req, res) => {
+  const { email, rsvp_status } = req.body;
   try {
-    const result = await pool.query(
-      "UPDATE guests SET shirt_size = $1, status = 'APPROVED' WHERE LOWER(email) = $2 RETURNING *",
-      [shirtSize, (email || '').toLowerCase().trim()]
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, error: 'Guest not found' });
-    }
-    res.json({ success: true, guest: result.rows[0] });
+    await pool.query('UPDATE guests SET rsvp_status = $1 WHERE email = $2', [rsvp_status, email]);
+    res.json({ success: true, rsvp_status });
   } catch (err) {
-    res.status(500).json({ error: 'Database error' });
+    res.status(500).json({ error: err.message });
   }
 });
 
+// Send Guest Invite
 app.post('/api/send-invite', async (req, res) => {
-  const { inviterEmail, friendEmail, note } = req.body;
-  const cleanInviter = (inviterEmail || '').toLowerCase().trim();
-  const cleanFriend = (friendEmail || '').toLowerCase().trim();
-
+  const { sender_email, recipient_email } = req.body;
   try {
-    const inviterRes = await pool.query('SELECT * FROM guests WHERE LOWER(email) = $1', [cleanInviter]);
-    const inviter = inviterRes.rows[0];
-
-    if (!inviter || inviter.invites_remaining <= 0) {
-      return res.status(400).json({ success: false, error: 'No invite clearance remaining.' });
+    const senderRes = await pool.query('SELECT invites_left FROM guests WHERE email = $1', [sender_email]);
+    if (senderRes.rows.length === 0 || senderRes.rows[0].invites_left <= 0) {
+      return res.status(400).json({ error: 'No invites remaining' });
     }
 
-    // Deduct invite
-    await pool.query('UPDATE guests SET invites_remaining = invites_remaining - 1 WHERE id = $1', [inviter.id]);
-
-    // Add friend if not exists
+    // Add recipient to guests table
     await pool.query(
-      `INSERT INTO guests (email, status, invites_remaining) 
-       VALUES ($1, 'PENDING', 2) 
-       ON CONFLICT (email) DO NOTHING`,
-      [cleanFriend]
+      'INSERT INTO guests (email, rsvp_status, shirt_size, invites_left) VALUES ($1, $2, $3, $4) ON CONFLICT (email) DO NOTHING',
+      [recipient_email, 'PENDING', 'Unassigned', 2]
     );
 
-    const frontendUrl = process.env.FRONTEND_URL || 'https://your-frontend.onrender.com';
-    const inviteUrl = `${frontendUrl}?email=${encodeURIComponent(cleanFriend)}`;
+    // Decrement sender invite count
+    await pool.query('UPDATE guests SET invites_left = invites_left - 1 WHERE email = $1', [sender_email]);
 
-    await transporter.sendMail({
-      from: `"CONTROL" <${process.env.EMAIL_USER}>`,
-      to: cleanFriend,
-      subject: 'CLEARANCE GRANTED: CONTROL ACCESS PASS',
-      html: `<p>You have been invited to CONTROL! Access your pass: <a href="${inviteUrl}">${inviteUrl}</a></p>`
+    // Send email via Resend
+    await resend.emails.send({
+      from: process.env.EMAIL_USER || 'onboarding@resend.dev',
+      to: recipient_email,
+      subject: 'CONTROL Pass Allocated',
+      html: `<p>You have been authorized access to CONTROL. Access portal: ${process.env.FRONTEND_URL}</p>`
     });
 
-    res.json({ success: true, remaining: inviter.invites_remaining - 1 });
+    res.json({ success: true });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, error: 'Error sending invitation.' });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// --- ADMIN CONTROL PANEL ---
+// --- ADMIN ENDPOINTS ---
 
-app.get('/admin', async (req, res) => {
+// Admin API JSON Data
+app.get('/api/admin/guests', async (req, res) => {
   try {
-    const guestsRes = await pool.query('SELECT * FROM guests ORDER BY id ASC');
-    const guests = guestsRes.rows;
-
-    const guestRows = guests.map((g, i) => `
-      <tr>
-        <td style="padding: 12px; border-bottom: 1px solid #222;">#${i + 1}</td>
-        <td style="padding: 12px; border-bottom: 1px solid #222; font-weight: bold;">${g.email}</td>
-        <td style="padding: 12px; border-bottom: 1px solid #222;">
-          <span style="padding: 4px 10px; border-radius: 12px; font-size: 11px; font-weight: 800; ${
-            g.status === 'APPROVED' ? 'background: rgba(0,240,255,0.1); color: #00f0ff;' : 'background: rgba(255,255,255,0.1); color: #888;'
-          }">
-            ${g.status}
-          </span>
-        </td>
-        <td style="padding: 12px; border-bottom: 1px solid #222; color: #00f0ff;">${g.shirt_size || 'Unassigned'}</td>
-        <td style="padding: 12px; border-bottom: 1px solid #222; text-align: center;">${g.invites_remaining}</td>
-        <td style="padding: 12px; border-bottom: 1px solid #222; text-align: right;">
-          <form action="/admin/reset-invites" method="POST" style="display:inline;">
-            <input type="hidden" name="email" value="${g.email}" />
-            <button type="submit" style="background: #00f0ff; color: #000; border: none; padding: 6px 12px; border-radius: 6px; font-weight: bold; cursor: pointer;">
-              Reset Invites (Set to 2)
-            </button>
-          </form>
-        </td>
-      </tr>
-    `).join('');
-
-    res.send(`
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <title>CONTROL — Admin Command Center</title>
-        <style>
-          body { font-family: sans-serif; background: #080a0f; color: #fff; padding: 40px; max-width: 1000px; margin: 0 auto; }
-          h1 { color: #00f0ff; letter-spacing: 2px; }
-          .card { background: #111522; padding: 24px; border-radius: 12px; border: 1px solid rgba(0,240,255,0.2); margin-bottom: 30px; }
-          input, button { padding: 10px 14px; border-radius: 6px; border: none; font-size: 14px; }
-          input[type="email"] { width: 300px; background: #000; color: #fff; border: 1px solid #333; }
-          table { width: 100%; border-collapse: collapse; text-align: left; }
-          th { padding: 12px; border-bottom: 2px solid #333; color: #888; font-size: 12px; text-transform: uppercase; }
-        </style>
-      </head>
-      <body>
-        <h1>CONTROL COMMAND CENTER</h1>
-
-        <div class="card">
-          <h3>Add New Guest</h3>
-          <form action="/admin/add-guest" method="POST" style="display: flex; gap: 10px;">
-            <input type="email" name="email" placeholder="guest@domain.com" required />
-            <button type="submit" style="background: #00f0ff; color: #000; font-weight: bold; cursor: pointer;">Authorize Guest</button>
-          </form>
-        </div>
-
-        <div class="card">
-          <h3>Guest Roster (${guests.length})</h3>
-          <table>
-            <thead>
-              <tr>
-                <th>#</th>
-                <th>Email</th>
-                <th>Status</th>
-                <th>Shirt Size</th>
-                <th style="text-align: center;">Invites Left</th>
-                <th style="text-align: right;">Action</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${guestRows.length > 0 ? guestRows : '<tr><td colspan="6" style="padding: 20px; text-align: center; color: #666;">No guests in database.</td></tr>'}
-            </tbody>
-          </table>
-        </div>
-      </body>
-      </html>
-    `);
+    const result = await pool.query('SELECT * FROM guests ORDER BY id ASC');
+    res.json(result.rows);
   } catch (err) {
-    res.status(500).send('Error loading admin panel.');
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Admin Reset Invites Action
-app.post('/admin/reset-invites', async (req, res) => {
+// Admin Reset Invites
+app.post('/api/admin/reset-invites', async (req, res) => {
   const { email } = req.body;
   try {
-    await pool.query('UPDATE guests SET invites_remaining = 2 WHERE LOWER(email) = $1', [email.toLowerCase().trim()]);
-    res.redirect('/admin');
+    await pool.query('UPDATE guests SET invites_left = 2 WHERE email = $1', [email]);
+    res.json({ success: true });
   } catch (err) {
-    res.status(500).send('Database error resetting invites.');
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Admin Add Guest Action
-app.post('/admin/add-guest', async (req, res) => {
-  const email = (req.body.email || '').toLowerCase().trim();
+// Admin Authorize New Guest
+app.post('/api/admin/add-guest', async (req, res) => {
+  const { email } = req.body;
   try {
-    if (email) {
-      await pool.query(
-        `INSERT INTO guests (email, status, invites_remaining) 
-         VALUES ($1, 'PENDING', 2) 
-         ON CONFLICT (email) DO NOTHING`,
-        [email]
-      );
-    }
-    res.redirect('/admin');
+    await pool.query(
+      'INSERT INTO guests (email, rsvp_status, shirt_size, invites_left) VALUES ($1, $2, $3, $4) ON CONFLICT (email) DO NOTHING',
+      [email, 'PENDING', 'Unassigned', 2]
+    );
+    res.json({ success: true });
   } catch (err) {
-    res.status(500).send('Database error adding guest.');
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Start Server
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+// Complete Admin Dashboard View
+app.get('/admin', (req, res) => {
+  res.send(`
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <title>CONTROL COMMAND CENTER</title>
+    <style>
+      body { background: #080b10; color: #e2e8f0; font-family: monospace; padding: 20px; }
+      h1 { color: #00f0ff; text-align: center; }
+      .metrics { display: flex; gap: 15px; margin-bottom: 25px; }
+      .card { background: #0f172a; border: 1px solid #1e293b; padding: 15px; flex: 1; border-radius: 8px; text-align: center; }
+      .card h2 { margin: 0; color: #00f0ff; font-size: 28px; }
+      table { width: 100%; border-collapse: collapse; background: #0f172a; border-radius: 8px; overflow: hidden; }
+      th, td { padding: 12px; text-align: left; border-bottom: 1px solid #1e293b; }
+      th { background: #1e293b; color: #94a3b8; }
+      .btn { background: #00f0ff; color: #000; font-weight: bold; border: none; padding: 6px 12px; cursor: pointer; border-radius: 4px; }
+      .btn:hover { background: #00c8ff; }
+      input { background: #020617; border: 1px solid #334155; color: #fff; padding: 8px; border-radius: 4px; }
+      .badge-confirmed { color: #00ff88; font-weight: bold; }
+      .badge-pending { color: #ffaa00; }
+    </style>
+  </head>
+  <body>
+    <h1>CONTROL COMMAND CENTER</h1>
+    
+    <div class="metrics">
+      <div class="card"><p>Total Guests</p><h2 id="total-guests">0</h2></div>
+      <div class="card"><p>Confirmed RSVPs</p><h2 id="confirmed-rsvp">0</h2></div>
+      <div class="card"><p>Shirts Claimed</p><h2 id="shirts-claimed">0</h2></div>
+    </div>
+
+    <div style="background: #0f172a; padding: 15px; border-radius: 8px; margin-bottom: 25px;">
+      <h3>Authorize New Guest</h3>
+      <input type="email" id="new-email" placeholder="guest@domain.com" style="width: 300px;">
+      <button class="btn" onclick="addGuest()">Authorize Guest</button>
+    </div>
+
+    <h3>Guest Roster</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Email</th>
+          <th>RSVP Status</th>
+          <th>Shirt Size</th>
+          <th>Invites Remaining</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody id="roster"></tbody>
+    </table>
+
+    <script>
+      async function loadData() {
+        const res = await fetch('/api/admin/guests');
+        const data = await res.json();
+        
+        document.getElementById('total-guests').innerText = data.length;
+        document.getElementById('confirmed-rsvp').innerText = data.filter(g => g.rsvp_status === 'CONFIRMED').length;
+        document.getElementById('shirts-claimed').innerText = data.filter(g => g.shirt_size && g.shirt_size !== 'Unassigned').length;
+
+        const tbody = document.getElementById('roster');
+        tbody.innerHTML = '';
+        data.forEach((g, idx) => {
+          tbody.innerHTML += \`
+            <tr>
+              <td>#\${idx + 1}</td>
+              <td><b>\${g.email}</b></td>
+              <td class="\${g.rsvp_status === 'CONFIRMED' ? 'badge-confirmed' : 'badge-pending'}">\${g.rsvp_status || 'PENDING'}</td>
+              <td>\${g.shirt_size || 'Unassigned'}</td>
+              <td>\${g.invites_left}</td>
+              <td><button class="btn" onclick="resetInvites('\${g.email}')">Reset Invites (Set to 2)</button></td>
+            </tr>
+          \`;
+        });
+      }
+
+      async function addGuest() {
+        const email = document.getElementById('new-email').value;
+        if (!email) return;
+        await fetch('/api/admin/add-guest', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email })
+        });
+        document.getElementById('new-email').value = '';
+        loadData();
+      }
+
+      async function resetInvites(email) {
+        await fetch('/api/admin/reset-invites', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email })
+        });
+        loadData();
+      }
+
+      loadData();
+    </script>
+  </body>
+  </html>
+  `);
 });
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`Server live on port ${PORT}`));
