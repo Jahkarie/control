@@ -58,12 +58,60 @@ app.post('/api/update-rsvp', async (req, res) => {
 
 // Send Guest Invite
 app.post('/api/send-invite', async (req, res) => {
-  const { sender_email, recipient_email } = req.body;
+  const { sender_email, recipient_email, custom_note } = req.body;
+
   try {
+    // 1. Verify sender has invites left
     const senderRes = await pool.query('SELECT invites_left FROM guests WHERE email = $1', [sender_email]);
     if (senderRes.rows.length === 0 || senderRes.rows[0].invites_left <= 0) {
-      return res.status(400).json({ error: 'No invites remaining' });
+      return res.status(403).json({ error: 'Zero authorizations remaining.' });
     }
+
+    // 2. Check if recipient already exists
+    const checkRes = await pool.query('SELECT * FROM guests WHERE email = $1', [recipient_email]);
+    if (checkRes.rows.length > 0) {
+      return res.status(400).json({ error: 'User is already in the system.' });
+    }
+
+    // 3. Add new guest and deduct invite from sender
+    await pool.query('INSERT INTO guests (email) VALUES ($1)', [recipient_email]);
+    await pool.query('UPDATE guests SET invites_left = invites_left - 1 WHERE email = $1', [sender_email]);
+
+    // 4. Format the custom note (if the user typed one)
+    const noteHTML = custom_note 
+      ? `<div style="background-color: #1a1a2e; padding: 20px; border-left: 4px solid #b026ff; margin: 25px 0; border-radius: 4px;">
+           <p style="color: #94a3b8; font-size: 12px; text-transform: uppercase; margin-top: 0;">Message from ${sender_email}:</p>
+           <p style="color: #ffffff; font-style: italic; font-size: 16px; margin-bottom: 0;">"${custom_note}"</p>
+         </div>`
+      : '';
+
+    // 5. Dispatch Cosmic-Themed Email via Resend
+    await resend.emails.send({
+      from: 'onboarding@resend.dev', // Switch to your custom domain once verified
+      to: recipient_email,
+      subject: `[CONTROL] Priority Authorization from ${sender_email}`,
+      html: `
+        <div style="background-color: #020108; color: #ffffff; padding: 40px 20px; font-family: 'Helvetica Neue', sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #1e293b; border-radius: 12px;">
+          <h1 style="color: #00f0ff; letter-spacing: 4px; text-align: center;">CONTROL PORTAL</h1>
+          <p style="font-size: 16px; text-align: center; color: #e2e8f0;">You have been authorized for priority access.</p>
+          
+          ${noteHTML}
+
+          <div style="text-align: center; margin-top: 35px;">
+            <a href="https://controlfrontend.onrender.com" style="display: inline-block; padding: 14px 28px; background: linear-gradient(90deg, #00f0ff, #b026ff); color: #ffffff; text-decoration: none; border-radius: 8px; font-weight: bold; letter-spacing: 1px;">INITIATE SECURE LINK</a>
+          </div>
+          
+          <p style="font-size: 11px; color: #64748b; text-align: center; margin-top: 40px; text-transform: uppercase;">Secure transmission from CONTROL server.</p>
+        </div>
+      `
+    });
+
+    res.json({ success: true, message: 'Invite dispatched successfully.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error during dispatch.' });
+  }
+});
 
     // Add recipient to guests table
     await pool.query(
