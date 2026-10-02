@@ -20,125 +20,7 @@ const pool = new Pool({
   connectionTimeoutMillis: 5000
 });
 
-// --- USER API ENDPOINTS ---
-
-// Fetch User Data for Portal
-app.get('/api/user-status', async (req, res) => {
-  const { email } = req.query;
-  try {
-    const result = await pool.query('SELECT * FROM guests WHERE email = $1', [email]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Guest not found' });
-    res.json(result.rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Update Shirt Size
-app.post('/api/update-shirt', async (req, res) => {
-  const { email, shirt_size } = req.body;
-  try {
-    await pool.query('UPDATE guests SET shirt_size = $1 WHERE email = $2', [shirt_size, email]);
-    res.json({ success: true, shirt_size });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Update RSVP Status
-app.post('/api/update-rsvp', async (req, res) => {
-  const { email, rsvp_status } = req.body;
-  try {
-    await pool.query('UPDATE guests SET rsvp_status = $1 WHERE email = $2', [rsvp_status, email]);
-    res.json({ success: true, rsvp_status });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Send Guest Invite
-app.post('/api/send-invite', async (req, res) => {
-  const { sender_email, recipient_email, custom_note } = req.body;
-
-  try {
-    // 1. Verify sender has invites left
-    const senderRes = await pool.query('SELECT invites_left FROM guests WHERE email = $1', [sender_email]);
-    if (senderRes.rows.length === 0 || senderRes.rows[0].invites_left <= 0) {
-      return res.status(403).json({ error: 'Zero authorizations remaining.' });
-    }
-
-    // 2. Check if recipient already exists
-    const checkRes = await pool.query('SELECT * FROM guests WHERE email = $1', [recipient_email]);
-    if (checkRes.rows.length > 0) {
-      return res.status(400).json({ error: 'User is already in the system.' });
-    }
-
-    // 3. Add new guest and deduct invite from sender
-    await pool.query('INSERT INTO guests (email) VALUES ($1)', [recipient_email]);
-    await pool.query('UPDATE guests SET invites_left = invites_left - 1 WHERE email = $1', [sender_email]);
-
-    // 4. Format the custom note (if the user typed one)
-    const noteHTML = custom_note 
-      ? `<div style="background-color: #1a1a2e; padding: 20px; border-left: 4px solid #b026ff; margin: 25px 0; border-radius: 4px;">
-           <p style="color: #94a3b8; font-size: 12px; text-transform: uppercase; margin-top: 0;">Message from ${sender_email}:</p>
-           <p style="color: #ffffff; font-style: italic; font-size: 16px; margin-bottom: 0;">"${custom_note}"</p>
-         </div>`
-      : '';
-
-    // 5. Dispatch Cosmic-Themed Email via Resend
-    await resend.emails.send({
-      from: 'onboarding@resend.dev', // Switch to your custom domain once verified
-      to: recipient_email,
-      subject: `[CONTROL] Priority Authorization from ${sender_email}`,
-      html: `
-        <div style="background-color: #020108; color: #ffffff; padding: 40px 20px; font-family: 'Helvetica Neue', sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #1e293b; border-radius: 12px;">
-          <h1 style="color: #00f0ff; letter-spacing: 4px; text-align: center;">CONTROL PORTAL</h1>
-          <p style="font-size: 16px; text-align: center; color: #e2e8f0;">You have been authorized for priority access.</p>
-          
-          ${noteHTML}
-
-          <div style="text-align: center; margin-top: 35px;">
-            <a href="https://controlfrontend.onrender.com" style="display: inline-block; padding: 14px 28px; background: linear-gradient(90deg, #00f0ff, #b026ff); color: #ffffff; text-decoration: none; border-radius: 8px; font-weight: bold; letter-spacing: 1px;">INITIATE SECURE LINK</a>
-          </div>
-          
-          <p style="font-size: 11px; color: #64748b; text-align: center; margin-top: 40px; text-transform: uppercase;">Secure transmission from CONTROL server.</p>
-        </div>
-      `
-    });
-
-    res.json({ success: true, message: 'Invite dispatched successfully.' });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error during dispatch.' });
-  }
-});
-
-    // Add recipient to guests table
-    await pool.query(
-      'INSERT INTO guests (email, rsvp_status, shirt_size, invites_left) VALUES ($1, $2, $3, $4) ON CONFLICT (email) DO NOTHING',
-      [recipient_email, 'PENDING', 'Unassigned', 2]
-    );
-
-    // Decrement sender invite count
-    await pool.query('UPDATE guests SET invites_left = invites_left - 1 WHERE email = $1', [sender_email]);
-
-    // Send email via Resend
-    await resend.emails.send({
-      from: process.env.EMAIL_USER || 'onboarding@resend.dev',
-      to: recipient_email,
-      subject: 'CONTROL Pass Allocated',
-      html: `<p>You have been authorized access to CONTROL. Access portal: ${process.env.FRONTEND_URL}</p>`
-    });
-
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// --- ADMIN ENDPOINTS ---
-
-// Guest Login Authorization Check
+// --- VIP LOGIN CHECK ---
 app.post('/api/login', async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: 'Email is required' });
@@ -150,13 +32,102 @@ app.post('/api/login', async (req, res) => {
     if (result.rows.length === 0) {
       return res.status(403).json({ error: 'ACCESS DENIED: Email not found on VIP roster.' });
     }
-
     res.json({ success: true, user: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
-// Admin API JSON Data
+
+// --- FETCH USER DATA ---
+app.get('/api/user-status', async (req, res) => {
+  const { email } = req.query;
+  try {
+    const result = await pool.query('SELECT * FROM guests WHERE email = $1', [email]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Guest not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- UPDATE SHIRT SIZE ---
+app.post('/api/update-shirt', async (req, res) => {
+  const { email, shirt_size } = req.body;
+  try {
+    await pool.query('UPDATE guests SET shirt_size = $1 WHERE email = $2', [shirt_size, email]);
+    res.json({ success: true, shirt_size });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- UPDATE RSVP ---
+app.post('/api/update-rsvp', async (req, res) => {
+  const { email, rsvp_status } = req.body;
+  try {
+    await pool.query('UPDATE guests SET rsvp_status = $1 WHERE email = $2', [rsvp_status, email]);
+    res.json({ success: true, rsvp_status });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- DISPATCH COSMIC EMAIL INVITE ---
+app.post('/api/send-invite', async (req, res) => {
+  const { sender_email, recipient_email, custom_note } = req.body;
+
+  try {
+    const senderRes = await pool.query('SELECT invites_left FROM guests WHERE email = $1', [sender_email]);
+    if (senderRes.rows.length === 0 || senderRes.rows[0].invites_left <= 0) {
+      return res.status(403).json({ error: 'Zero authorizations remaining.' });
+    }
+
+    const checkRes = await pool.query('SELECT * FROM guests WHERE email = $1', [recipient_email]);
+    if (checkRes.rows.length > 0) {
+      return res.status(400).json({ error: 'User is already in the system.' });
+    }
+
+    // Add guest and deduct invite
+    await pool.query('INSERT INTO guests (email) VALUES ($1)', [recipient_email]);
+    await pool.query('UPDATE guests SET invites_left = invites_left - 1 WHERE email = $1', [sender_email]);
+
+    // Format custom note if provided
+    const noteHTML = custom_note 
+      ? `<div style="background-color: #1a1a2e; padding: 20px; border-left: 4px solid #b026ff; margin: 25px 0; border-radius: 4px;">
+           <p style="color: #94a3b8; font-size: 12px; text-transform: uppercase; margin-top: 0;">Message from ${sender_email}:</p>
+           <p style="color: #ffffff; font-style: italic; font-size: 16px; margin-bottom: 0;">"${custom_note}"</p>
+         </div>`
+      : '';
+
+    // Send via Resend
+    await resend.emails.send({
+      from: process.env.EMAIL_USER || 'onboarding@resend.dev',
+      to: recipient_email,
+      subject: `[CONTROL] Priority Authorization from ${sender_email}`,
+      html: `
+        <div style="background-color: #020108; color: #ffffff; padding: 40px 20px; font-family: 'Helvetica Neue', sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #1e293b; border-radius: 12px;">
+          <h1 style="color: #00f0ff; letter-spacing: 4px; text-align: center;">CONTROL PORTAL</h1>
+          <p style="font-size: 16px; text-align: center; color: #e2e8f0;">You have been authorized for priority access.</p>
+          
+          ${noteHTML}
+
+          <div style="text-align: center; margin-top: 35px;">
+            <a href="${process.env.FRONTEND_URL || 'https://controlfrontend.onrender.com'}" style="display: inline-block; padding: 14px 28px; background: linear-gradient(90deg, #00f0ff, #b026ff); color: #ffffff; text-decoration: none; border-radius: 8px; font-weight: bold; letter-spacing: 1px;">INITIATE SECURE LINK</a>
+          </div>
+          
+          <p style="font-size: 11px; color: #64748b; text-align: center; margin-top: 40px; text-transform: uppercase;">Secure transmission from CONTROL server.</p>
+        </div>
+      `
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error during dispatch.' });
+  }
+});
+
+// --- ADMIN ENDPOINTS ---
 app.get('/api/admin/guests', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM guests ORDER BY id ASC');
@@ -166,7 +137,6 @@ app.get('/api/admin/guests', async (req, res) => {
   }
 });
 
-// Admin Reset Invites
 app.post('/api/admin/reset-invites', async (req, res) => {
   const { email } = req.body;
   try {
@@ -177,7 +147,6 @@ app.post('/api/admin/reset-invites', async (req, res) => {
   }
 });
 
-// Admin Authorize New Guest
 app.post('/api/admin/add-guest', async (req, res) => {
   const { email } = req.body;
   try {
@@ -191,7 +160,6 @@ app.post('/api/admin/add-guest', async (req, res) => {
   }
 });
 
-// Complete Admin Dashboard View
 app.get('/admin', (req, res) => {
   res.send(`
   <!DOCTYPE html>
@@ -272,21 +240,13 @@ app.get('/admin', (req, res) => {
       async function addGuest() {
         const email = document.getElementById('new-email').value;
         if (!email) return;
-        await fetch('/api/admin/add-guest', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email })
-        });
+        await fetch('/api/admin/add-guest', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email }) });
         document.getElementById('new-email').value = '';
         loadData();
       }
 
       async function resetInvites(email) {
-        await fetch('/api/admin/reset-invites', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email })
-        });
+        await fetch('/api/admin/reset-invites', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email }) });
         loadData();
       }
 
