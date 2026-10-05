@@ -168,10 +168,10 @@ async function sendInviteEmail(to, from, note, link) {
     const { error } = await resend.emails.send({
       from: EMAIL_FROM,
       to,
-      subject: `[CONTROL] ${from} chose you as one of their invites`,
+      subject: `[On D' Road] ${from} chose you as one of their invites`,
       html: `
         <div style="background-color: #080307; color: #fff4e0; padding: 40px 20px; font-family: 'Helvetica Neue', sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #3a1a22; border-radius: 12px;">
-          <h1 style="color: #f2c879; letter-spacing: 4px; text-align: center;">CONTROL</h1>
+          <h1 style="color: #f2c879; letter-spacing: 4px; text-align: center;">ON D' ROAD</h1>
           <p style="font-size: 16px; text-align: center;">${escapeHtml(from)} chose you as one of their two invites.</p>
           <p style="font-size: 14px; text-align: center; color: #c7ad84;">This invitation is personal and single-use. Do not forward it.</p>
           ${noteHTML}
@@ -288,7 +288,7 @@ app.post('/api/admin/create-invite', requireAdmin, async (req, res) => {
       "INSERT INTO invites (token_hash, inviter_email, invitee_email, note) VALUES ($1, 'CONTROL', $2, $3)",
       [hashToken(token), email, note]);
     const link = inviteLink(token);
-    const emailed = !(await sendInviteEmail(email, 'CONTROL', note, link));
+    const emailed = !(await sendInviteEmail(email, "On D' Road", note, link));
     res.json({ success: true, link, emailed });
   } catch (err) {
     serverError(res, err);
@@ -332,112 +332,238 @@ app.post('/api/admin/add-guest', requireAdmin, async (req, res) => {
   }
 });
 
-app.get('/admin', requireAdmin, (req, res) => {
-  res.send(`<!DOCTYPE html>
+app.get('/api/admin/invites', requireAdmin, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT id, inviter_email, invitee_email, note, status, created_at, accepted_at FROM invites ORDER BY id DESC');
+    res.json(r.rows);
+  } catch (err) {
+    serverError(res, err);
+  }
+});
+
+app.post('/api/admin/revoke-invite', requireAdmin, async (req, res) => {
+  const id = parseInt(req.body?.id, 10);
+  if (!id) return res.status(400).json({ error: 'Invalid invite.' });
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query('BEGIN');
+    const r = await client.query("UPDATE invites SET status = 'REVOKED' WHERE id = $1 AND status = 'PENDING' RETURNING inviter_email", [id]);
+    if (!r.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Only pending invites can be revoked.' });
+    }
+    // Give the inviter their invite back (no-op for admin-created invites)
+    await client.query('UPDATE guests SET invites_left = invites_left + 1 WHERE LOWER(email) = $1', [r.rows[0].inviter_email.toLowerCase()]);
+    await client.query('COMMIT');
+    res.json({ success: true });
+  } catch (err) {
+    await client?.query('ROLLBACK').catch(() => {});
+    serverError(res, err);
+  } finally {
+    client?.release();
+  }
+});
+
+app.post('/api/admin/set-invites', requireAdmin, async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+  const count = parseInt(req.body?.count, 10);
+  if (!isValidEmail(email) || !(count >= 0 && count <= 20)) return res.status(400).json({ error: 'Invalid email or count (0-20).' });
+  try {
+    await pool.query('UPDATE guests SET invites_left = $1 WHERE LOWER(email) = $2', [count, email]);
+    res.json({ success: true });
+  } catch (err) {
+    serverError(res, err);
+  }
+});
+
+app.post('/api/admin/remove-guest', requireAdmin, async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+  if (!isValidEmail(email)) return res.status(400).json({ error: 'A valid email is required.' });
+  try {
+    await pool.query('DELETE FROM guests WHERE LOWER(email) = $1', [email]);
+    res.json({ success: true });
+  } catch (err) {
+    serverError(res, err);
+  }
+});
+
+const ADMIN_PAGE = `<!DOCTYPE html>
 <html>
 <head>
-  <title>CONTROL COMMAND CENTER</title>
-  <style>
-    body { background: #080b10; color: #e2e8f0; font-family: monospace; padding: 20px; }
-    h1 { color: #00f0ff; text-align: center; }
-    .metrics { display: flex; gap: 15px; margin-bottom: 25px; }
-    .card { background: #0f172a; border: 1px solid #1e293b; padding: 15px; flex: 1; border-radius: 8px; text-align: center; }
-    .card h2 { margin: 0; color: #00f0ff; font-size: 28px; }
-    table { width: 100%; border-collapse: collapse; background: #0f172a; border-radius: 8px; overflow: hidden; }
-    th, td { padding: 12px; text-align: left; border-bottom: 1px solid #1e293b; }
-    th { background: #1e293b; color: #94a3b8; }
-    .btn { background: #00f0ff; color: #000; font-weight: bold; border: none; padding: 6px 12px; cursor: pointer; border-radius: 4px; }
-    .btn:hover { background: #00c8ff; }
-    input { background: #020617; border: 1px solid #334155; color: #fff; padding: 8px; border-radius: 4px; }
-    .badge-confirmed { color: #00ff88; font-weight: bold; }
-    .badge-pending { color: #ffaa00; }
-  </style>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>On D' Road | Command Center</title>
+<link href="https://fonts.googleapis.com/css2?family=Bowlby+One&family=Outfit:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root { --sun:#ffd400; --pink:#ff2e88; --teal:#00b8a9; --orange:#ff6b1a; --ink:#140b2e; --cream:#fff7e6; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: 'Outfit', sans-serif; background: var(--cream); color: var(--ink); padding: 0 0 50px; }
+  .top { background: var(--ink); color: var(--sun); padding: 18px 22px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+  .top h1 { font-family: 'Bowlby One', sans-serif; font-size: 24px; margin: 0; letter-spacing: 1px; }
+  .top span { color: #fff; font-weight: 700; font-size: 13px; }
+  .bunting { height: 30px; background: url('data:image/svg+xml;utf8,<svg width="130" height="30" xmlns="http://www.w3.org/2000/svg"><polygon points="0,0 32,0 16,28" fill="%23ff2e88"/><polygon points="32,0 65,0 48,28" fill="%23ffd400"/><polygon points="65,0 97,0 81,28" fill="%2300b8a9"/><polygon points="97,0 130,0 113,28" fill="%23ff6b1a"/></svg>') repeat-x; }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 22px 16px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-bottom: 22px; }
+  .stat { border: 3px solid var(--ink); border-radius: 20px; padding: 16px; box-shadow: 5px 5px 0 var(--ink); animation: pop .5s both; }
+  .stat b { font-family: 'Bowlby One', sans-serif; font-size: 38px; display: block; line-height: 1; }
+  .stat small { font-weight: 800; letter-spacing: 1px; font-size: 11px; text-transform: uppercase; }
+  .stat:nth-child(1) { background: var(--pink); color: #fff; } .stat:nth-child(2) { background: var(--teal); }
+  .stat:nth-child(3) { background: var(--sun); } .stat:nth-child(4) { background: var(--orange); }
+  .stat:nth-child(5) { background: #fff; } .stat:nth-child(6) { background: #fff; }
+  .panel { background: #fff; border: 3px solid var(--ink); border-radius: 22px; padding: 18px; margin-bottom: 22px; box-shadow: 6px 6px 0 var(--pink); }
+  .panel h3 { font-family: 'Bowlby One', sans-serif; margin: 0 0 12px; font-size: 16px; text-transform: uppercase; }
+  .bars div { display: flex; align-items: center; gap: 10px; margin: 8px 0; font-weight: 800; font-size: 13px; }
+  .bars em { display: block; height: 22px; background: var(--teal); border: 2px solid var(--ink); border-radius: 12px; width: 0; transition: width 1s cubic-bezier(.2,.9,.3,1.1); min-width: 4px; }
+  .bars span { width: 90px; } .bars i { font-style: normal; }
+  .tabs { display: flex; gap: 10px; margin-bottom: 14px; }
+  .tab { border: 3px solid var(--ink); background: #fff; border-radius: 999px; padding: 10px 22px; font-weight: 800; cursor: pointer; font-family: 'Outfit', sans-serif; }
+  .tab.on { background: var(--ink); color: #fff; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  input, select { padding: 11px 14px; border: 3px solid var(--ink); border-radius: 14px; font-size: 14px; font-family: 'Outfit', sans-serif; background: var(--cream); min-width: 0; }
+  .btn { background: var(--ink); color: #fff; border: 3px solid var(--ink); border-radius: 999px; padding: 9px 16px; font-weight: 800; cursor: pointer; font-family: 'Outfit', sans-serif; font-size: 13px; transition: transform .15s, box-shadow .15s; }
+  .btn:hover { transform: translate(-2px,-2px); box-shadow: 3px 3px 0 var(--pink); }
+  .btn.alt { background: #fff; color: var(--ink); } .btn.bad { background: #fff; color: #c0153d; border-color: #c0153d; }
+  .scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th { text-align: left; font-size: 11px; letter-spacing: 1px; text-transform: uppercase; padding: 10px; border-bottom: 3px solid var(--ink); }
+  td { padding: 10px; border-bottom: 1px solid #eadfc8; vertical-align: middle; } tbody tr { animation: pop .4s both; }
+  .pill { border: 2px solid var(--ink); border-radius: 999px; padding: 3px 10px; font-weight: 800; font-size: 11px; display: inline-block; }
+  .CONFIRMED, .ACCEPTED { background: #b6f5d4; } .PENDING { background: #ffe07a; } .REVOKED { background: #ffc2c2; }
+  #msg { font-weight: 700; word-break: break-all; margin: 6px 0 0; }
+  .hidden { display: none; }
+  @keyframes pop { from { opacity: 0; transform: translateY(16px) scale(.96); } to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
 </head>
 <body>
-  <h1>CONTROL COMMAND CENTER</h1>
-  <div class="metrics">
-    <div class="card"><p>Total Guests</p><h2 id="total-guests">0</h2></div>
-    <div class="card"><p>Confirmed RSVPs</p><h2 id="confirmed-rsvp">0</h2></div>
-    <div class="card"><p>Shirts Claimed</p><h2 id="shirts-claimed">0</h2></div>
+<div class="top"><h1>ON D' ROAD · COMMAND CENTER</h1><span id="clock"></span></div>
+<div class="bunting"></div>
+<div class="wrap">
+  <div class="stats" id="stats"></div>
+
+  <div class="panel"><h3>Shirt sizes</h3><div class="bars" id="bars"></div></div>
+
+  <div class="panel">
+    <h3>Add people</h3>
+    <div class="row">
+      <input type="email" id="new-email" placeholder="Add straight to roster..." style="flex:1; min-width:200px;">
+      <button class="btn" id="add-btn">Add to roster</button>
+    </div>
+    <div class="row">
+      <input type="email" id="inv-email" placeholder="Create a personal invite link..." style="flex:1; min-width:200px;">
+      <button class="btn" id="inv-btn">Create link</button>
+    </div>
+    <p id="msg"></p>
   </div>
-  <div style="background: #0f172a; padding: 15px; border-radius: 8px; margin-bottom: 25px;">
-    <h3>Authorize New Guest</h3>
-    <input type="email" id="new-email" placeholder="guest@domain.com" style="width: 300px;">
-    <button class="btn" id="add-btn">Authorize Guest</button>
+
+  <div class="tabs"><button class="tab on" id="tab-g">Guests</button><button class="tab" id="tab-i">Invites</button></div>
+
+  <div class="panel" id="guests-panel">
+    <div class="row">
+      <input id="search" placeholder="Search email..." style="flex:1; min-width:160px;">
+      <select id="filter"><option value="">All RSVPs</option><option value="CONFIRMED">Confirmed</option><option value="PENDING">Pending</option></select>
+      <button class="btn alt" id="csv-btn">Export CSV</button>
+    </div>
+    <div class="scroll"><table><thead><tr><th>#</th><th>Email</th><th>RSVP</th><th>Shirt</th><th>Invites left</th><th>Actions</th></tr></thead><tbody id="roster"></tbody></table></div>
   </div>
-  <div style="background: #0f172a; padding: 15px; border-radius: 8px; margin-bottom: 25px;">
-    <h3>Create Personal Invite Link</h3>
-    <input type="email" id="inv-email" placeholder="guest@domain.com" style="width: 300px;">
-    <button class="btn" id="inv-btn">Create Link</button>
-    <p id="inv-out" style="word-break: break-all;"></p>
+
+  <div class="panel hidden" id="invites-panel">
+    <div class="scroll"><table><thead><tr><th>Invited</th><th>By</th><th>Status</th><th>Sent</th><th>Action</th></tr></thead><tbody id="invlist"></tbody></table></div>
   </div>
-  <h3>Guest Roster</h3>
-  <table>
-    <thead><tr><th>#</th><th>Email</th><th>RSVP Status</th><th>Shirt Size</th><th>Invites Remaining</th><th>Action</th></tr></thead>
-    <tbody id="roster"></tbody>
-  </table>
-  <script>
-    const $ = (id) => document.getElementById(id);
-    async function api(path, body) {
-      const opts = body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : undefined;
-      const res = await fetch(path, opts);
-      if (!res.ok) throw new Error('Request failed (' + res.status + ')');
-      return res.json();
-    }
-    function cell(tr, text, cls) {
-      const td = document.createElement('td');
-      td.textContent = text;
-      if (cls) td.className = cls;
-      tr.appendChild(td);
-      return td;
-    }
-    async function loadData() {
-      try {
-        const data = await api('/api/admin/guests');
-        $('total-guests').textContent = data.length;
-        $('confirmed-rsvp').textContent = data.filter((g) => g.rsvp_status === 'CONFIRMED').length;
-        $('shirts-claimed').textContent = data.filter((g) => g.shirt_size && g.shirt_size !== 'Unassigned').length;
-        const tbody = $('roster');
-        tbody.replaceChildren();
-        data.forEach((g, i) => {
-          const tr = document.createElement('tr');
-          cell(tr, '#' + (i + 1));
-          cell(tr, g.email).style.fontWeight = 'bold';
-          cell(tr, g.rsvp_status || 'PENDING', g.rsvp_status === 'CONFIRMED' ? 'badge-confirmed' : 'badge-pending');
-          cell(tr, g.shirt_size || 'Unassigned');
-          cell(tr, g.invites_left);
-          const td = document.createElement('td');
-          const btn = document.createElement('button');
-          btn.className = 'btn';
-          btn.textContent = 'Reset Invites (Set to 2)';
-          btn.addEventListener('click', async () => {
-            try { await api('/api/admin/reset-invites', { email: g.email }); loadData(); } catch (e) { alert(e.message); }
-          });
-          td.appendChild(btn);
-          tr.appendChild(td);
-          tbody.appendChild(tr);
-        });
-      } catch (e) { alert(e.message); }
-    }
-    $('add-btn').addEventListener('click', async () => {
-      const email = $('new-email').value.trim();
-      if (!email) return;
-      try { await api('/api/admin/add-guest', { email }); $('new-email').value = ''; loadData(); } catch (e) { alert(e.message); }
+</div>
+<script>
+  const $ = (id) => document.getElementById(id);
+  let guests = [], invites = [];
+  async function api(path, body) {
+    const opts = body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : undefined;
+    const res = await fetch(path, opts);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || ('Request failed (' + res.status + ')'));
+    return data;
+  }
+  function el(tag, text, cls) { const e = document.createElement(tag); if (text !== undefined) e.textContent = text; if (cls) e.className = cls; return e; }
+  function td(tr, text) { const c = el('td', text); tr.appendChild(c); return c; }
+  function pill(text, cls) { return el('span', text, 'pill ' + cls); }
+  function btn(label, cls, fn) { const b = el('button', label, 'btn ' + cls); b.addEventListener('click', async () => { try { await fn(); await load(); } catch (e) { alert(e.message); } }); return b; }
+
+  function renderStats() {
+    const sum = (f) => guests.filter(f).length;
+    const items = [
+      ['Guests', guests.length], ['Confirmed', sum((g) => g.rsvp_status === 'CONFIRMED')],
+      ['Shirts claimed', sum((g) => g.shirt_size && g.shirt_size !== 'Unassigned')],
+      ['Invites pending', invites.filter((i) => i.status === 'PENDING').length],
+      ['Invites accepted', invites.filter((i) => i.status === 'ACCEPTED').length],
+      ['Invites unused', guests.reduce((a, g) => a + (g.invites_left || 0), 0)]
+    ];
+    const box = $('stats'); box.replaceChildren();
+    items.forEach(([label, n], i) => { const d = el('div', undefined, 'stat'); d.style.animationDelay = (i * 0.07) + 's'; d.appendChild(el('b', n)); d.appendChild(el('small', label)); box.appendChild(d); });
+    const sizes = ['S', 'M', 'L', 'XL', 'Unassigned'];
+    const counts = sizes.map((z) => guests.filter((g) => (g.shirt_size || 'Unassigned') === z).length);
+    const max = Math.max(1, ...counts);
+    const bars = $('bars'); bars.replaceChildren();
+    sizes.forEach((z, i) => { const row = el('div'); row.appendChild(el('span', z)); const bar = el('em'); row.appendChild(bar); row.appendChild(el('i', counts[i])); bars.appendChild(row); setTimeout(() => { bar.style.width = (counts[i] / max * 70) + '%'; }, 60); });
+  }
+
+  function renderGuests() {
+    const q = $('search').value.trim().toLowerCase(), f = $('filter').value;
+    const tbody = $('roster'); tbody.replaceChildren();
+    guests.filter((g) => g.email.toLowerCase().includes(q) && (!f || (g.rsvp_status || 'PENDING') === f)).forEach((g, i) => {
+      const tr = el('tr'); tr.style.animationDelay = Math.min(i * 0.03, 0.5) + 's';
+      td(tr, i + 1); td(tr, g.email).style.fontWeight = '700';
+      td(tr, '').appendChild(pill(g.rsvp_status || 'PENDING', g.rsvp_status || 'PENDING'));
+      td(tr, g.shirt_size || 'Unassigned'); td(tr, g.invites_left);
+      const act = td(tr, '');
+      act.appendChild(btn('Set invites', 'alt', async () => { const v = prompt('Invites for ' + g.email + ' (0-20):', g.invites_left); if (v === null) throw new Error('Cancelled'); await api('/api/admin/set-invites', { email: g.email, count: v }); }));
+      act.appendChild(document.createTextNode(' '));
+      act.appendChild(btn('Remove', 'bad', async () => { if (!confirm('Remove ' + g.email + ' from the roster?')) throw new Error('Cancelled'); await api('/api/admin/remove-guest', { email: g.email }); }));
+      tbody.appendChild(tr);
     });
-    $('inv-btn').addEventListener('click', async () => {
-      const email = $('inv-email').value.trim();
-      if (!email) return;
-      try {
-        const r = await api('/api/admin/create-invite', { email });
-        $('inv-out').textContent = (r.emailed ? 'Emailed. ' : 'Email not sent, share this link yourself: ') + r.link;
-        $('inv-email').value = '';
-      } catch (e) { alert(e.message); }
+  }
+
+  function renderInvites() {
+    const tbody = $('invlist'); tbody.replaceChildren();
+    invites.forEach((v, i) => {
+      const tr = el('tr'); tr.style.animationDelay = Math.min(i * 0.03, 0.5) + 's';
+      td(tr, v.invitee_email).style.fontWeight = '700'; td(tr, v.inviter_email);
+      td(tr, '').appendChild(pill(v.status, v.status));
+      td(tr, new Date(v.created_at).toLocaleString());
+      const act = td(tr, '');
+      if (v.status === 'PENDING') act.appendChild(btn('Revoke', 'bad', async () => { if (!confirm('Revoke this invite?')) throw new Error('Cancelled'); await api('/api/admin/revoke-invite', { id: v.id }); }));
+      tbody.appendChild(tr);
     });
-    loadData();
-  </script>
+  }
+
+  async function load() {
+    try { [guests, invites] = await Promise.all([api('/api/admin/guests'), api('/api/admin/invites')]); }
+    catch (e) { if (e.message !== 'Cancelled') alert(e.message); return; }
+    renderStats(); renderGuests(); renderInvites();
+  }
+
+  $('search').addEventListener('input', renderGuests); $('filter').addEventListener('change', renderGuests);
+  $('tab-g').addEventListener('click', () => { $('guests-panel').classList.remove('hidden'); $('invites-panel').classList.add('hidden'); $('tab-g').classList.add('on'); $('tab-i').classList.remove('on'); });
+  $('tab-i').addEventListener('click', () => { $('invites-panel').classList.remove('hidden'); $('guests-panel').classList.add('hidden'); $('tab-i').classList.add('on'); $('tab-g').classList.remove('on'); });
+  $('add-btn').addEventListener('click', async () => {
+    const email = $('new-email').value.trim(); if (!email) return;
+    try { await api('/api/admin/add-guest', { email }); $('new-email').value = ''; $('msg').textContent = 'Added ' + email; load(); } catch (e) { alert(e.message); }
+  });
+  $('inv-btn').addEventListener('click', async () => {
+    const email = $('inv-email').value.trim(); if (!email) return;
+    try { const r = await api('/api/admin/create-invite', { email }); $('msg').textContent = (r.emailed ? 'Emailed. ' : 'Email not sent, share this link yourself: ') + r.link; $('inv-email').value = ''; load(); } catch (e) { alert(e.message); }
+  });
+  $('csv-btn').addEventListener('click', () => {
+    const NL = String.fromCharCode(10), q = (v) => '"' + String(v === null || v === undefined ? '' : v).split('"').join('""') + '"';
+    const rows = [['email', 'rsvp', 'shirt', 'invites_left']].concat(guests.map((g) => [g.email, g.rsvp_status, g.shirt_size, g.invites_left]));
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([rows.map((r) => r.map(q).join(',')).join(NL)], { type: 'text/csv' }));
+    a.download = 'ondroad-guests.csv'; a.click();
+  });
+  setInterval(() => { $('clock').textContent = new Date().toLocaleString(); }, 1000);
+  load();
+</script>
 </body>
-</html>`);
-});
+</html>`;
+
+app.get('/admin', requireAdmin, (req, res) => res.send(ADMIN_PAGE));
 
 // Malformed JSON and other uncaught errors
 app.use((err, req, res, next) => {
