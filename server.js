@@ -151,70 +151,147 @@ app.post('/api/update-rsvp', requireAuth, async (req, res) => {
   }
 });
 
-// --- DISPATCH COSMIC EMAIL INVITE ---
+// ---------- Personal single-use invite links ----------
+const hashToken = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
+const newInviteToken = () => crypto.randomBytes(24).toString('base64url');
+const inviteLink = (t) => `${FRONTEND_URL}/?invite=${t}`;
+
+// Returns an error object (or null). Never throws.
+async function sendInviteEmail(to, from, note, link) {
+  const noteHTML = note
+    ? `<div style="background-color: #1a0a10; padding: 20px; border-left: 4px solid #f2c879; margin: 25px 0; border-radius: 4px;">
+         <p style="color: #c7ad84; font-size: 12px; text-transform: uppercase; margin-top: 0;">Message from ${escapeHtml(from)}:</p>
+         <p style="color: #fff4e0; font-style: italic; font-size: 16px; margin-bottom: 0;">"${escapeHtml(note)}"</p>
+       </div>`
+    : '';
+  try {
+    const { error } = await resend.emails.send({
+      from: EMAIL_FROM,
+      to,
+      subject: `[CONTROL] ${from} chose you as one of their invites`,
+      html: `
+        <div style="background-color: #080307; color: #fff4e0; padding: 40px 20px; font-family: 'Helvetica Neue', sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #3a1a22; border-radius: 12px;">
+          <h1 style="color: #f2c879; letter-spacing: 4px; text-align: center;">CONTROL</h1>
+          <p style="font-size: 16px; text-align: center;">${escapeHtml(from)} chose you as one of their two invites.</p>
+          <p style="font-size: 14px; text-align: center; color: #c7ad84;">This invitation is personal and single-use. Do not forward it.</p>
+          ${noteHTML}
+          <div style="text-align: center; margin-top: 35px;">
+            <a href="${link}" style="display: inline-block; padding: 14px 28px; background: #f2c879; color: #1a0509; text-decoration: none; border-radius: 8px; font-weight: bold; letter-spacing: 1px;">ACCEPT YOUR INVITATION</a>
+          </div>
+        </div>`
+    });
+    return error || null;
+  } catch (err) {
+    return err;
+  }
+}
+
+// --- SEND A PERSONAL INVITE (uses one of the sender's invites) ---
 app.post('/api/send-invite', requireAuth, rateLimit(20, 60 * 60 * 1000), async (req, res) => {
   const sender = req.userEmail;
   const recipient = normalizeEmail(req.body?.recipient_email);
   const note = typeof req.body?.custom_note === 'string' ? req.body.custom_note.trim().slice(0, 300) : '';
   if (!isValidEmail(recipient)) return res.status(400).json({ error: 'A valid recipient email is required.' });
 
+  const token = newInviteToken();
   let client;
   try {
     client = await pool.connect();
     await client.query('BEGIN');
 
-    const exists = await client.query('SELECT 1 FROM guests WHERE LOWER(email) = $1', [recipient]);
-    if (exists.rowCount) {
+    const dup = await client.query(
+      `SELECT 1 FROM guests WHERE LOWER(email) = $1
+       UNION SELECT 1 FROM invites WHERE invitee_email = $1 AND status <> 'REVOKED'`, [recipient]);
+    if (dup.rowCount) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'User is already in the system.' });
+      return res.status(400).json({ error: 'That person has already been invited.' });
     }
-
-    // Atomic check-and-deduct: only succeeds if the sender still has invites.
     const dec = await client.query(
-      'UPDATE guests SET invites_left = invites_left - 1 WHERE LOWER(email) = $1 AND invites_left > 0',
-      [sender]
-    );
+      'UPDATE guests SET invites_left = invites_left - 1 WHERE LOWER(email) = $1 AND invites_left > 0', [sender]);
     if (!dec.rowCount) {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'Zero authorizations remaining.' });
     }
+    await client.query(
+      'INSERT INTO invites (token_hash, inviter_email, invitee_email, note) VALUES ($1, $2, $3, $4)',
+      [hashToken(token), sender, recipient, note]);
 
-    await client.query('INSERT INTO guests (email) VALUES ($1)', [recipient]);
-
-    const noteHTML = note
-      ? `<div style="background-color: #1a1a2e; padding: 20px; border-left: 4px solid #b026ff; margin: 25px 0; border-radius: 4px;">
-           <p style="color: #94a3b8; font-size: 12px; text-transform: uppercase; margin-top: 0;">Message from ${escapeHtml(sender)}:</p>
-           <p style="color: #ffffff; font-style: italic; font-size: 16px; margin-bottom: 0;">"${escapeHtml(note)}"</p>
-         </div>`
-      : '';
-
-    // The Resend SDK returns { data, error } rather than throwing on API errors.
-    const { error } = await resend.emails.send({
-      from: EMAIL_FROM,
-      to: recipient,
-      subject: `[CONTROL] Priority Authorization from ${sender}`,
-      html: `
-        <div style="background-color: #020108; color: #ffffff; padding: 40px 20px; font-family: 'Helvetica Neue', sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #1e293b; border-radius: 12px;">
-          <h1 style="color: #00f0ff; letter-spacing: 4px; text-align: center;">CONTROL PORTAL</h1>
-          <p style="font-size: 16px; text-align: center; color: #e2e8f0;">You have been authorized for priority access.</p>
-          ${noteHTML}
-          <div style="text-align: center; margin-top: 35px;">
-            <a href="${FRONTEND_URL}" style="display: inline-block; padding: 14px 28px; background: linear-gradient(90deg, #00f0ff, #b026ff); color: #ffffff; text-decoration: none; border-radius: 8px; font-weight: bold; letter-spacing: 1px;">INITIATE SECURE LINK</a>
-          </div>
-          <p style="font-size: 11px; color: #64748b; text-align: center; margin-top: 40px; text-transform: uppercase;">Secure transmission from CONTROL server.</p>
-        </div>
-      `
-    });
-    if (error) throw Object.assign(new Error(error.message), { publicMessage: 'Email could not be delivered.' });
+    const emailError = await sendInviteEmail(recipient, sender, note, inviteLink(token));
+    if (emailError) throw Object.assign(new Error(emailError.message), { publicMessage: 'Email could not be delivered.' });
 
     await client.query('COMMIT');
     res.json({ success: true });
   } catch (err) {
     await client?.query('ROLLBACK').catch(() => {});
-    if (err.code === '23505') return res.status(400).json({ error: 'User is already in the system.' });
+    if (err.code === '23505') return res.status(400).json({ error: 'That person has already been invited.' });
     serverError(res, err, err.publicMessage || 'Server error during dispatch.');
   } finally {
     client?.release();
+  }
+});
+
+// --- LOOK UP AN INVITE LINK (public) ---
+app.get('/api/invite/:token', rateLimit(30, 15 * 60 * 1000), async (req, res) => {
+  try {
+    const r = await pool.query('SELECT inviter_email, note, status FROM invites WHERE token_hash = $1', [hashToken(req.params.token)]);
+    if (!r.rowCount || r.rows[0].status !== 'PENDING') {
+      return res.status(404).json({ error: 'This invitation is invalid or has already been used.' });
+    }
+    res.json({ inviter: r.rows[0].inviter_email, note: r.rows[0].note });
+  } catch (err) {
+    serverError(res, err);
+  }
+});
+
+// --- ACCEPT AN INVITE: joins the roster with two invites and logs in ---
+app.post('/api/invite/accept', rateLimit(10, 15 * 60 * 1000), async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+  const bad = 'Invitation invalid, already used, or not issued to that email.';
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query('BEGIN');
+    const r = await client.query(
+      'SELECT id, invitee_email, status FROM invites WHERE token_hash = $1 FOR UPDATE', [hashToken(req.body?.token)]);
+    const inv = r.rows[0];
+    if (!inv || inv.status !== 'PENDING' || inv.invitee_email !== email) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: bad });
+    }
+    await client.query(
+      `INSERT INTO guests (email, rsvp_status, shirt_size, invites_left)
+       SELECT $1::text, 'PENDING', 'Unassigned', 2
+       WHERE NOT EXISTS (SELECT 1 FROM guests WHERE LOWER(email) = $1::text)`, [email]);
+    await client.query("UPDATE invites SET status = 'ACCEPTED', accepted_at = NOW() WHERE id = $1", [inv.id]);
+    await client.query('COMMIT');
+    res.json({ success: true, token: createToken(email), user: { email } });
+  } catch (err) {
+    await client?.query('ROLLBACK').catch(() => {});
+    serverError(res, err);
+  } finally {
+    client?.release();
+  }
+});
+
+// --- ADMIN: create an invite without using anyone's allowance; returns the link ---
+app.post('/api/admin/create-invite', requireAdmin, async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+  const note = typeof req.body?.note === 'string' ? req.body.note.trim().slice(0, 300) : '';
+  if (!isValidEmail(email)) return res.status(400).json({ error: 'A valid email is required.' });
+  const token = newInviteToken();
+  try {
+    const dup = await pool.query(
+      `SELECT 1 FROM guests WHERE LOWER(email) = $1
+       UNION SELECT 1 FROM invites WHERE invitee_email = $1 AND status <> 'REVOKED'`, [email]);
+    if (dup.rowCount) return res.status(400).json({ error: 'That person is already on the roster or invited.' });
+    await pool.query(
+      "INSERT INTO invites (token_hash, inviter_email, invitee_email, note) VALUES ($1, 'CONTROL', $2, $3)",
+      [hashToken(token), email, note]);
+    const link = inviteLink(token);
+    const emailed = !(await sendInviteEmail(email, 'CONTROL', note, link));
+    res.json({ success: true, link, emailed });
+  } catch (err) {
+    serverError(res, err);
   }
 });
 
@@ -288,6 +365,12 @@ app.get('/admin', requireAdmin, (req, res) => {
     <input type="email" id="new-email" placeholder="guest@domain.com" style="width: 300px;">
     <button class="btn" id="add-btn">Authorize Guest</button>
   </div>
+  <div style="background: #0f172a; padding: 15px; border-radius: 8px; margin-bottom: 25px;">
+    <h3>Create Personal Invite Link</h3>
+    <input type="email" id="inv-email" placeholder="guest@domain.com" style="width: 300px;">
+    <button class="btn" id="inv-btn">Create Link</button>
+    <p id="inv-out" style="word-break: break-all;"></p>
+  </div>
   <h3>Guest Roster</h3>
   <table>
     <thead><tr><th>#</th><th>Email</th><th>RSVP Status</th><th>Shirt Size</th><th>Invites Remaining</th><th>Action</th></tr></thead>
@@ -340,6 +423,15 @@ app.get('/admin', requireAdmin, (req, res) => {
       const email = $('new-email').value.trim();
       if (!email) return;
       try { await api('/api/admin/add-guest', { email }); $('new-email').value = ''; loadData(); } catch (e) { alert(e.message); }
+    });
+    $('inv-btn').addEventListener('click', async () => {
+      const email = $('inv-email').value.trim();
+      if (!email) return;
+      try {
+        const r = await api('/api/admin/create-invite', { email });
+        $('inv-out').textContent = (r.emailed ? 'Emailed. ' : 'Email not sent, share this link yourself: ') + r.link;
+        $('inv-email').value = '';
+      } catch (e) { alert(e.message); }
     });
     loadData();
   </script>
