@@ -97,7 +97,10 @@ const rateLimit = (max, windowMs) => {
 // ---------- App ----------
 const app = express();
 app.set('trust proxy', 1); // Render sits behind a proxy
-app.use(cors({ origin: FRONTEND_URL }));
+// Accept the configured frontend plus the production domain (and any extras, comma-separated).
+const ALLOWED_ORIGINS = [FRONTEND_URL, 'https://ondroad.xyz', 'https://www.ondroad.xyz',
+  ...(process.env.EXTRA_ORIGINS || '').split(',').map((o) => o.trim().replace(/\/$/, '')).filter(Boolean)];
+app.use(cors({ origin: ALLOWED_ORIGINS }));
 app.use(express.json({ limit: '10kb' }));
 
 // --- VIP LOGIN ---
