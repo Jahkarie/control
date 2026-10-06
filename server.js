@@ -105,7 +105,44 @@ app.use(express.json({ limit: '10kb' }));
 
 // Payment instructions, pay-by deadline, auto-expiry and reminders (see payments.js).
 // Registered before the other routes on purpose: it replaces /api/my-order below.
-registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, requireAuth, requireAdmin, escapeHtml });
+const mail = registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, requireAuth, requireAdmin, escapeHtml });
+const ADMIN_EMAIL = normalizeEmail(process.env.ADMIN_EMAIL); // optional: gets a copy of refund requests
+
+// Creates the packages/orders/settings tables and any missing columns on startup,
+// so no SQL has to be run by hand in Aiven. Safe to run every boot.
+async function ensureSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS packages (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      price_cents INTEGER NOT NULL DEFAULT 0,
+      currency TEXT NOT NULL DEFAULT 'XCD',
+      includes TEXT NOT NULL DEFAULT '',
+      requires_compliance BOOLEAN NOT NULL DEFAULT TRUE,
+      capacity INTEGER,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS orders (
+      id SERIAL PRIMARY KEY,
+      guest_email TEXT NOT NULL,
+      package_id INTEGER NOT NULL REFERENCES packages(id),
+      status TEXT NOT NULL DEFAULT 'RESERVED',
+      reference_code TEXT NOT NULL UNIQUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      paid_at TIMESTAMPTZ
+    );
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL DEFAULT ''
+    );
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS reminder_sent_at TIMESTAMPTZ;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS cancel_requested_at TIMESTAMPTZ;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS cancel_reason TEXT;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMPTZ;
+  `);
+}
 
 // --- VIP LOGIN: step 1, request a one-time link ---
 // Always returns the same generic response whether or not the email is on the roster,
@@ -500,7 +537,7 @@ app.post('/api/orders', requireAuth, rateLimit(10, 60 * 60 * 1000), async (req, 
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'You already have a package reserved. Cancel it first to choose another.' });
     }
-    const pkg = await client.query('SELECT capacity, active FROM packages WHERE id = $1 FOR UPDATE', [packageId]);
+    const pkg = await client.query('SELECT name, price_cents, currency, capacity, active FROM packages WHERE id = $1 FOR UPDATE', [packageId]);
     if (!pkg.rowCount || !pkg.rows[0].active) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'That package is no longer available.' });
@@ -513,11 +550,15 @@ app.post('/api/orders', requireAuth, rateLimit(10, 60 * 60 * 1000), async (req, 
       }
     }
     const ref = newRef();
-    await client.query(
-      'INSERT INTO orders (guest_email, package_id, reference_code) VALUES ($1, $2, $3)',
+    const created = await client.query(
+      'INSERT INTO orders (guest_email, package_id, reference_code) VALUES ($1, $2, $3) RETURNING created_at',
       [req.userEmail, packageId, ref]);
     await client.query('COMMIT');
     res.json({ success: true, reference_code: ref });
+    // Sent after responding so a slow email never holds up the guest.
+    const p = pkg.rows[0];
+    sendOrderReceivedEmail(req.userEmail, p.name, money(p.price_cents, p.currency), ref, created.rows[0].created_at)
+      .catch((e) => console.error('Order-received email error:', e));
   } catch (err) {
     await client?.query('ROLLBACK').catch(() => {});
     serverError(res, err);
@@ -528,8 +569,54 @@ app.post('/api/orders', requireAuth, rateLimit(10, 60 * 60 * 1000), async (req, 
 
 app.post('/api/orders/cancel', requireAuth, async (req, res) => {
   try {
-    const r = await pool.query("UPDATE orders SET status = 'CANCELLED' WHERE guest_email = $1 AND status = 'RESERVED'", [req.userEmail]);
+    const r = await pool.query(
+      `UPDATE orders SET status = 'CANCELLED' WHERE guest_email = $1 AND status = 'RESERVED'
+       RETURNING reference_code, (SELECT name FROM packages WHERE id = orders.package_id) AS package_name`, [req.userEmail]);
     if (!r.rowCount) return res.status(400).json({ error: 'No reserved order to cancel.' });
+    res.json({ success: true });
+    const o = r.rows[0];
+    mail.send(req.userEmail, "Reservation cancelled — On D' Road",
+      mail.shell('RESERVATION CANCELLED', 'Cancelled', '#ffd400',
+        `<p style="${mail.p1}">Your reservation for ${escapeHtml(o.package_name)} (${escapeHtml(o.reference_code)}) is cancelled.</p>
+         <p style="${mail.p2}">Nothing was paid, so nothing is owed. If spots are still open, you can reserve again from your account.</p>`));
+  } catch (err) {
+    serverError(res, err);
+  }
+});
+
+// A paid guest asks to cancel and get their money back. The pass stays valid until the organizer approves.
+app.post('/api/orders/request-refund', requireAuth, rateLimit(5, 60 * 60 * 1000), async (req, res) => {
+  const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim().slice(0, 500) : '';
+  try {
+    const r = await pool.query(
+      `UPDATE orders SET cancel_requested_at = NOW(), cancel_reason = $2
+       WHERE guest_email = $1 AND status = 'PAID' AND cancel_requested_at IS NULL
+       RETURNING reference_code, (SELECT name FROM packages WHERE id = orders.package_id) AS package_name`, [req.userEmail, reason]);
+    if (!r.rowCount) return res.status(400).json({ error: 'No paid order to cancel, or a request is already open.' });
+    res.json({ success: true });
+    const o = r.rows[0];
+    mail.send(req.userEmail, "Cancellation request received — On D' Road",
+      mail.shell('REQUEST RECEIVED', 'We got it', '#ffd400',
+        `<p style="${mail.p1}">We received your request to cancel ${escapeHtml(o.package_name)} (${escapeHtml(o.reference_code)}) and get your money back.</p>
+         <p style="${mail.p2}">We'll email you when your refund is approved, with how to collect it. Your pass stays active until then.</p>`));
+    if (ADMIN_EMAIL) {
+      mail.send(ADMIN_EMAIL, `Refund requested: ${o.reference_code}`,
+        mail.shell('REFUND REQUEST', 'Action needed', '#ff6a1f',
+          `<p style="${mail.p1}">${escapeHtml(req.userEmail)} wants to cancel ${escapeHtml(o.package_name)} (${escapeHtml(o.reference_code)}).</p>
+           ${reason ? `<p style="${mail.p2}">Reason: ${escapeHtml(reason)}</p>` : ''}
+           <p style="${mail.p2}">Approve it in the Orders tab of the Command Center.</p>`));
+    }
+  } catch (err) {
+    serverError(res, err);
+  }
+});
+
+app.post('/api/orders/withdraw-refund', requireAuth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `UPDATE orders SET cancel_requested_at = NULL, cancel_reason = NULL
+       WHERE guest_email = $1 AND status = 'PAID' AND cancel_requested_at IS NOT NULL`, [req.userEmail]);
+    if (!r.rowCount) return res.status(400).json({ error: 'No open cancellation request.' });
     res.json({ success: true });
   } catch (err) {
     serverError(res, err);
@@ -539,13 +626,30 @@ app.post('/api/orders/cancel', requireAuth, async (req, res) => {
 app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   try {
     const r = await pool.query(
-      `SELECT o.id, o.guest_email, o.status, o.reference_code, o.created_at, o.paid_at, p.name AS package_name, p.price_cents, p.currency
-       FROM orders o JOIN packages p ON p.id = o.package_id ORDER BY o.id DESC`);
+      `SELECT o.id, o.guest_email, o.status, o.reference_code, o.created_at, o.paid_at,
+              o.cancel_requested_at, o.cancel_reason, o.refunded_at, p.name AS package_name, p.price_cents, p.currency
+       FROM orders o JOIN packages p ON p.id = o.package_id
+       ORDER BY (o.status = 'PAID' AND o.cancel_requested_at IS NOT NULL) DESC, o.id DESC`);
     res.json(r.rows);
   } catch (err) {
     serverError(res, err);
   }
 });
+
+const money = (cents, cur) => (cur || 'XCD') + ' ' + (cents / 100).toFixed(2);
+
+async function sendOrderReceivedEmail(to, packageName, price, ref, createdAt) {
+  const { instructions, payDays } = await mail.getSettings();
+  const deadline = payDays > 0
+    ? `<p style="${mail.p1}">Pay by ${mail.fmt(mail.payBy(createdAt, payDays))} or your spot is released.</p>` : '';
+  return mail.send(to, "Order received — On D' Road",
+    mail.shell('ORDER RECEIVED', 'Spot held', '#ff6a1f',
+      `<p style="${mail.p1}">You reserved ${escapeHtml(packageName)} (${escapeHtml(price)}).</p>
+       <p style="${mail.p2}">Reference: ${escapeHtml(ref)}</p>
+       ${deadline}
+       ${mail.instrBlock(instructions)}
+       <p style="${mail.p2}">Your spot is not confirmed until payment is received. Your entry pass appears in your account once it is.</p>`));
+}
 
 async function sendPaidEmail(to, packageName, ref) {
   try {
@@ -596,12 +700,40 @@ app.post('/api/admin/orders/:id/mark-paid', requireAdmin, async (req, res) => {
   }
 });
 
+// Cancels an unpaid reservation. Paid orders go through approve-refund instead.
 app.post('/api/admin/orders/:id/cancel', requireAdmin, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   try {
-    const r = await pool.query("UPDATE orders SET status = 'CANCELLED' WHERE id = $1 AND status <> 'CANCELLED'", [id]);
-    if (!r.rowCount) return res.status(400).json({ error: 'Order not found.' });
-    res.json({ success: true });
+    const r = await pool.query(
+      `UPDATE orders SET status = 'CANCELLED' WHERE id = $1 AND status = 'RESERVED'
+       RETURNING guest_email, reference_code, (SELECT name FROM packages WHERE id = orders.package_id) AS package_name`, [id]);
+    if (!r.rowCount) return res.status(400).json({ error: 'Order not found or not an unpaid reservation.' });
+    const o = r.rows[0];
+    const emailError = await mail.send(o.guest_email, "Reservation cancelled — On D' Road",
+      mail.shell('RESERVATION CANCELLED', 'Cancelled', '#ffd400',
+        `<p style="${mail.p1}">Your reservation for ${escapeHtml(o.package_name)} (${escapeHtml(o.reference_code)}) was cancelled by the organizers.</p>
+         <p style="${mail.p2}">Nothing was paid, so nothing is owed. Questions? Reply to this email.</p>`));
+    res.json({ success: true, emailed: !emailError });
+  } catch (err) {
+    serverError(res, err);
+  }
+});
+
+// Cancels a paid order and records the refund. The guest's pass stops working immediately.
+app.post('/api/admin/orders/:id/approve-refund', requireAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  try {
+    const r = await pool.query(
+      `UPDATE orders o SET status = 'CANCELLED', refunded_at = NOW() FROM packages p
+       WHERE o.id = $1 AND p.id = o.package_id AND o.status = 'PAID'
+       RETURNING o.guest_email, o.reference_code, p.name AS package_name, p.price_cents, p.currency`, [id]);
+    if (!r.rowCount) return res.status(400).json({ error: 'Order not found or not paid.' });
+    const o = r.rows[0];
+    const emailError = await mail.send(o.guest_email, "Refund approved — On D' Road",
+      mail.shell('REFUND APPROVED', 'Cancelled', '#7fd63c',
+        `<p style="${mail.p1}">Your order for ${escapeHtml(o.package_name)} (${escapeHtml(o.reference_code)}) is cancelled and your refund of ${escapeHtml(money(o.price_cents, o.currency))} is approved.</p>
+         <p style="${mail.p2}">Refunds are paid in cash where you paid. Bring your reference code. Your entry pass is no longer valid.</p>`));
+    res.json({ success: true, emailed: !emailError });
   } catch (err) {
     serverError(res, err);
   }
@@ -804,7 +936,7 @@ th { border-bottom: 1px solid rgba(233,180,76,.35); } td { border-bottom: 1px so
 
   <div class="panel hidden" id="orders-panel">
     <div class="row">
-      <select id="order-filter"><option value="">All statuses</option><option value="RESERVED">Reserved</option><option value="PAID">Paid</option><option value="CANCELLED">Cancelled</option></select>
+      <select id="order-filter"><option value="">All statuses</option><option value="RESERVED">Reserved</option><option value="PAID">Paid</option><option value="CANCELLED">Cancelled</option><option value="REFUND">Refund requests</option></select>
     </div>
     <div class="scroll"><table><thead><tr><th>Guest</th><th>Package</th><th>Status</th><th>Ref</th><th>Reserved</th><th>Actions</th></tr></thead><tbody id="orderlist"></tbody></table></div>
   </div>
@@ -835,7 +967,7 @@ async function api(path, body) {
 function el(tag, text, cls) { const e = document.createElement(tag); if (text !== undefined) e.textContent = text; if (cls) e.className = cls; return e; }
 function td(tr, text) { const c = el('td', text); tr.appendChild(c); return c; }
 function pill(text, cls) { return el('span', text, 'pill ' + cls); }
-function btn(label, cls, fn) { const b = el('button', label, 'btn ' + cls); b.addEventListener('click', async () => { try { await fn(); await load(); } catch (e) { alert(e.message); } }); return b; }
+function btn(label, cls, fn) { const b = el('button', label, 'btn ' + cls); b.addEventListener('click', async () => { try { await fn(); await load(); if (!$('orders-panel').classList.contains('hidden')) await loadOrders(); if (!$('products-panel').classList.contains('hidden')) await loadProducts(); } catch (e) { if (e.message !== 'Cancelled') alert(e.message); } }); return b; }
 
 function renderStats() {
   const sum = (f) => guests.filter(f).length;
@@ -945,11 +1077,16 @@ $('p-create').addEventListener('click', async () => {
 function renderOrders(orders) {
   const f = $('order-filter').value;
   const tbody = $('orderlist'); tbody.replaceChildren();
-  orders.filter((o) => !f || o.status === f).forEach((o) => {
+  const wantsRefund = (o) => o.status === 'PAID' && !!o.cancel_requested_at;
+  orders.filter((o) => !f || (f === 'REFUND' ? wantsRefund(o) : o.status === f)).forEach((o) => {
     const tr = el('tr');
     td(tr, o.guest_email).style.fontWeight = '700';
     td(tr, o.package_name + ' (' + money(o.price_cents, o.currency) + ')');
-    td(tr, '').appendChild(pill(o.status, o.status === 'PAID' ? 'CONFIRMED' : o.status === 'CANCELLED' ? 'REVOKED' : 'PENDING'));
+    const st = td(tr, '');
+    if (wantsRefund(o)) st.appendChild(pill('REFUND REQUESTED', 'PENDING'));
+    else if (o.status === 'CANCELLED' && o.refunded_at) st.appendChild(pill('REFUNDED', 'REVOKED'));
+    else st.appendChild(pill(o.status, o.status === 'PAID' ? 'CONFIRMED' : o.status === 'CANCELLED' ? 'REVOKED' : 'PENDING'));
+    if (wantsRefund(o) && o.cancel_reason) { const r = el('div', 'Reason: ' + o.cancel_reason); r.style.fontSize = '12px'; r.style.marginTop = '4px'; st.appendChild(r); }
     td(tr, o.reference_code);
     td(tr, new Date(o.created_at).toLocaleDateString());
     const act = td(tr, '');
@@ -957,6 +1094,12 @@ function renderOrders(orders) {
       act.appendChild(btn('Mark paid', '', async () => { await api('/api/admin/orders/' + o.id + '/mark-paid', {}); }));
       act.appendChild(document.createTextNode(' '));
       act.appendChild(btn('Cancel', 'bad', async () => { if (!confirm('Cancel this order?')) throw new Error('Cancelled'); await api('/api/admin/orders/' + o.id + '/cancel', {}); }));
+    } else if (o.status === 'PAID') {
+      const label = wantsRefund(o) ? 'Approve refund' : 'Cancel + refund';
+      act.appendChild(btn(label, 'bad', async () => {
+        if (!confirm('Cancel this paid order and refund ' + money(o.price_cents, o.currency) + ' to ' + o.guest_email + '? Their pass stops working.')) throw new Error('Cancelled');
+        await api('/api/admin/orders/' + o.id + '/approve-refund', {});
+      }));
     }
     tbody.appendChild(tr);
   });
@@ -994,4 +1137,7 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Server live on port ${PORT}`));
+ensureSchema()
+  .then(() => console.log('Database schema ready.'))
+  .catch((err) => console.error('Schema setup failed (check DB settings):', err.message))
+  .finally(() => app.listen(PORT, () => console.log(`Server live on port ${PORT}`)));
