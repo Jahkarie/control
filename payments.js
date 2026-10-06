@@ -78,8 +78,8 @@ export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, 
     try {
       const { instructions, payDays } = await getSettings();
       const r = await pool.query(
-        `SELECT o.id, o.status, o.reference_code, o.created_at, o.cancel_requested_at,
-                p.name AS package_name, p.price_cents, p.currency, p.includes
+        `SELECT o.id, o.status, o.reference_code, o.created_at, o.cancel_requested_at, o.size,
+                p.name AS package_name, p.price_cents, p.currency, p.includes, p.sizes AS package_sizes
          FROM orders o JOIN packages p ON p.id = o.package_id
          WHERE o.guest_email = $1 AND o.status <> 'CANCELLED' ORDER BY o.id DESC LIMIT 1`, [req.userEmail]);
       const o = r.rows[0];

@@ -7,6 +7,7 @@ import { registerPayments } from './payments.js';
 import { renderEmail } from './emails.js';
 import { registerDoor } from './door.js';
 import { registerEvent } from './event.js';
+import { registerSite } from './site.js';
 
 const { Pool } = pkg;
 
@@ -42,6 +43,17 @@ const safeEqual = (a, b) => {
   const hb = crypto.createHash('sha256').update(String(b)).digest();
   return crypto.timingSafeEqual(ha, hb);
 };
+// "S, m , M, L" -> ['S', 'm', 'L']: trimmed, no repeats (ignoring case), at most 15 sizes of up to 15 characters.
+const sizeList = (v) => {
+  const out = [];
+  for (const part of String(v || '').split(',')) {
+    const size = part.trim().slice(0, 15);
+    if (size && out.length < 15 && !out.some((x) => x.toLowerCase() === size.toLowerCase())) out.push(size);
+  }
+  return out;
+};
+// The package's own spelling of the size the guest picked, or null if it isn't one of them.
+const pickSize = (sizes, v) => sizes.find((s) => s.toLowerCase() === String(v || '').trim().toLowerCase()) || null;
 const serverError = (res, err, msg = 'Server error.') => {
   console.error(err);
   res.status(500).json({ error: msg });
@@ -107,6 +119,8 @@ app.use(cors({ origin: ALLOWED_ORIGINS }));
 // Door check-in (staff scanner at /door). Registered before the 10kb body limit because
 // a phone coming back online can upload a batch of offline check-ins at once.
 registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLimit, requireAdmin });
+// Contact details and terms (see site.js). Also before the 10kb limit: the terms can be longer than that.
+const site = registerSite({ app, pool, express, requireAdmin });
 app.use(express.json({ limit: '10kb' }));
 
 // Payment instructions, pay-by deadline, auto-expiry and reminders (see payments.js).
@@ -178,6 +192,9 @@ async function ensureSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     ALTER TABLE guests ADD COLUMN IF NOT EXISTS age_confirmed_at TIMESTAMPTZ;
+    ALTER TABLE packages ADD COLUMN IF NOT EXISTS sizes TEXT NOT NULL DEFAULT '';
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS size TEXT;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS terms_accepted_at TIMESTAMPTZ;
   `);
 }
 
@@ -417,7 +434,7 @@ app.post('/api/admin/create-invite', requireAdmin, async (req, res) => {
 app.get('/api/packages', async (req, res) => {
   try {
     const r = await pool.query(
-      `SELECT p.id, p.name, p.price_cents, p.currency, p.includes, p.requires_compliance, p.capacity,
+      `SELECT p.id, p.name, p.price_cents, p.currency, p.includes, p.requires_compliance, p.capacity, p.sizes,
               GREATEST(0, COALESCE(p.capacity, 2147483647) - (SELECT COUNT(*) FROM orders o WHERE o.package_id = p.id AND o.status <> 'CANCELLED')) AS spots_left
        FROM packages p WHERE p.active = TRUE ORDER BY p.sort_order ASC, p.id ASC`);
     res.json(r.rows);
@@ -429,7 +446,10 @@ app.get('/api/packages', async (req, res) => {
 app.get('/api/admin/packages', requireAdmin, async (req, res) => {
   try {
     const r = await pool.query(
-      `SELECT p.*, (SELECT COUNT(*) FROM orders o WHERE o.package_id = p.id AND o.status <> 'CANCELLED') AS claimed
+      `SELECT p.*, (SELECT COUNT(*) FROM orders o WHERE o.package_id = p.id AND o.status <> 'CANCELLED') AS claimed,
+              (SELECT COALESCE(json_object_agg(s.size, s.n), '{}'::json) FROM
+                (SELECT o.size, COUNT(*) AS n FROM orders o
+                 WHERE o.package_id = p.id AND o.status <> 'CANCELLED' AND o.size IS NOT NULL GROUP BY o.size) s) AS size_counts
        FROM packages p ORDER BY p.sort_order ASC, p.id ASC`);
     res.json(r.rows);
   } catch (err) {
@@ -445,12 +465,13 @@ app.post('/api/admin/packages', requireAdmin, async (req, res) => {
   const capacity = req.body?.capacity === '' || req.body?.capacity == null ? null : parseInt(req.body.capacity, 10);
   const sortOrder = parseInt(req.body?.sort_order, 10) || 0;
   const currency = ['XCD', 'USD'].includes(req.body?.currency) ? req.body.currency : 'XCD';
+  const sizes = sizeList(req.body?.sizes).join(', ');
   if (!name || !Number.isFinite(price) || price < 0) return res.status(400).json({ error: 'A name and a valid price (in cents) are required.' });
   try {
     const r = await pool.query(
-      `INSERT INTO packages (name, price_cents, currency, includes, requires_compliance, capacity, sort_order)
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-      [name, price, currency, includes, requiresCompliance, capacity, sortOrder]);
+      `INSERT INTO packages (name, price_cents, currency, includes, requires_compliance, capacity, sort_order, sizes)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+      [name, price, currency, includes, requiresCompliance, capacity, sortOrder, sizes]);
     res.json({ success: true, id: r.rows[0].id });
   } catch (err) {
     serverError(res, err);
@@ -468,6 +489,7 @@ app.post('/api/admin/packages/:id', requireAdmin, async (req, res) => {
   if (req.body?.capacity !== undefined) push('capacity', req.body.capacity === '' || req.body.capacity == null ? null : parseInt(req.body.capacity, 10));
   if (req.body?.active !== undefined) push('active', !!req.body.active);
   if (req.body?.sort_order !== undefined) push('sort_order', parseInt(req.body.sort_order, 10) || 0);
+  if (typeof req.body?.sizes === 'string') push('sizes', sizeList(req.body.sizes).join(', '));
   if (!id || !fields.length) return res.status(400).json({ error: 'Nothing to update.' });
   try {
     await pool.query(`UPDATE packages SET ${fields.join(', ')} WHERE id = $${i}`, [...values, id]);
@@ -513,6 +535,7 @@ app.get('/api/my-order', requireAuth, async (req, res) => {
 app.post('/api/orders', requireAuth, rateLimit(10, 60 * 60 * 1000), async (req, res) => {
   const packageId = parseInt(req.body?.package_id, 10);
   if (!packageId) return res.status(400).json({ error: 'Choose a package.' });
+  if (req.body?.terms !== true) return res.status(400).json({ error: 'Agree to the terms to reserve a package.', code: 'TERMS_REQUIRED' });
   let client;
   try {
     client = await pool.connect();
@@ -535,10 +558,16 @@ app.post('/api/orders', requireAuth, rateLimit(10, 60 * 60 * 1000), async (req, 
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'You already have a package reserved. Cancel it first to choose another.' });
     }
-    const pkg = await client.query('SELECT name, price_cents, currency, capacity, active FROM packages WHERE id = $1 FOR UPDATE', [packageId]);
+    const pkg = await client.query('SELECT name, price_cents, currency, capacity, active, sizes FROM packages WHERE id = $1 FOR UPDATE', [packageId]);
     if (!pkg.rowCount || !pkg.rows[0].active) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'That package is no longer available.' });
+    }
+    const sizes = sizeList(pkg.rows[0].sizes);
+    const size = pickSize(sizes, req.body?.size);
+    if (sizes.length && !size) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Choose your size.', code: 'SIZE_REQUIRED' });
     }
     if (pkg.rows[0].capacity !== null) {
       const claimed = await client.query("SELECT COUNT(*) FROM orders WHERE package_id = $1 AND status <> 'CANCELLED'", [packageId]);
@@ -549,8 +578,9 @@ app.post('/api/orders', requireAuth, rateLimit(10, 60 * 60 * 1000), async (req, 
     }
     const ref = newRef();
     const created = await client.query(
-      'INSERT INTO orders (guest_email, package_id, reference_code) VALUES ($1, $2, $3) RETURNING created_at',
-      [req.userEmail, packageId, ref]);
+      `INSERT INTO orders (guest_email, package_id, reference_code, size, terms_accepted_at)
+       VALUES ($1, $2, $3, $4, NOW()) RETURNING created_at`,
+      [req.userEmail, packageId, ref, size]);
     await client.query('COMMIT');
     res.json({ success: true, reference_code: ref });
     // Sent after responding so a slow email never holds up the guest.
@@ -562,6 +592,22 @@ app.post('/api/orders', requireAuth, rateLimit(10, 60 * 60 * 1000), async (req, 
     serverError(res, err);
   } finally {
     client?.release();
+  }
+});
+
+// Lets a guest change the size on their current order (from the sizes the package offers).
+app.post('/api/orders/size', requireAuth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT o.id, p.sizes FROM orders o JOIN packages p ON p.id = o.package_id
+       WHERE o.guest_email = $1 AND o.status <> 'CANCELLED' ORDER BY o.id DESC LIMIT 1`, [req.userEmail]);
+    if (!r.rowCount) return res.status(400).json({ error: 'You have no order to change.' });
+    const size = pickSize(sizeList(r.rows[0].sizes), req.body?.size);
+    if (!size) return res.status(400).json({ error: 'Choose one of the sizes listed.' });
+    await pool.query('UPDATE orders SET size = $1 WHERE id = $2', [size, r.rows[0].id]);
+    res.json({ success: true, size });
+  } catch (err) {
+    serverError(res, err);
   }
 });
 
@@ -634,7 +680,7 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   try {
     const r = await pool.query(
       `SELECT o.id, o.package_id, o.guest_email, o.status, o.reference_code, o.created_at, o.paid_at,
-              o.cancel_requested_at, o.cancel_reason, o.refunded_at, o.checked_in_at, o.checked_in_by,
+              o.cancel_requested_at, o.cancel_reason, o.refunded_at, o.checked_in_at, o.checked_in_by, o.size,
               p.name AS package_name, p.price_cents, p.currency
        FROM orders o JOIN packages p ON p.id = o.package_id
        ORDER BY (o.status = 'PAID' AND o.cancel_requested_at IS NOT NULL) DESC, o.id DESC`);
@@ -1026,7 +1072,7 @@ td.actions .btn + .btn { margin-left: 6px; }
 .create { padding: 18px; border-bottom: 1px solid var(--line); background: rgba(243, 236, 226, .015); }
 .create h3 { margin: 0 0 14px; font-size: 14px; font-weight: 600; }
 .create-grid { display: grid; grid-template-columns: 2fr 1fr 110px 1fr; gap: 10px; }
-.create-grid textarea { grid-column: 1 / -1; }
+.create-grid textarea, .create-grid #p-sizes { grid-column: 1 / -1; }
 .create-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
 .check { display: inline-flex; align-items: center; gap: 10px; font-size: 14px; color: var(--text); cursor: pointer; }
 @media (max-width: 700px) { .create-grid { grid-template-columns: 1fr 1fr; } .create-grid input:first-child { grid-column: 1 / -1; } }
@@ -1057,6 +1103,7 @@ dialog p { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
     <a class="top-link" href="/door" target="_blank" rel="noopener">Door scanner</a>
     <a class="top-link" href="/admin/payments">Payment settings</a>
     <a class="top-link" href="/admin/event">Event &amp; messages</a>
+    <a class="top-link" href="/admin/site">Contact &amp; terms</a>
     <a class="top-link" href="${FRONTEND_URL}" target="_blank" rel="noopener">View site &#8599;</a>
     <span id="clock" class="clock"></span>
   </nav>
@@ -1131,6 +1178,7 @@ dialog p { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
         <select id="p-currency" aria-label="Currency"><option value="XCD">XCD</option><option value="USD">USD</option></select>
         <input id="p-capacity" type="number" min="1" placeholder="Capacity (blank = no limit)" aria-label="Capacity">
         <textarea id="p-includes" placeholder="What's included, one item per line" aria-label="What's included"></textarea>
+        <input id="p-sizes" placeholder="Sizes guests choose from, e.g. S, M, L, XL (leave blank if no size is needed)" aria-label="Sizes">
       </div>
       <div class="create-foot">
         <label class="check"><input type="checkbox" id="p-compliance" checked> Requires costume compliance</label>
@@ -1442,7 +1490,14 @@ function renderProducts() {
     const meta = [];
     if (lines.length) meta.push(plural(lines.length, 'item', 'items') + ' included');
     if (p.requires_compliance) meta.push('Costume compliance');
+    if (p.sizes) meta.push('Sizes: ' + p.sizes);
     if (meta.length) name.appendChild(el('span', meta.join(' · '), 'subtext'));
+    // How many active orders picked each size, in the package's own size order.
+    const counts = p.size_counts || {};
+    const order = String(p.sizes || '').split(',').map((s) => s.trim()).filter(Boolean);
+    Object.keys(counts).forEach((k) => { if (order.indexOf(k) < 0) order.push(k); });
+    const picked = order.filter((k) => counts[k]).map((k) => k + ' ' + counts[k]);
+    if (picked.length) name.appendChild(el('span', 'Ordered: ' + picked.join(' · '), 'subtext'));
     td(tr, money(p.price_cents, p.currency), 'num');
     td(tr, p.claimed + (p.capacity !== null && p.capacity !== undefined ? ' / ' + p.capacity : ''), 'num');
     const vis = td(tr, '');
@@ -1462,12 +1517,13 @@ function renderProducts() {
         { name: 'price', label: 'Price (' + (p.currency || 'XCD') + ')', type: 'number', step: '0.01', min: 0, value: (p.price_cents / 100).toFixed(2), required: true },
         { name: 'capacity', label: 'Capacity (blank = no limit)', type: 'number', min: 1, value: p.capacity },
         { name: 'includes', label: "What's included (one per line)", type: 'textarea', value: p.includes },
+        { name: 'sizes', label: 'Sizes (comma-separated, blank = no size)', value: p.sizes, placeholder: 'S, M, L, XL' },
         { name: 'requires_compliance', label: 'Requires costume compliance', type: 'checkbox', value: p.requires_compliance }
       ] });
       if (!v) return false;
       const price = parseFloat(v.price);
       if (!v.name.trim() || !(price >= 0)) throw new Error('Name and a valid price are required.');
-      await api('/api/admin/packages/' + p.id, { name: v.name, price_cents: Math.round(price * 100), capacity: v.capacity, includes: v.includes, requires_compliance: v.requires_compliance });
+      await api('/api/admin/packages/' + p.id, { name: v.name, price_cents: Math.round(price * 100), capacity: v.capacity, includes: v.includes, sizes: v.sizes, requires_compliance: v.requires_compliance });
       return 'Package saved.';
     }));
     act.appendChild(actionBtn('Delete', 'danger', async () => {
@@ -1491,7 +1547,8 @@ function renderOrders() {
   list.forEach((o) => {
     const tr = el('tr');
     td(tr, o.guest_email, 'strong');
-    td(tr, o.package_name);
+    const pk = td(tr, o.package_name);
+    if (o.size) pk.appendChild(el('span', 'Size ' + o.size, 'subtext'));
     td(tr, money(o.price_cents, o.currency), 'num');
     const st = td(tr, '');
     st.appendChild(orderPill(o));
@@ -1633,9 +1690,9 @@ $('p-form').addEventListener('submit', async (e) => {
   try {
     await api('/api/admin/packages', {
       name, price_cents: Math.round(price * 100), currency: $('p-currency').value, includes: $('p-includes').value,
-      requires_compliance: $('p-compliance').checked, capacity: $('p-capacity').value || null
+      requires_compliance: $('p-compliance').checked, capacity: $('p-capacity').value || null, sizes: $('p-sizes').value
     });
-    ['p-name', 'p-price', 'p-includes', 'p-capacity'].forEach((id) => { $(id).value = ''; });
+    ['p-name', 'p-price', 'p-includes', 'p-capacity', 'p-sizes'].forEach((id) => { $(id).value = ''; });
     toast('Package created.');
     await refresh();
   } catch (err) { toast(err.message, true); }
@@ -1643,9 +1700,9 @@ $('p-form').addEventListener('submit', async (e) => {
 
 $('csv-btn').addEventListener('click', () => {
   const q = (v) => '"' + String(v === null || v === undefined ? '' : v).split('"').join('""') + '"';
-  const rows = [['email', 'attendance', 'invites_left', 'package', 'order_status', 'reference', 'checked_in_at']].concat(guests.map((g) => {
+  const rows = [['email', 'attendance', 'invites_left', 'package', 'size', 'order_status', 'reference', 'checked_in_at']].concat(guests.map((g) => {
     const o = latestOrderFor(g.email);
-    return [g.email, g.rsvp_status || 'PENDING', g.invites_left, o ? o.package_name : '', o ? (isRefundRequest(o) ? 'REFUND_REQUESTED' : o.status) : '', o ? o.reference_code : '', o && o.checked_in_at ? o.checked_in_at : ''];
+    return [g.email, g.rsvp_status || 'PENDING', g.invites_left, o ? o.package_name : '', o && o.size ? o.size : '', o ? (isRefundRequest(o) ? 'REFUND_REQUESTED' : o.status) : '', o ? o.reference_code : '', o && o.checked_in_at ? o.checked_in_at : ''];
   }));
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([rows.map((r) => r.map(q).join(',')).join(NL)], { type: 'text/csv' }));
@@ -1671,4 +1728,5 @@ const PORT = process.env.PORT || 10000;
 ensureSchema()
   .then(() => console.log('Database schema ready.'))
   .catch((err) => console.error('Schema setup failed (check DB settings):', err.message))
+  .then(() => site.refresh())
   .finally(() => app.listen(PORT, () => console.log(`Server live on port ${PORT}`)));

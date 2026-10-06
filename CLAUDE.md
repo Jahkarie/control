@@ -13,8 +13,9 @@ On D' Road is an invite-only, 18+ Antigua Carnival band. Guests join through an 
 - `server.js`: config, auth, schema setup, guest/invite/package/order routes, admin API, and the Command Center admin page at `/admin` (HTML inlined as `ADMIN_PAGE`).
 - `payments.js`: payment settings (`payment_instructions`, `pay_days`), the pay-by deadline, a job every 10 minutes that expires unpaid orders and sends one reminder, `/api/my-order`, and the `/admin/payments` page. It is registered before the routes in `server.js`, so its `/api/my-order` wins and the one in `server.js` is an unused fallback.
 - `event.js`: event details guests see in their account (`/api/event`), emails to groups of guests through Resend's batch API, and the `/admin/event` page ("Event & messages").
+- `site.js`: contact details and terms (`/api/site`, public), the `/admin/site` page ("Contact & terms"), and `DEFAULT_TERMS`, the draft guests see until the organizers save their own.
 - `door.js`: staff scanner at `/door` (works offline through a service worker), `/api/door/list|checkin|sync`, and the door log at `/api/admin/checkins`.
-- `emails.js`: `renderEmail()` builds every email (HTML + plain text).
+- `emails.js`: `renderEmail()` builds every email (HTML + plain text). Its footer lists the contact details set through `setContact()` (called by `site.js` on boot and after each save).
 
 ## How it works
 
@@ -26,12 +27,15 @@ On D' Road is an invite-only, 18+ Antigua Carnival band. Guests join through an 
 - **18+:** accepting an invite requires `adult: true` (a checkbox on the guest site). Guests who joined before that, or were added by the admin, confirm once when they reserve: `/api/orders` answers `400` with `code: 'AGE_REQUIRED'` until they send `adult: true`. Stored in `guests.age_confirmed_at`. Guests who already had an order before this check were never asked.
 - **Event details:** stored in `settings` as `event_when`, `event_info` (every logged-in guest) and `event_paid_info` (only returned once the guest's order is `PAID`).
 - **Group emails:** to paid guests, reserved-but-unpaid guests, or everyone on the roster, sent in batches of 100 with a short pause between batches. Each send is logged in `broadcasts`. Test sends aren't logged.
+- **Contact details:** `settings` keys `contact_whatsapp` (digits with country code; Antigua numbers can be typed without it), `contact_instagram` (username) and `contact_email`. Shown in the guest site's footer and at the bottom of every email.
+- **Terms:** `settings.terms` (falls back to `DEFAULT_TERMS`) and `terms_updated_at`. In the text, `# ` starts a heading and `- ` a bullet point. `/api/orders` requires `terms: true` (`code: 'TERMS_REQUIRED'`) and stores `orders.terms_accepted_at`.
+- **Sizes:** `packages.sizes` is a comma-separated list; empty means no size is needed. When it's set, `/api/orders` requires one of them (`code: 'SIZE_REQUIRED'`) and stores it in `orders.size`. Guests change it with `/api/orders/size`. The admin packages list shows how many active orders picked each size. (`guests.shirt_size` and `/api/update-shirt` are old and unused.)
 - **Door:** the guest's QR code encodes `ONDROAD:<reference>:<email>`. Only one phone can record the first entry; repeat scans are logged as `DUPLICATE`.
 - Times shown to guests use the `America/Antigua` time zone.
 
 ## Database
 
-`ensureSchema()` in `server.js` creates and migrates `packages`, `orders`, `settings`, `checkins` and `broadcasts` on every boot, and adds `guests.age_confirmed_at`. Add new columns there with `ADD COLUMN IF NOT EXISTS`. `guests`, `invites` and `login_links` are **not** created by code; they already exist in Aiven.
+`ensureSchema()` in `server.js` creates and migrates `packages`, `orders`, `settings`, `checkins` and `broadcasts` on every boot, and adds `guests.age_confirmed_at`, `packages.sizes`, `orders.size` and `orders.terms_accepted_at`. Add new columns there with `ADD COLUMN IF NOT EXISTS`. `guests`, `invites` and `login_links` are **not** created by code; they already exist in Aiven.
 
 ## Environment variables
 
@@ -45,6 +49,7 @@ On D' Road is an invite-only, 18+ Antigua Carnival band. Guests join through an 
 - All SQL is parameterized. Multi-step writes use `pool.connect()` + `BEGIN`/`COMMIT`/`ROLLBACK`.
 - Email helpers return an error or `null` and never throw. Guest emails are often sent after the response.
 - Rate limiting is in memory, per IP: `rateLimit(max, windowMs)`.
+- `express.json({ limit: '10kb' })` applies to every route registered after it. Routes that need bigger bodies (door sync, terms) are registered before it with their own parser.
 - Errors are `{ error: '<short plain message>' }`. Guest-facing text is plain, friendly and short.
 - Admin and door pages are HTML strings inside the JS files, with no framework.
 - CORS allows `FRONTEND_URL`, `https://ondroad.xyz`, `https://www.ondroad.xyz` and `EXTRA_ORIGINS`.
@@ -57,13 +62,15 @@ On D' Road is an invite-only, 18+ Antigua Carnival band. Guests join through an 
 3. `/api/update-rsvp` accepts any string up to 20 characters.
 4. Package edits: a bad price silently becomes 0; a bad capacity causes a 500.
 5. No README, `.env.example` or tests.
+6. Reservations are limited to 10 per hour per IP address. Guests on shared mobile-data IPs could hit that when sales open.
 
 One active order per guest is enforced by locking the guest's row in `/api/orders`, so two quick reservations can't both go through.
 
 ## Not built yet
 
-- Package/shirt pickup tracking (shirt sizes are collected, only entry is tracked).
-- CSV export of orders (the Command Center already exports guests).
+- Package/costume pickup tracking (sizes are collected per order; only entry is tracked).
+- An FAQ section.
+- The QR pass in the "You're confirmed" email (today it's only in the guest's account).
+- CSV export of orders (the Command Center's guest export includes each guest's latest package and size).
 - A record of which admin marked an order paid (everyone shares one admin key).
 - Waitlist for sold-out packages; transferring a pass.
-- Terms, refund policy and privacy pages.
