@@ -159,32 +159,50 @@ const hashToken = (t) => crypto.createHash('sha256').update(String(t)).digest('h
 const newInviteToken = () => crypto.randomBytes(24).toString('base64url');
 const inviteLink = (t) => `${FRONTEND_URL}/?invite=${t}`;
 
-// Returns an error object (or null). Never throws.
+// Sends the invite email via Resend and returns an error object (or null). Never throws —
+// callers check the return value explicitly, so a failed send can never be reported as a success.
 async function sendInviteEmail(to, from, note, link) {
   const noteHTML = note
-    ? `<div style="background-color: #1a0a10; padding: 20px; border-left: 4px solid #f2c879; margin: 25px 0; border-radius: 4px;">
-         <p style="color: #c7ad84; font-size: 12px; text-transform: uppercase; margin-top: 0;">Message from ${escapeHtml(from)}:</p>
-         <p style="color: #fff4e0; font-style: italic; font-size: 16px; margin-bottom: 0;">"${escapeHtml(note)}"</p>
-       </div>`
+    ? `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin: 22px 0;">
+         <tr><td style="background-color: #0d0d0d; border: 3px solid #0d0d0d; padding: 18px 20px;">
+           <p style="color: #ffffff; font-family: Arial, Helvetica, sans-serif; font-size: 11px; font-weight: 800; letter-spacing: 2px; text-transform: uppercase; margin: 0 0 8px;">Message from ${escapeHtml(from)}</p>
+           <p style="color: #f4f1ea; font-family: Georgia, serif; font-style: italic; font-size: 16px; line-height: 1.5; margin: 0;">&ldquo;${escapeHtml(note)}&rdquo;</p>
+         </td></tr>
+       </table>`
     : '';
   try {
-    const { error } = await resend.emails.send({
+    const { data, error } = await resend.emails.send({
       from: EMAIL_FROM,
       to,
-      subject: `[On D' Road] ${from} chose you as one of their invites`,
+      subject: `${from} chose you — On D' Road`,
       html: `
-        <div style="background-color: #080307; color: #fff4e0; padding: 40px 20px; font-family: 'Helvetica Neue', sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #3a1a22; border-radius: 12px;">
-          <h1 style="color: #f2c879; letter-spacing: 4px; text-align: center;">ON D' ROAD</h1>
-          <p style="font-size: 16px; text-align: center;">${escapeHtml(from)} chose you as one of their two invites.</p>
-          <p style="font-size: 14px; text-align: center; color: #c7ad84;">This invitation is personal and single-use. Do not forward it.</p>
-          ${noteHTML}
-          <div style="text-align: center; margin-top: 35px;">
-            <a href="${link}" style="display: inline-block; padding: 14px 28px; background: #f2c879; color: #1a0509; text-decoration: none; border-radius: 8px; font-weight: bold; letter-spacing: 1px;">ACCEPT YOUR INVITATION</a>
-          </div>
-        </div>`
+      <div style="background-color: #f4f1ea; padding: 32px 16px; font-family: Arial, Helvetica, sans-serif;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width: 540px; margin: 0 auto;">
+          <tr><td style="background-color: #ff6a1f; border: 3px solid #0d0d0d; padding: 28px 24px 24px;">
+            <p style="display: inline-block; font-size: 11px; font-weight: 800; letter-spacing: 2px; color: #0d0d0d; border: 2px solid #0d0d0d; border-radius: 999px; padding: 5px 12px; margin: 0 0 16px;">18+ &middot; INVITE ONLY</p>
+            <h1 style="font-family: Arial Black, Arial, sans-serif; font-size: 34px; line-height: 1; text-transform: uppercase; color: #0d0d0d; margin: 0;">On D' Road</h1>
+          </td></tr>
+          <tr><td style="background-color: #0d0d0d; border: 3px solid #0d0d0d; border-top: none; padding: 26px 24px;">
+            <p style="color: #f4f1ea; font-size: 17px; font-weight: 700; line-height: 1.5; margin: 0 0 6px;">${escapeHtml(from)} chose you as one of their two invites.</p>
+            <p style="color: #b8b3a6; font-size: 13px; font-weight: 600; line-height: 1.5; margin: 0;">This invitation is personal and single-use. Do not forward or post your link publicly — it's tied to this email address only.</p>
+            ${noteHTML}
+            <table role="presentation" cellpadding="0" cellspacing="0" style="margin: 28px auto 6px;">
+              <tr><td style="background-color: #7fd63c; border: 3px solid #f4f1ea; border-radius: 999px;">
+                <a href="${link}" style="display: inline-block; padding: 15px 32px; font-family: Arial Black, Arial, sans-serif; font-size: 13px; letter-spacing: 1.5px; text-transform: uppercase; color: #0d0d0d; text-decoration: none;">Accept Your Invitation</a>
+              </td></tr>
+            </table>
+          </td></tr>
+        </table>
+        <p style="max-width: 540px; margin: 18px auto 0; text-align: center; font-size: 11px; color: #8a8578;">Invites circulate through the chain — getting yours later than someone else doesn't mean you were skipped.</p>
+      </div>`
     });
-    return error || null;
+    if (error) {
+      console.error('Resend send failed:', error);
+      return error;
+    }
+    return null;
   } catch (err) {
+    console.error('Resend send threw:', err);
     return err;
   }
 }
