@@ -40,6 +40,7 @@ const nl2br = (s) => esc(s).replace(/\r?\n/g, '<br>');
  * @param {Array<[string, string, boolean?]>} [o.details]  Label/value rows; third item true = monospace value
  * @param {{from: string, text: string}} [o.quote]        Personal note
  * @param {{label: string, text: string}} [o.callout]     Boxed info such as "How to pay" (line breaks kept)
+ * @param {{src: string, alt: string, caption?: string}} [o.image]  Centered image on white, e.g. the QR entry pass
  * @param {{text: string, url: string, fallback?: boolean}} [o.cta]  Button; fallback shows the raw link too
  * @param {string} [o.fine]      Small print under everything
  */
@@ -66,6 +67,15 @@ export function renderEmail(o) {
 <p style="margin:0 0 8px;font-family:${FONT};font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:${C.dim};">Message from ${esc(o.quote.from)}</p>
 <p style="margin:0;font-family:Georgia, 'Times New Roman', serif;font-style:italic;font-size:17px;line-height:1.5;color:${C.text};">&ldquo;${esc(o.quote.text)}&rdquo;</p>
 </td></tr></table></td></tr>`);
+  }
+
+  if (o.image && o.image.src) {
+    rows.push(`<tr><td class="px" align="center" style="padding:22px 32px 0;">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="background-color:#ffffff;border-radius:14px;"><tr><td style="padding:14px;">
+<img src="${esc(o.image.src)}" width="220" height="220" alt="${esc(o.image.alt)}" style="display:block;width:220px;height:220px;border:0;">
+</td></tr></table>
+${o.image.caption ? `<p style="margin:12px 0 0;font-family:${FONT};font-size:13px;line-height:1.5;color:${C.muted};">${esc(o.image.caption)}</p>` : ''}
+</td></tr>`);
   }
 
   if (details.length) {

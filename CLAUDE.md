@@ -32,6 +32,7 @@ On D' Road is an invite-only, 18+ Antigua Carnival band. Guests join through an 
 - **Terms:** `settings.terms` (falls back to `DEFAULT_TERMS`) and `terms_updated_at`. In the text, `# ` starts a heading and `- ` a bullet point. `/api/orders` requires `terms: true` (`code: 'TERMS_REQUIRED'`) and stores `orders.terms_accepted_at`.
 - **Sizes:** `packages.sizes` is a comma-separated list; empty means no size is needed. When it's set, `/api/orders` requires one of them (`code: 'SIZE_REQUIRED'`) and stores it in `orders.size`. Guests change it with `/api/orders/size`. The admin packages list shows how many active orders picked each size. (`guests.shirt_size` and `/api/update-shirt` are old and unused.)
 - **PayPal:** off until `PAYPAL_CLIENT_ID` and `PAYPAL_CLIENT_SECRET` are set. In sandbox mode (the default) only the emails in `PAYPAL_TESTERS` see it; `PAYPAL_ENV=live` shows it to everyone. PayPal doesn't take XCD, so XCD prices are charged in USD at 2.70 (`usdCents()`), rounded up to the cent; fees are absorbed. `create-order` makes the PayPal order (invoice id = our reference, so PayPal blocks a second completed payment) and stores `paypal_order_id`, `paypal_amount` and `paypal_status`. `capture` locks the order row, captures, checks PayPal took exactly `paypal_amount`, then marks it paid and sends the usual confirmation. A payment that completed without reaching us (page closed, lost response) is found by `settle()` when the guest taps PayPal again, or by `syncDue()`. The deadline job skips orders with a checkout started in the last 30 minutes or a payment PayPal is still holding (`paypal_status = 'PENDING'`). Approving a refund on a PayPal order refunds it through PayPal first; if PayPal refuses, nothing changes. No webhooks are used.
+- **Emailed pass:** the "You're confirmed" email (`sendPaidEmail`, used by manual and PayPal payments) attaches the QR as a PNG and shows it inline from `/api/pass/<ref>.png?s=<sig>`. The signature is an HMAC of the reference; the image only loads while the order is `PAID`. The inline image needs `PUBLIC_URL`, or Render's automatic `RENDER_EXTERNAL_URL`; without either, only the attachment is sent.
 - **Door:** the guest's QR code encodes `ONDROAD:<reference>:<email>`. Only one phone can record the first entry; repeat scans are logged as `DUPLICATE`.
 - Times shown to guests use the `America/Antigua` time zone.
 
@@ -44,7 +45,7 @@ On D' Road is an invite-only, 18+ Antigua Carnival band. Guests join through an 
 - Required: `TOKEN_SECRET`, `ADMIN_KEY`.
 - Database: `DB_HOST`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`, `DB_PORT`, `DB_CA` (optional; enables full TLS verification).
 - Email: `RESEND_API_KEY` (or `EMAIL_PASS`), `EMAIL_FROM`.
-- Optional: `FRONTEND_URL`, `EXTRA_ORIGINS` (comma-separated), `ADMIN_EMAIL` (gets refund requests), `DOOR_KEY`, `PORT`.
+- Optional: `PUBLIC_URL` (the backend's own address, for emailed pass images; Render sets `RENDER_EXTERNAL_URL` automatically), `FRONTEND_URL`, `EXTRA_ORIGINS` (comma-separated), `ADMIN_EMAIL` (gets refund requests), `DOOR_KEY`, `PORT`.
 - PayPal (optional): `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `PAYPAL_ENV` (`sandbox` or `live`), `PAYPAL_TESTERS` (comma-separated emails that see PayPal in sandbox mode). `PAYPAL_API_URL` points at a fake PayPal for testing.
 
 ## Conventions
@@ -73,7 +74,6 @@ One active order per guest is enforced by locking the guest's row in `/api/order
 
 - Package/costume pickup tracking (sizes are collected per order; only entry is tracked).
 - An FAQ section.
-- The QR pass in the "You're confirmed" email (today it's only in the guest's account).
 - CSV export of orders (the Command Center's guest export includes each guest's latest package and size).
 - A record of which admin marked an order paid (everyone shares one admin key).
 - Waitlist for sold-out packages; transferring a pass.

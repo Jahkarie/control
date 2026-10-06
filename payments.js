@@ -15,9 +15,10 @@ export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, 
   const fmt = (d) => d.toLocaleString('en-US', { dateStyle: 'full', timeStyle: 'short', timeZone: 'America/Antigua' });
 
   // Sends an email built by renderEmail(). Returns an error (or null). Never throws.
-  async function send(to, subject, email) {
+  // attachments: optional [{ filename, content: Buffer }].
+  async function send(to, subject, email, attachments) {
     try {
-      const { error } = await resend.emails.send({ from: EMAIL_FROM, to, subject, html: email.html, text: email.text });
+      const { error } = await resend.emails.send({ from: EMAIL_FROM, to, subject, html: email.html, text: email.text, ...(attachments ? { attachments } : {}) });
       if (error) { console.error('Email failed:', subject, error); return error; }
       return null;
     } catch (err) {

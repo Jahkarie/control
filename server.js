@@ -9,6 +9,7 @@ import { registerDoor } from './door.js';
 import { registerEvent } from './event.js';
 import { registerSite } from './site.js';
 import { registerPayPal } from './paypal.js';
+import QRCode from 'qrcode';
 
 const { Pool } = pkg;
 
@@ -730,15 +731,43 @@ async function sendOrderReceivedEmail(to, packageName, price, ref, createdAt, pa
   }));
 }
 
+// ---------- Entry pass QR in email ----------
+// Same text as the QR on the guest site, which the door scanner reads.
+const passText = (ref, email) => `ONDROAD:${ref}:${String(email).toLowerCase()}`;
+const passPng = (ref, email) => QRCode.toBuffer(passText(ref, email), { width: 440, margin: 2, errorCorrectionLevel: 'M' });
+// The emailed image URL is signed so pass images can't be fetched by guessing references.
+const passSig = (ref) => sign('pass:' + ref).slice(0, 22);
+const PUBLIC_URL = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
+
+// Only paid orders have a pass: after a refund the emailed image stops loading.
+app.get('/api/pass/:ref.png', rateLimit(300, 15 * 60 * 1000), async (req, res) => {
+  const ref = String(req.params.ref || '').toUpperCase();
+  if (!safeEqual(String(req.query.s || ''), passSig(ref))) return res.status(404).end();
+  try {
+    const r = await pool.query("SELECT guest_email FROM orders WHERE reference_code = $1 AND status = 'PAID'", [ref]);
+    if (!r.rowCount) return res.status(404).end();
+    res.type('png').set('Cache-Control', 'private, max-age=3600').send(await passPng(ref, r.rows[0].guest_email));
+  } catch (err) {
+    serverError(res, err);
+  }
+});
+
 async function sendPaidEmail(to, packageName, ref) {
+  let attachments;
+  try {
+    attachments = [{ filename: `ondroad-pass-${ref}.png`, content: await passPng(ref, to) }];
+  } catch (err) {
+    console.error('Pass QR failed:', ref, err.message); // still send the confirmation without it
+  }
   return mail.send(to, "You're confirmed — On D' Road", renderEmail({
     tone: 'good', tag: 'Payment confirmed', title: "You're in",
     preheader: 'Payment received. Your entry pass is ready.',
     lines: ['Payment received. Your spot is confirmed.',
-      'Your entry pass is in your account. Final event details, location and package pickup info will follow closer to the date.'],
+      'Your entry pass is below and attached to this email. Save it to your phone so you can show it at the entrance even without signal. Final event details, location and package pickup info will follow closer to the date.'],
+    image: PUBLIC_URL ? { src: `${PUBLIC_URL}/api/pass/${ref}.png?s=${passSig(ref)}`, alt: `Entry pass ${ref}`, caption: 'Show this at the entrance. One scan, one person.' } : null,
     details: [['Package', packageName], ['Reference', ref, true]],
     cta: { text: 'View my pass', url: FRONTEND_URL }
-  }));
+  }), attachments);
 }
 
 app.post('/api/admin/orders/:id/mark-paid', requireAdmin, async (req, res) => {
