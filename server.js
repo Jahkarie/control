@@ -6,6 +6,7 @@ import { Resend } from 'resend';
 import { registerPayments } from './payments.js';
 import { renderEmail } from './emails.js';
 import { registerDoor } from './door.js';
+import { registerEvent } from './event.js';
 
 const { Pool } = pkg;
 
@@ -111,6 +112,8 @@ app.use(express.json({ limit: '10kb' }));
 // Payment instructions, pay-by deadline, auto-expiry and reminders (see payments.js).
 // Registered before the other routes on purpose: it replaces /api/my-order below.
 const mail = registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, requireAuth, requireAdmin, escapeHtml });
+// Event details in guests' accounts and email updates to groups of guests (see event.js).
+registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, requireAuth, requireAdmin, mail });
 const ADMIN_EMAIL = normalizeEmail(process.env.ADMIN_EMAIL); // optional: gets a copy of refund requests
 
 // Creates the packages/orders/settings tables and any missing columns on startup,
@@ -164,6 +167,17 @@ async function ensureSchema() {
       scanned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS broadcasts (
+      id SERIAL PRIMARY KEY,
+      audience TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      message TEXT NOT NULL,
+      recipients INTEGER NOT NULL DEFAULT 0,
+      sent INTEGER NOT NULL DEFAULT 0,
+      failed INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    ALTER TABLE guests ADD COLUMN IF NOT EXISTS age_confirmed_at TIMESTAMPTZ;
   `);
 }
 
@@ -349,6 +363,7 @@ app.get('/api/invite/:token', rateLimit(30, 15 * 60 * 1000), async (req, res) =>
 app.post('/api/invite/accept', rateLimit(10, 15 * 60 * 1000), async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   const bad = 'Invitation invalid, already used, or not issued to that email.';
+  if (req.body?.adult !== true) return res.status(400).json({ error: "On D' Road is 18+ only. Confirm you're 18 or older to accept." });
   let client;
   try {
     client = await pool.connect();
@@ -364,6 +379,7 @@ app.post('/api/invite/accept', rateLimit(10, 15 * 60 * 1000), async (req, res) =
       `INSERT INTO guests (email, rsvp_status, shirt_size, invites_left)
        SELECT $1::text, 'PENDING', 'Unassigned', 2
        WHERE NOT EXISTS (SELECT 1 FROM guests WHERE LOWER(email) = $1::text)`, [email]);
+    await client.query('UPDATE guests SET age_confirmed_at = NOW() WHERE LOWER(email) = $1 AND age_confirmed_at IS NULL', [email]);
     await client.query("UPDATE invites SET status = 'ACCEPTED', accepted_at = NOW() WHERE id = $1", [inv.id]);
     await client.query('COMMIT');
     res.json({ success: true, token: createToken(email), user: { email } });
@@ -501,6 +517,19 @@ app.post('/api/orders', requireAuth, rateLimit(10, 60 * 60 * 1000), async (req, 
   try {
     client = await pool.connect();
     await client.query('BEGIN');
+    // Guests who joined before the 18+ check (or were added by the admin) confirm here, once.
+    const guest = await client.query('SELECT age_confirmed_at FROM guests WHERE LOWER(email) = $1 FOR UPDATE', [req.userEmail]);
+    if (!guest.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'That account is no longer on the roster.' });
+    }
+    if (!guest.rows[0].age_confirmed_at) {
+      if (req.body?.adult !== true) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: "Confirm you're 18 or older to reserve a package.", code: 'AGE_REQUIRED' });
+      }
+      await client.query('UPDATE guests SET age_confirmed_at = NOW() WHERE LOWER(email) = $1', [req.userEmail]);
+    }
     const existing = await client.query("SELECT 1 FROM orders WHERE guest_email = $1 AND status <> 'CANCELLED'", [req.userEmail]);
     if (existing.rowCount) {
       await client.query('ROLLBACK');
@@ -1027,6 +1056,7 @@ dialog p { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
   <nav class="top-right">
     <a class="top-link" href="/door" target="_blank" rel="noopener">Door scanner</a>
     <a class="top-link" href="/admin/payments">Payment settings</a>
+    <a class="top-link" href="/admin/event">Event &amp; messages</a>
     <a class="top-link" href="${FRONTEND_URL}" target="_blank" rel="noopener">View site &#8599;</a>
     <span id="clock" class="clock"></span>
   </nav>
