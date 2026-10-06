@@ -97,13 +97,16 @@ const requireAdmin = (req, res, next) => {
   res.status(401).json({ error: 'Unauthorized' });
 };
 
-// Simple in-memory fixed-window rate limiter, per IP.
-const rateLimit = (max, windowMs) => {
+// Simple in-memory fixed-window rate limiter, per IP by default. Pass perUser (after requireAuth) to count per
+// account instead: guests on mobile data often share one IP, so per-IP limits would block real people.
+const perUser = (req) => 'u:' + req.userEmail;
+const rateLimit = (max, windowMs, keyOf = (req) => req.ip) => {
   const hits = new Map();
   setInterval(() => hits.clear(), windowMs).unref();
   return (req, res, next) => {
-    const n = (hits.get(req.ip) || 0) + 1;
-    hits.set(req.ip, n);
+    const key = keyOf(req);
+    const n = (hits.get(key) || 0) + 1;
+    hits.set(key, n);
     if (n > max) return res.status(429).json({ error: 'Too many requests. Try again later.' });
     next();
   };
@@ -131,7 +134,7 @@ const mail = registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, req
 // Event details in guests' accounts and email updates to groups of guests (see event.js).
 registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, requireAuth, requireAdmin, mail });
 // Paying online with PayPal (see paypal.js). Off until the PAYPAL_* settings are added.
-const paypal = registerPayPal({ app, pool, requireAuth, requireAdmin, rateLimit,
+const paypal = registerPayPal({ app, pool, requireAuth, requireAdmin, rateLimit, perUser,
   onPaid: (o) => sendPaidEmail(o.guest_email, o.package_name, o.reference_code) });
 const ADMIN_EMAIL = normalizeEmail(process.env.ADMIN_EMAIL); // optional: gets a copy of refund requests
 
@@ -201,6 +204,7 @@ async function ensureSchema() {
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS size TEXT;
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS terms_accepted_at TIMESTAMPTZ;
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS paid_via TEXT;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS pay_days INTEGER;
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS paypal_order_id TEXT;
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS paypal_status TEXT;
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS paypal_started_at TIMESTAMPTZ;
@@ -213,7 +217,8 @@ async function ensureSchema() {
 // --- VIP LOGIN: step 1, request a one-time link ---
 // Always returns the same generic response whether or not the email is on the roster,
 // so this endpoint can't be used to check who is or isn't invited.
-app.post('/api/login', rateLimit(6, 15 * 60 * 1000), async (req, res) => {
+// Per IP (generous, for shared mobile IPs) and per email address (so nobody can flood one inbox).
+app.post('/api/login', rateLimit(40, 15 * 60 * 1000), rateLimit(5, 15 * 60 * 1000, (req) => 'e:' + normalizeEmail(req.body?.email)), async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   if (!isValidEmail(email)) return res.status(400).json({ error: 'A valid email is required' });
   const generic = { success: true, message: "If that email is on the roster, we've sent a login link." };
@@ -234,7 +239,7 @@ app.post('/api/login', rateLimit(6, 15 * 60 * 1000), async (req, res) => {
 });
 
 // --- VIP LOGIN: step 2, exchange the one-time code for a session ---
-app.post('/api/login/verify', rateLimit(15, 15 * 60 * 1000), async (req, res) => {
+app.post('/api/login/verify', rateLimit(60, 15 * 60 * 1000), async (req, res) => {
   const code = req.body?.code;
   if (!code) return res.status(400).json({ error: 'Missing login code.' });
   let client;
@@ -330,7 +335,7 @@ async function sendLoginEmail(to, link) {
 }
 
 // --- SEND A PERSONAL INVITE (uses one of the sender's invites) ---
-app.post('/api/send-invite', requireAuth, rateLimit(20, 60 * 60 * 1000), async (req, res) => {
+app.post('/api/send-invite', requireAuth, rateLimit(20, 60 * 60 * 1000, perUser), async (req, res) => {
   const sender = req.userEmail;
   const recipient = normalizeEmail(req.body?.recipient_email);
   const note = typeof req.body?.custom_note === 'string' ? req.body.custom_note.trim().slice(0, 300) : '';
@@ -376,7 +381,7 @@ app.post('/api/send-invite', requireAuth, rateLimit(20, 60 * 60 * 1000), async (
 });
 
 // --- LOOK UP AN INVITE LINK (public) ---
-app.get('/api/invite/:token', rateLimit(30, 15 * 60 * 1000), async (req, res) => {
+app.get('/api/invite/:token', rateLimit(120, 15 * 60 * 1000), async (req, res) => {
   try {
     const r = await pool.query('SELECT inviter_email, note, status FROM invites WHERE token_hash = $1', [hashToken(req.params.token)]);
     if (!r.rowCount || r.rows[0].status !== 'PENDING') {
@@ -389,7 +394,7 @@ app.get('/api/invite/:token', rateLimit(30, 15 * 60 * 1000), async (req, res) =>
 });
 
 // --- ACCEPT AN INVITE: joins the roster with two invites and logs in ---
-app.post('/api/invite/accept', rateLimit(10, 15 * 60 * 1000), async (req, res) => {
+app.post('/api/invite/accept', rateLimit(40, 15 * 60 * 1000), async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   const bad = 'Invitation invalid, already used, or not issued to that email.';
   if (req.body?.adult !== true) return res.status(400).json({ error: "On D' Road is 18+ only. Confirm you're 18 or older to accept." });
@@ -544,7 +549,7 @@ app.get('/api/my-order', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/orders', requireAuth, rateLimit(10, 60 * 60 * 1000), async (req, res) => {
+app.post('/api/orders', requireAuth, rateLimit(10, 60 * 60 * 1000, perUser), rateLimit(300, 60 * 60 * 1000), async (req, res) => {
   const packageId = parseInt(req.body?.package_id, 10);
   if (!packageId) return res.status(400).json({ error: 'Choose a package.' });
   if (req.body?.terms !== true) return res.status(400).json({ error: 'Agree to the terms to reserve a package.', code: 'TERMS_REQUIRED' });
@@ -589,15 +594,17 @@ app.post('/api/orders', requireAuth, rateLimit(10, 60 * 60 * 1000), async (req, 
       }
     }
     const ref = newRef();
+    // The order keeps the days-to-pay in force now, so changing the setting later only affects new reservations.
+    const { payDays } = await mail.getSettings();
     const created = await client.query(
-      `INSERT INTO orders (guest_email, package_id, reference_code, size, terms_accepted_at)
-       VALUES ($1, $2, $3, $4, NOW()) RETURNING created_at`,
-      [req.userEmail, packageId, ref, size]);
+      `INSERT INTO orders (guest_email, package_id, reference_code, size, terms_accepted_at, pay_days)
+       VALUES ($1, $2, $3, $4, NOW(), $5) RETURNING created_at`,
+      [req.userEmail, packageId, ref, size, payDays]);
     await client.query('COMMIT');
     res.json({ success: true, reference_code: ref });
     // Sent after responding so a slow email never holds up the guest.
     const p = pkg.rows[0];
-    sendOrderReceivedEmail(req.userEmail, p.name, money(p.price_cents, p.currency), ref, created.rows[0].created_at)
+    sendOrderReceivedEmail(req.userEmail, p.name, money(p.price_cents, p.currency), ref, created.rows[0].created_at, payDays)
       .catch((e) => console.error('Order-received email error:', e));
   } catch (err) {
     await client?.query('ROLLBACK').catch(() => {});
@@ -644,7 +651,7 @@ app.post('/api/orders/cancel', requireAuth, async (req, res) => {
 });
 
 // A paid guest asks to cancel and get their money back. The pass stays valid until the organizer approves.
-app.post('/api/orders/request-refund', requireAuth, rateLimit(5, 60 * 60 * 1000), async (req, res) => {
+app.post('/api/orders/request-refund', requireAuth, rateLimit(5, 60 * 60 * 1000, perUser), async (req, res) => {
   const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim().slice(0, 500) : '';
   try {
     const r = await pool.query(
@@ -694,6 +701,7 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
       `SELECT o.id, o.package_id, o.guest_email, o.status, o.reference_code, o.created_at, o.paid_at,
               o.cancel_requested_at, o.cancel_reason, o.refunded_at, o.checked_in_at, o.checked_in_by, o.size,
               o.paid_via, o.paypal_status, o.paypal_amount, o.paypal_refund_id,
+              NOT EXISTS (SELECT 1 FROM guests g WHERE LOWER(g.email) = LOWER(o.guest_email)) AS removed_guest,
               p.name AS package_name, p.price_cents, p.currency
        FROM orders o JOIN packages p ON p.id = o.package_id
        ORDER BY (o.status = 'PAID' AND o.cancel_requested_at IS NOT NULL) DESC, o.id DESC`);
@@ -705,8 +713,8 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
 
 const money = (cents, cur) => (cur || 'XCD') + ' ' + (cents / 100).toFixed(2);
 
-async function sendOrderReceivedEmail(to, packageName, price, ref, createdAt) {
-  const { instructions, payDays } = await mail.getSettings();
+async function sendOrderReceivedEmail(to, packageName, price, ref, createdAt, payDays) {
+  const { instructions } = await mail.getSettings();
   const due = payDays > 0 ? mail.fmt(mail.payBy(createdAt, payDays)) : null;
   return mail.send(to, "Order received — On D' Road", renderEmail({
     tone: 'warn', tag: 'Order received', title: 'Your spot is held',
@@ -889,11 +897,28 @@ app.post('/api/admin/set-invites', requireAdmin, async (req, res) => {
 app.post('/api/admin/remove-guest', requireAdmin, async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   if (!isValidEmail(email)) return res.status(400).json({ error: 'A valid email is required.' });
+  // A paid guest must be refunded first, or their pass would keep working at the door.
+  // Unpaid reservations are cancelled so the spots free up.
+  let client;
   try {
-    await pool.query('DELETE FROM guests WHERE LOWER(email) = $1', [email]);
-    res.json({ success: true });
+    client = await pool.connect();
+    await client.query('BEGIN');
+    const paid = await client.query(
+      "SELECT reference_code FROM orders WHERE LOWER(guest_email) = $1 AND status = 'PAID' LIMIT 1", [email]);
+    if (paid.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: `${email} has a paid order (${paid.rows[0].reference_code}). Refund it in the Orders tab first, then remove them.` });
+    }
+    const cancelled = await client.query(
+      "UPDATE orders SET status = 'CANCELLED' WHERE LOWER(guest_email) = $1 AND status = 'RESERVED'", [email]);
+    await client.query('DELETE FROM guests WHERE LOWER(email) = $1', [email]);
+    await client.query('COMMIT');
+    res.json({ success: true, cancelled: cancelled.rowCount });
   } catch (err) {
+    await client?.query('ROLLBACK').catch(() => {});
     serverError(res, err);
+  } finally {
+    client?.release();
   }
 });
 
@@ -1060,6 +1085,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 td.actions { text-align: right; white-space: nowrap; }
 td.actions .btn + .btn { margin-left: 6px; }
 .subtext { display: block; font-size: 12px; color: var(--muted); margin-top: 4px; max-width: 280px; white-space: normal; }
+.subtext.bad { color: var(--bad); }
 .empty-row td { text-align: center; color: var(--muted); padding: 40px 14px; }
 
 .pill { display: inline-flex; align-items: center; gap: 7px; padding: 4px 10px; border-radius: 999px; font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; border: 1px solid var(--line-strong); color: var(--muted); }
@@ -1472,10 +1498,10 @@ function renderGuests() {
       return 'Invites updated.';
     }));
     act.appendChild(actionBtn('Remove', 'danger', async () => {
-      const v = await ask({ title: 'Remove guest?', text: g.email + ' will be taken off the roster and can no longer log in.', ok: 'Remove', danger: true });
+      const v = await ask({ title: 'Remove guest?', text: g.email + ' will be taken off the roster and can no longer log in. An unpaid reservation is cancelled. A paid order must be refunded first.', ok: 'Remove', danger: true });
       if (!v) return false;
-      await api('/api/admin/remove-guest', { email: g.email });
-      return 'Guest removed.';
+      const r = await api('/api/admin/remove-guest', { email: g.email });
+      return r.cancelled ? 'Guest removed and their reservation cancelled.' : 'Guest removed.';
     }));
     tbody.appendChild(tr);
   });
@@ -1579,6 +1605,7 @@ function renderOrders() {
     st.appendChild(orderPill(o));
     const ppNote = { CREATED: 'PayPal checkout started', PENDING: 'PayPal is still processing the payment', AMOUNT_MISMATCH: "PayPal amount didn't match. Check PayPal." }[o.paypal_status];
     if (o.status === 'RESERVED' && ppNote) st.appendChild(el('span', ppNote, 'subtext'));
+    if (o.removed_guest && o.status !== 'CANCELLED') st.appendChild(el('span', 'Guest was removed from the roster', 'subtext bad'));
     if (o.status === 'CANCELLED' && o.refunded_at && o.paid_via === 'PAYPAL') st.appendChild(el('span', 'Refunded through PayPal', 'subtext'));
     if (isRefundRequest(o)) {
       st.appendChild(el('span', 'Requested ' + shortDate(o.cancel_requested_at) + (o.cancel_reason ? ': ' + o.cancel_reason : ''), 'subtext'));

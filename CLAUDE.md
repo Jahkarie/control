@@ -37,7 +37,7 @@ On D' Road is an invite-only, 18+ Antigua Carnival band. Guests join through an 
 
 ## Database
 
-`ensureSchema()` in `server.js` creates and migrates `packages`, `orders`, `settings`, `checkins` and `broadcasts` on every boot, and adds `guests.age_confirmed_at`, `packages.sizes`, `orders.size`, `orders.terms_accepted_at`, `orders.paid_via` and the `orders.paypal_*` columns. Add new columns there with `ADD COLUMN IF NOT EXISTS`. `guests`, `invites` and `login_links` are **not** created by code; they already exist in Aiven.
+`ensureSchema()` in `server.js` creates and migrates `packages`, `orders`, `settings`, `checkins` and `broadcasts` on every boot, and adds `guests.age_confirmed_at`, `packages.sizes`, `orders.size`, `orders.terms_accepted_at`, `orders.paid_via`, `orders.pay_days` and the `orders.paypal_*` columns. Add new columns there with `ADD COLUMN IF NOT EXISTS`. `guests`, `invites` and `login_links` are **not** created by code; they already exist in Aiven.
 
 ## Environment variables
 
@@ -51,7 +51,7 @@ On D' Road is an invite-only, 18+ Antigua Carnival band. Guests join through an 
 
 - All SQL is parameterized. Multi-step writes use `pool.connect()` + `BEGIN`/`COMMIT`/`ROLLBACK`.
 - Email helpers return an error or `null` and never throw. Guest emails are often sent after the response.
-- Rate limiting is in memory, per IP: `rateLimit(max, windowMs)`.
+- Rate limiting is in memory: `rateLimit(max, windowMs, keyOf)`, per IP by default. Use `perUser` after `requireAuth` for logged-in actions, since guests on mobile data share IPs. `/api/login` is also limited per email address.
 - `express.json({ limit: '10kb' })` applies to every route registered after it. Routes that need bigger bodies (door sync, terms) are registered before it with their own parser.
 - Errors are `{ error: '<short plain message>' }`. Guest-facing text is plain, friendly and short.
 - Admin and door pages are HTML strings inside the JS files, with no framework.
@@ -60,12 +60,12 @@ On D' Road is an invite-only, 18+ Antigua Carnival band. Guests join through an 
 
 ## Known issues (review of 2026-10-06)
 
-1. Removing a guest leaves their orders active, so a paid pass still scans at the door. (A removed guest can no longer reserve, and the guest site logs them out.)
-2. The expiry job uses the *current* `pay_days` for every order, so shortening it cancels older reservations right away.
-3. `/api/update-rsvp` accepts any string up to 20 characters.
-4. Package edits: a bad price silently becomes 0; a bad capacity causes a 500.
-5. No README, `.env.example` or tests.
-6. Reservations are limited to 10 per hour per IP address. Guests on shared mobile-data IPs could hit that when sales open.
+1. `/api/update-rsvp` accepts any string up to 20 characters.
+2. Package edits: a bad price silently becomes 0; a bad capacity causes a 500.
+3. No README, `.env.example` or tests.
+4. The backend runs on Render's free plan: it sleeps when idle, so the first request is slow and the payments job doesn't run while asleep.
+
+Fixed since the review: removing a guest is refused while they have a paid order and cancels their unpaid reservation (orders of guests removed earlier are flagged "Guest was removed from the roster" in the Orders tab); each order keeps the `pay_days` it was reserved under (`orders.pay_days`; NULL on older orders means the current setting); reservation, invite, refund-request and PayPal limits count per account (`perUser`), not per IP.
 
 One active order per guest is enforced by locking the guest's row in `/api/orders`, so two quick reservations can't both go through.
 

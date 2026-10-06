@@ -31,14 +31,16 @@ export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, 
       const { instructions, payDays } = await getSettings();
       // PayPal payments that went through must count before anything is cancelled (see paypal.js).
       if (beforeExpire) await beforeExpire(payDays).catch((err) => console.error('PayPal check error:', err.message));
-      if (payDays < 1) return; // 0 = no deadline
+      // Each order keeps the days-to-pay it was reserved under (orders.pay_days; 0 = no deadline). Orders from
+      // before that column existed use the current setting.
+      const DAYS = 'COALESCE(o.pay_days, $1::int)';
 
       // 1. Expire unpaid orders past the deadline (this also frees capacity). A PayPal checkout started in the
       //    last 30 minutes, or a PayPal payment PayPal is still processing, gets more time.
       const expired = await pool.query(
         `UPDATE orders o SET status = 'CANCELLED' FROM packages p
          WHERE p.id = o.package_id AND o.status = 'RESERVED'
-           AND o.created_at + make_interval(days => $1::int) < NOW()
+           AND ${DAYS} > 0 AND o.created_at + make_interval(days => ${DAYS}) < NOW()
            AND (o.paypal_started_at IS NULL OR o.paypal_started_at < NOW() - INTERVAL '30 minutes')
            AND o.paypal_status IS DISTINCT FROM 'PENDING'
          RETURNING o.guest_email, o.reference_code, p.name AS package_name`, [payDays]);
@@ -53,14 +55,14 @@ export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, 
       }
 
       // 2. One reminder, about 24 hours before the deadline (needs a deadline of 2+ days).
-      if (payDays >= 2) {
+      {
         const due = await pool.query(
           `UPDATE orders o SET reminder_sent_at = NOW() FROM packages p
            WHERE p.id = o.package_id AND o.status = 'RESERVED' AND o.reminder_sent_at IS NULL
-             AND o.created_at + make_interval(days => $1::int) - INTERVAL '24 hours' < NOW()
-           RETURNING o.guest_email, o.reference_code, o.created_at, p.name AS package_name`, [payDays]);
+             AND ${DAYS} >= 2 AND o.created_at + make_interval(days => ${DAYS}) - INTERVAL '24 hours' < NOW()
+           RETURNING o.guest_email, o.reference_code, o.created_at, ${DAYS} AS days, p.name AS package_name`, [payDays]);
         for (const o of due.rows) {
-          const due = fmt(payBy(o.created_at, payDays));
+          const due = fmt(payBy(o.created_at, o.days));
           await send(o.guest_email, "Pay soon to keep your spot — On D' Road", renderEmail({
             tone: 'warn', tag: 'Payment reminder', title: 'Pay by tomorrow',
             preheader: `Your reservation expires ${due}.`,
@@ -83,14 +85,15 @@ export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, 
     try {
       const { instructions, payDays } = await getSettings();
       const r = await pool.query(
-        `SELECT o.id, o.status, o.reference_code, o.created_at, o.cancel_requested_at, o.size,
+        `SELECT o.id, o.status, o.reference_code, o.created_at, o.cancel_requested_at, o.size, o.pay_days,
                 p.name AS package_name, p.price_cents, p.currency, p.includes, p.sizes AS package_sizes
          FROM orders o JOIN packages p ON p.id = o.package_id
          WHERE o.guest_email = $1 AND o.status <> 'CANCELLED' ORDER BY o.id DESC LIMIT 1`, [req.userEmail]);
       const o = r.rows[0];
       if (!o) return res.json(null);
       const open = o.status === 'RESERVED';
-      o.pay_by = open && payDays > 0 ? payBy(o.created_at, payDays).toISOString() : null;
+      const days = o.pay_days ?? payDays;
+      o.pay_by = open && days > 0 ? payBy(o.created_at, days).toISOString() : null;
       o.payment_instructions = open ? instructions : '';
       res.json(o);
     } catch (err) {
@@ -182,7 +185,7 @@ button:disabled { opacity: .5; cursor: progress; }
 
     <label for="days">Days to pay after reserving</label>
     <input id="days" type="number" min="0" max="30" inputmode="numeric">
-    <small>Unpaid reservations are cancelled automatically after this many days. Use 0 for no deadline. A reminder goes out 24 hours before the deadline (needs 2 or more days).</small>
+    <small>Unpaid reservations are cancelled automatically after this many days. Use 0 for no deadline. Changing this only affects new reservations; existing ones keep the deadline they were given. A reminder goes out 24 hours before the deadline (needs 2 or more days).</small>
 
     <div class="preview" aria-live="polite"><b>Guest preview: How to pay</b><span id="pv"></span></div>
 

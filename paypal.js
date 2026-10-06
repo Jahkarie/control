@@ -20,7 +20,7 @@ const TIMEOUT_MS = 20 * 1000; // a stuck PayPal call mustn't hold the order (and
 export const usdCents = (cents, currency) => (currency === 'USD' ? cents : Math.ceil((cents * 10) / 27));
 const usd = (cents) => (cents / 100).toFixed(2);
 
-export function registerPayPal({ app, pool, requireAuth, requireAdmin, rateLimit, onPaid }) {
+export function registerPayPal({ app, pool, requireAuth, requireAdmin, rateLimit, perUser, onPaid }) {
   const enabledFor = (email) => CONFIGURED && (LIVE || TESTERS.includes(email));
   const fail = (res, err) => { console.error('PayPal error:', err); res.status(500).json({ error: 'Server error.' }); };
 
@@ -103,7 +103,7 @@ export function registerPayPal({ app, pool, requireAuth, requireAdmin, rateLimit
   });
 
   // Step 1, when the guest taps a PayPal button: create the PayPal order for their reservation.
-  app.post('/api/paypal/create-order', requireAuth, rateLimit(30, 60 * 60 * 1000), async (req, res) => {
+  app.post('/api/paypal/create-order', requireAuth, rateLimit(30, 60 * 60 * 1000, perUser), async (req, res) => {
     if (!enabledFor(req.userEmail)) return res.status(400).json({ error: "PayPal isn't available." });
     let client;
     try {
@@ -232,7 +232,8 @@ export function registerPayPal({ app, pool, requireAuth, requireAdmin, rateLimit
     if (!CONFIGURED) return;
     const due = await pool.query(
       `${ORDER_SQL} WHERE o.status = 'RESERVED' AND o.paypal_order_id IS NOT NULL
-         AND (o.paypal_status = 'PENDING' OR ($1::int > 0 AND o.created_at + make_interval(days => $1::int) < NOW()))
+         AND (o.paypal_status = 'PENDING' OR (COALESCE(o.pay_days, $1::int) > 0
+              AND o.created_at + make_interval(days => COALESCE(o.pay_days, $1::int)) < NOW()))
        ORDER BY o.id LIMIT 50`, [payDays]);
     for (const row of due.rows) {
       const client = await pool.connect();
