@@ -298,6 +298,184 @@ app.post('/api/admin/create-invite', requireAdmin, async (req, res) => {
   }
 });
 
+// ---------- Packages (public read, admin write) ----------
+app.get('/api/packages', async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT p.id, p.name, p.price_cents, p.currency, p.includes, p.requires_compliance, p.capacity,
+              GREATEST(0, COALESCE(p.capacity, 2147483647) - (SELECT COUNT(*) FROM orders o WHERE o.package_id = p.id AND o.status <> 'CANCELLED')) AS spots_left
+       FROM packages p WHERE p.active = TRUE ORDER BY p.sort_order ASC, p.id ASC`);
+    res.json(r.rows);
+  } catch (err) {
+    serverError(res, err);
+  }
+});
+
+app.get('/api/admin/packages', requireAdmin, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT p.*, (SELECT COUNT(*) FROM orders o WHERE o.package_id = p.id AND o.status <> 'CANCELLED') AS claimed
+       FROM packages p ORDER BY p.sort_order ASC, p.id ASC`);
+    res.json(r.rows);
+  } catch (err) {
+    serverError(res, err);
+  }
+});
+
+app.post('/api/admin/packages', requireAdmin, async (req, res) => {
+  const name = typeof req.body?.name === 'string' ? req.body.name.trim().slice(0, 80) : '';
+  const price = parseInt(req.body?.price_cents, 10);
+  const includes = typeof req.body?.includes === 'string' ? req.body.includes.slice(0, 1000) : '';
+  const requiresCompliance = !!req.body?.requires_compliance;
+  const capacity = req.body?.capacity === '' || req.body?.capacity == null ? null : parseInt(req.body.capacity, 10);
+  const sortOrder = parseInt(req.body?.sort_order, 10) || 0;
+  if (!name || !Number.isFinite(price) || price < 0) return res.status(400).json({ error: 'A name and a valid price (in cents) are required.' });
+  try {
+    const r = await pool.query(
+      `INSERT INTO packages (name, price_cents, includes, requires_compliance, capacity, sort_order)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+      [name, price, includes, requiresCompliance, capacity, sortOrder]);
+    res.json({ success: true, id: r.rows[0].id });
+  } catch (err) {
+    serverError(res, err);
+  }
+});
+
+app.post('/api/admin/packages/:id', requireAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const fields = []; const values = []; let i = 1;
+  const push = (col, val) => { fields.push(`${col} = $${i++}`); values.push(val); };
+  if (typeof req.body?.name === 'string') push('name', req.body.name.trim().slice(0, 80));
+  if (req.body?.price_cents !== undefined) push('price_cents', parseInt(req.body.price_cents, 10) || 0);
+  if (typeof req.body?.includes === 'string') push('includes', req.body.includes.slice(0, 1000));
+  if (req.body?.requires_compliance !== undefined) push('requires_compliance', !!req.body.requires_compliance);
+  if (req.body?.capacity !== undefined) push('capacity', req.body.capacity === '' || req.body.capacity == null ? null : parseInt(req.body.capacity, 10));
+  if (req.body?.active !== undefined) push('active', !!req.body.active);
+  if (req.body?.sort_order !== undefined) push('sort_order', parseInt(req.body.sort_order, 10) || 0);
+  if (!id || !fields.length) return res.status(400).json({ error: 'Nothing to update.' });
+  try {
+    await pool.query(`UPDATE packages SET ${fields.join(', ')} WHERE id = $${i}`, [...values, id]);
+    res.json({ success: true });
+  } catch (err) {
+    serverError(res, err);
+  }
+});
+
+app.post('/api/admin/packages/:id/delete', requireAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!id) return res.status(400).json({ error: 'Invalid package.' });
+  try {
+    const used = await pool.query('SELECT 1 FROM orders WHERE package_id = $1 LIMIT 1', [id]);
+    if (used.rowCount) {
+      await pool.query('UPDATE packages SET active = FALSE WHERE id = $1', [id]);
+      return res.json({ success: true, retired: true });
+    }
+    await pool.query('DELETE FROM packages WHERE id = $1', [id]);
+    res.json({ success: true, retired: false });
+  } catch (err) {
+    serverError(res, err);
+  }
+});
+
+// ---------- Orders ----------
+const newRef = () => 'ODR-' + crypto.randomBytes(4).toString('hex').toUpperCase();
+
+app.get('/api/my-order', requireAuth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT o.id, o.status, o.reference_code, o.created_at, p.name AS package_name, p.price_cents, p.currency, p.includes
+       FROM orders o JOIN packages p ON p.id = o.package_id
+       WHERE o.guest_email = $1 AND o.status <> 'CANCELLED' ORDER BY o.id DESC LIMIT 1`, [req.userEmail]);
+    res.json(r.rows[0] || null);
+  } catch (err) {
+    serverError(res, err);
+  }
+});
+
+app.post('/api/orders', requireAuth, rateLimit(10, 60 * 60 * 1000), async (req, res) => {
+  const packageId = parseInt(req.body?.package_id, 10);
+  if (!packageId) return res.status(400).json({ error: 'Choose a package.' });
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query('BEGIN');
+
+    const existing = await client.query("SELECT 1 FROM orders WHERE guest_email = $1 AND status <> 'CANCELLED'", [req.userEmail]);
+    if (existing.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'You already have a package reserved. Cancel it first to choose another.' });
+    }
+
+    const pkg = await client.query('SELECT capacity, active FROM packages WHERE id = $1 FOR UPDATE', [packageId]);
+    if (!pkg.rowCount || !pkg.rows[0].active) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'That package is no longer available.' });
+    }
+    if (pkg.rows[0].capacity !== null) {
+      const claimed = await client.query("SELECT COUNT(*) FROM orders WHERE package_id = $1 AND status <> 'CANCELLED'", [packageId]);
+      if (parseInt(claimed.rows[0].count, 10) >= pkg.rows[0].capacity) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'That package just sold out.' });
+      }
+    }
+
+    const ref = newRef();
+    await client.query(
+      'INSERT INTO orders (guest_email, package_id, reference_code) VALUES ($1, $2, $3)',
+      [req.userEmail, packageId, ref]);
+    await client.query('COMMIT');
+    res.json({ success: true, reference_code: ref });
+  } catch (err) {
+    await client?.query('ROLLBACK').catch(() => {});
+    serverError(res, err);
+  } finally {
+    client?.release();
+  }
+});
+
+app.post('/api/orders/cancel', requireAuth, async (req, res) => {
+  try {
+    const r = await pool.query("UPDATE orders SET status = 'CANCELLED' WHERE guest_email = $1 AND status = 'RESERVED'", [req.userEmail]);
+    if (!r.rowCount) return res.status(400).json({ error: 'No reserved order to cancel.' });
+    res.json({ success: true });
+  } catch (err) {
+    serverError(res, err);
+  }
+});
+
+app.get('/api/admin/orders', requireAdmin, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT o.id, o.guest_email, o.status, o.reference_code, o.created_at, o.paid_at, p.name AS package_name, p.price_cents, p.currency
+       FROM orders o JOIN packages p ON p.id = o.package_id ORDER BY o.id DESC`);
+    res.json(r.rows);
+  } catch (err) {
+    serverError(res, err);
+  }
+});
+
+app.post('/api/admin/orders/:id/mark-paid', requireAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  try {
+    const r = await pool.query("UPDATE orders SET status = 'PAID', paid_at = NOW() WHERE id = $1 AND status = 'RESERVED'", [id]);
+    if (!r.rowCount) return res.status(400).json({ error: 'Order not found or already resolved.' });
+    res.json({ success: true });
+  } catch (err) {
+    serverError(res, err);
+  }
+});
+
+app.post('/api/admin/orders/:id/cancel', requireAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  try {
+    const r = await pool.query("UPDATE orders SET status = 'CANCELLED' WHERE id = $1 AND status <> 'CANCELLED'", [id]);
+    if (!r.rowCount) return res.status(400).json({ error: 'Order not found.' });
+    res.json({ success: true });
+  } catch (err) {
+    serverError(res, err);
+  }
+});
+
 // ---------- Admin ----------
 app.get('/api/admin/guests', requireAdmin, async (req, res) => {
   try {
@@ -396,25 +574,25 @@ const ADMIN_PAGE = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>On D' Road | Command Center</title>
-<link href="https://fonts.googleapis.com/css2?family=Bowlby+One&family=Outfit:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Anton&family=Outfit:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
   :root { --sun:#ffd400; --pink:#ff2e88; --teal:#00b8a9; --orange:#ff6b1a; --ink:#140b2e; --cream:#fff7e6; }
   * { box-sizing: border-box; }
   body { margin: 0; font-family: 'Outfit', sans-serif; background: var(--cream); color: var(--ink); padding: 0 0 50px; }
   .top { background: var(--ink); color: var(--sun); padding: 18px 22px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
-  .top h1 { font-family: 'Bowlby One', sans-serif; font-size: 24px; margin: 0; letter-spacing: 1px; }
+  .top h1 { font-family: 'Anton', sans-serif; font-size: 24px; margin: 0; letter-spacing: 1px; }
   .top span { color: #fff; font-weight: 700; font-size: 13px; }
   .bunting { height: 30px; background: url('data:image/svg+xml;utf8,<svg width="130" height="30" xmlns="http://www.w3.org/2000/svg"><polygon points="0,0 32,0 16,28" fill="%23ff2e88"/><polygon points="32,0 65,0 48,28" fill="%23ffd400"/><polygon points="65,0 97,0 81,28" fill="%2300b8a9"/><polygon points="97,0 130,0 113,28" fill="%23ff6b1a"/></svg>') repeat-x; }
   .wrap { max-width: 1100px; margin: 0 auto; padding: 22px 16px; }
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-bottom: 22px; }
   .stat { border: 3px solid var(--ink); border-radius: 20px; padding: 16px; box-shadow: 5px 5px 0 var(--ink); animation: pop .5s both; }
-  .stat b { font-family: 'Bowlby One', sans-serif; font-size: 38px; display: block; line-height: 1; }
+  .stat b { font-family: 'Anton', sans-serif; font-size: 38px; display: block; line-height: 1; }
   .stat small { font-weight: 800; letter-spacing: 1px; font-size: 11px; text-transform: uppercase; }
   .stat:nth-child(1) { background: var(--pink); color: #fff; } .stat:nth-child(2) { background: var(--teal); }
   .stat:nth-child(3) { background: var(--sun); } .stat:nth-child(4) { background: var(--orange); }
   .stat:nth-child(5) { background: #fff; } .stat:nth-child(6) { background: #fff; }
   .panel { background: #fff; border: 3px solid var(--ink); border-radius: 22px; padding: 18px; margin-bottom: 22px; box-shadow: 6px 6px 0 var(--pink); }
-  .panel h3 { font-family: 'Bowlby One', sans-serif; margin: 0 0 12px; font-size: 16px; text-transform: uppercase; }
+  .panel h3 { font-family: 'Anton', sans-serif; margin: 0 0 12px; font-size: 16px; text-transform: uppercase; }
   .bars div { display: flex; align-items: center; gap: 10px; margin: 8px 0; font-weight: 800; font-size: 13px; }
   .bars em { display: block; height: 22px; background: var(--teal); border: 2px solid var(--ink); border-radius: 12px; width: 0; transition: width 1s cubic-bezier(.2,.9,.3,1.1); min-width: 4px; }
   .bars span { width: 90px; } .bars i { font-style: normal; }
@@ -436,6 +614,21 @@ const ADMIN_PAGE = `<!DOCTYPE html>
   .hidden { display: none; }
   @keyframes pop { from { opacity: 0; transform: translateY(16px) scale(.96); } to { opacity: 1; transform: none; } }
   @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+  /* adult night look */
+  body { background: #08050a; color: #f6efe6; }
+  .top { background: #14060e; border-bottom: 1px solid rgba(233,180,76,.3); color: #e9b44c; }
+  .bunting { display: none; }
+  .top h1, .panel h3, th, .stat b { font-family: 'Anton', sans-serif; font-weight: 400; letter-spacing: 2px; }
+  .stat, .stat:nth-child(n), .panel, .tab, input, select { background: #14090f; color: #f6efe6; border: 1px solid rgba(233,180,76,.3); box-shadow: none; }
+  .stat b { color: #e9b44c; }
+  th { border-bottom: 1px solid rgba(233,180,76,.35); } td { border-bottom: 1px solid rgba(246,239,230,.08); }
+  .btn { background: linear-gradient(90deg, #e9b44c, #ff2a6d); color: #14060e; border: none; }
+  .btn.alt { background: transparent; color: #e9b44c; border: 1px solid rgba(233,180,76,.4); }
+  .btn.bad { background: transparent; color: #ff7b98; border: 1px solid rgba(255,123,152,.45); }
+  .tab.on { background: #e9b44c; color: #14060e; }
+  .pill { border-color: rgba(246,239,230,.3); color: #f6efe6; }
+  .CONFIRMED, .ACCEPTED { background: rgba(80,220,150,.16); } .PENDING { background: rgba(233,180,76,.18); } .REVOKED { background: rgba(255,123,152,.18); }
+  .bars em { background: linear-gradient(90deg, #e9b44c, #ff2a6d); border-color: transparent; }
 </style>
 </head>
 <body>
@@ -459,7 +652,33 @@ const ADMIN_PAGE = `<!DOCTYPE html>
     <p id="msg"></p>
   </div>
 
-  <div class="tabs"><button class="tab on" id="tab-g">Guests</button><button class="tab" id="tab-i">Invites</button></div>
+  <div class="tabs"><button class="tab on" id="tab-g">Guests</button><button class="tab" id="tab-i">Invites</button><button class="tab" id="tab-p">Products</button><button class="tab" id="tab-o">Orders</button></div>
+
+  <div class="panel hidden" id="products-panel">
+    <h3>Create a package</h3>
+    <div class="row">
+      <input id="p-name" placeholder="Name (e.g. Full Package)" style="flex:1; min-width:160px;">
+      <input id="p-price" type="number" step="0.01" placeholder="Price (e.g. 250.00)" style="width:140px;">
+      <select id="p-currency"><option value="XCD">XCD</option><option value="USD">USD</option></select>
+    </div>
+    <div class="row">
+      <textarea id="p-includes" placeholder="What's included, one item per line" style="flex:1; min-width:220px; min-height:70px;"></textarea>
+    </div>
+    <div class="row" style="align-items:center;">
+      <label style="font-weight:800; font-size:13px;"><input type="checkbox" id="p-compliance" checked> Requires costume compliance</label>
+      <input id="p-capacity" type="number" placeholder="Capacity (blank = unlimited)" style="width:200px;">
+      <button class="btn" id="p-create">Create package</button>
+    </div>
+    <div class="scroll"><table><thead><tr><th>Name</th><th>Price</th><th>Claimed</th><th>Active</th><th>Actions</th></tr></thead><tbody id="productlist"></tbody></table></div>
+  </div>
+
+  <div class="panel hidden" id="orders-panel">
+    <div class="row">
+      <select id="order-filter"><option value="">All statuses</option><option value="RESERVED">Reserved</option><option value="PAID">Paid</option><option value="CANCELLED">Cancelled</option></select>
+    </div>
+    <div class="scroll"><table><thead><tr><th>Guest</th><th>Package</th><th>Status</th><th>Ref</th><th>Reserved</th><th>Actions</th></tr></thead><tbody id="orderlist"></tbody></table></div>
+  </div>
+
 
   <div class="panel" id="guests-panel">
     <div class="row">
@@ -541,10 +760,87 @@ const ADMIN_PAGE = `<!DOCTYPE html>
     catch (e) { if (e.message !== 'Cancelled') alert(e.message); return; }
     renderStats(); renderGuests(); renderInvites();
   }
+  loadProducts(); loadOrders();
 
   $('search').addEventListener('input', renderGuests); $('filter').addEventListener('change', renderGuests);
   $('tab-g').addEventListener('click', () => { $('guests-panel').classList.remove('hidden'); $('invites-panel').classList.add('hidden'); $('tab-g').classList.add('on'); $('tab-i').classList.remove('on'); });
   $('tab-i').addEventListener('click', () => { $('invites-panel').classList.remove('hidden'); $('guests-panel').classList.add('hidden'); $('tab-i').classList.add('on'); $('tab-g').classList.remove('on'); });
+  const panels = ['guests-panel', 'invites-panel', 'products-panel', 'orders-panel'];
+  const tabs = ['tab-g', 'tab-i', 'tab-p', 'tab-o'];
+  function showTab(which) {
+    panels.forEach((p, i) => $(p).classList.toggle('hidden', tabs[i] !== which));
+    tabs.forEach((t) => $(t).classList.toggle('on', t === which));
+  }
+  $('tab-g').addEventListener('click', () => showTab('tab-g'));
+  $('tab-i').addEventListener('click', () => showTab('tab-i'));
+  $('tab-p').addEventListener('click', () => showTab('tab-p'));
+  $('tab-o').addEventListener('click', () => showTab('tab-o'));
+
+  function money(cents, cur) { return (cur || 'XCD') + ' ' + (cents / 100).toFixed(2); }
+
+  function renderProducts(products) {
+    const tbody = $('productlist'); tbody.replaceChildren();
+    products.forEach((p) => {
+      const tr = el('tr');
+      td(tr, p.name).style.fontWeight = '700';
+      td(tr, money(p.price_cents, p.currency));
+      td(tr, p.claimed + (p.capacity != null ? ' / ' + p.capacity : ''));
+      const actCell = td(tr, '');
+      const actBtn = el('button', p.active ? 'Active' : 'Hidden', 'btn ' + (p.active ? '' : 'alt'));
+      actBtn.addEventListener('click', async () => { try { await api('/api/admin/packages/' + p.id, { active: !p.active }); loadProducts(); } catch (e) { alert(e.message); } });
+      actCell.appendChild(actBtn);
+      const act = td(tr, '');
+      act.appendChild(btn('Edit', 'alt', async () => {
+        const name = prompt('Name:', p.name); if (name === null) throw new Error('Cancelled');
+        const price = prompt('Price (e.g. 250.00):', (p.price_cents / 100).toFixed(2)); if (price === null) throw new Error('Cancelled');
+        const includes = prompt('Includes (one item per line):', p.includes); if (includes === null) throw new Error('Cancelled');
+        await api('/api/admin/packages/' + p.id, { name, price_cents: Math.round(parseFloat(price) * 100), includes });
+        await loadProducts();
+      }));
+      act.appendChild(document.createTextNode(' '));
+      act.appendChild(btn('Delete', 'bad', async () => {
+        if (!confirm('Delete/retire ' + p.name + '?')) throw new Error('Cancelled');
+        await api('/api/admin/packages/' + p.id + '/delete', {});
+      }));
+      tbody.appendChild(tr);
+    });
+  }
+  async function loadProducts() { try { renderProducts(await api('/api/admin/packages')); } catch (e) { alert(e.message); } }
+  $('p-create').addEventListener('click', async () => {
+    const name = $('p-name').value.trim(), price = parseFloat($('p-price').value);
+    if (!name || !(price >= 0)) return alert('Name and a valid price are required.');
+    try {
+      await api('/api/admin/packages', {
+        name, price_cents: Math.round(price * 100), includes: $('p-includes').value,
+        requires_compliance: $('p-compliance').checked, capacity: $('p-capacity').value || null
+      });
+      $('p-name').value = ''; $('p-price').value = ''; $('p-includes').value = ''; $('p-capacity').value = '';
+      loadProducts();
+    } catch (e) { alert(e.message); }
+  });
+
+  function renderOrders(orders) {
+    const f = $('order-filter').value;
+    const tbody = $('orderlist'); tbody.replaceChildren();
+    orders.filter((o) => !f || o.status === f).forEach((o) => {
+      const tr = el('tr');
+      td(tr, o.guest_email).style.fontWeight = '700';
+      td(tr, o.package_name + ' (' + money(o.price_cents, o.currency) + ')');
+      td(tr, '').appendChild(pill(o.status, o.status === 'PAID' ? 'CONFIRMED' : o.status === 'CANCELLED' ? 'REVOKED' : 'PENDING'));
+      td(tr, o.reference_code);
+      td(tr, new Date(o.created_at).toLocaleDateString());
+      const act = td(tr, '');
+      if (o.status === 'RESERVED') {
+        act.appendChild(btn('Mark paid', '', async () => { await api('/api/admin/orders/' + o.id + '/mark-paid', {}); }));
+        act.appendChild(document.createTextNode(' '));
+        act.appendChild(btn('Cancel', 'bad', async () => { if (!confirm('Cancel this order?')) throw new Error('Cancelled'); await api('/api/admin/orders/' + o.id + '/cancel', {}); }));
+      }
+      tbody.appendChild(tr);
+    });
+  }
+  async function loadOrders() { try { renderOrders(await api('/api/admin/orders')); } catch (e) { alert(e.message); } }
+  $('order-filter').addEventListener('change', loadOrders);
+
   $('add-btn').addEventListener('click', async () => {
     const email = $('new-email').value.trim(); if (!email) return;
     try { await api('/api/admin/add-guest', { email }); $('new-email').value = ''; $('msg').textContent = 'Added ' + email; load(); } catch (e) { alert(e.message); }
