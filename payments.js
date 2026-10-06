@@ -3,7 +3,7 @@ import { renderEmail } from './emails.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, requireAuth, requireAdmin, escapeHtml }) {
+export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, requireAuth, requireAdmin, escapeHtml, beforeExpire }) {
   async function getSettings() {
     const r = await pool.query("SELECT key, value FROM settings WHERE key IN ('payment_instructions', 'pay_days')");
     const s = Object.fromEntries(r.rows.map((x) => [x.key, x.value]));
@@ -29,13 +29,18 @@ export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, 
   async function tick() {
     try {
       const { instructions, payDays } = await getSettings();
+      // PayPal payments that went through must count before anything is cancelled (see paypal.js).
+      if (beforeExpire) await beforeExpire(payDays).catch((err) => console.error('PayPal check error:', err.message));
       if (payDays < 1) return; // 0 = no deadline
 
-      // 1. Expire unpaid orders past the deadline (this also frees capacity).
+      // 1. Expire unpaid orders past the deadline (this also frees capacity). A PayPal checkout started in the
+      //    last 30 minutes, or a PayPal payment PayPal is still processing, gets more time.
       const expired = await pool.query(
         `UPDATE orders o SET status = 'CANCELLED' FROM packages p
          WHERE p.id = o.package_id AND o.status = 'RESERVED'
            AND o.created_at + make_interval(days => $1::int) < NOW()
+           AND (o.paypal_started_at IS NULL OR o.paypal_started_at < NOW() - INTERVAL '30 minutes')
+           AND o.paypal_status IS DISTINCT FROM 'PENDING'
          RETURNING o.guest_email, o.reference_code, p.name AS package_name`, [payDays]);
       for (const o of expired.rows) {
         await send(o.guest_email, "Your reservation expired — On D' Road", renderEmail({
@@ -78,8 +83,8 @@ export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, 
     try {
       const { instructions, payDays } = await getSettings();
       const r = await pool.query(
-        `SELECT o.id, o.status, o.reference_code, o.created_at, o.cancel_requested_at,
-                p.name AS package_name, p.price_cents, p.currency, p.includes
+        `SELECT o.id, o.status, o.reference_code, o.created_at, o.cancel_requested_at, o.size,
+                p.name AS package_name, p.price_cents, p.currency, p.includes, p.sizes AS package_sizes
          FROM orders o JOIN packages p ON p.id = o.package_id
          WHERE o.guest_email = $1 AND o.status <> 'CANCELLED' ORDER BY o.id DESC LIMIT 1`, [req.userEmail]);
       const o = r.rows[0];
@@ -154,6 +159,8 @@ small { display: block; color: var(--dim); font-size: 13px; margin-top: 8px; }
 .preview b { display: block; font-size: 11px; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; color: var(--accent); margin-bottom: 8px; }
 .preview span { white-space: pre-line; font-size: 15px; }
 .preview .none { color: var(--dim); font-style: italic; }
+.pp { margin: 0; color: var(--muted); }
+.pp b { color: var(--text); font-weight: 600; }
 .foot { display: flex; align-items: center; gap: 14px; margin-top: 26px; flex-wrap: wrap; }
 button { font: 600 14px 'Inter', system-ui, sans-serif; padding: 13px 22px; border-radius: 10px; cursor: pointer; color: var(--accent-ink); background: var(--accent); border: 1px solid var(--accent); }
 button:hover { filter: brightness(1.08); }
@@ -181,6 +188,10 @@ button:disabled { opacity: .5; cursor: progress; }
 
     <div class="foot"><button id="save" type="button">Save settings</button><span id="msg" role="status"></span></div>
   </div>
+  <div class="card" style="margin-top:22px">
+    <label style="margin-top:0">PayPal</label>
+    <p id="pp" class="pp" aria-live="polite">Checking...</p>
+  </div>
 </main>
 <script>
 var $ = function (id) { return document.getElementById(id); };
@@ -190,6 +201,17 @@ function preview() {
   $('pv').className = v ? '' : 'none';
 }
 $('instr').addEventListener('input', preview);
+fetch('/api/admin/paypal').then(function (r) { return r.json(); }).then(function (d) {
+  var t = !d.configured
+    ? '<b>Not set up.</b> Add PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET to the server settings in Render to let guests pay online.'
+    : d.live
+    ? '<b>On.</b> Guests with a reservation can pay with PayPal or a card, and are confirmed right away. XCD prices are charged in USD at 2.70 to the dollar. The instructions above show as "Other ways to pay".'
+    : d.testers.length
+    ? '<b>Test mode</b> (PayPal sandbox, no real money). Only these guests see PayPal: ' + d.testers.map(esc).join(', ') + '. Set PAYPAL_ENV to live, with your live keys, when you are ready.'
+    : '<b>Test mode</b>, but nobody is listed in PAYPAL_TESTERS, so no guest sees PayPal yet.';
+  $('pp').innerHTML = t;
+}).catch(function () { $('pp').textContent = 'Could not check PayPal.'; });
+function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
 fetch('/api/admin/payment-settings').then(function (r) { return r.json(); }).then(function (d) {
   $('instr').value = d.instructions || '';
   $('days').value = d.pay_days;

@@ -9,6 +9,24 @@ const C = {
 const FONT = "'Helvetica Neue', Helvetica, Arial, sans-serif";
 const MONO = "Menlo, Consolas, 'Courier New', monospace";
 
+// Contact details for the bottom of every email. site.js sets them from the admin's settings.
+let contact = { whatsapp: '', instagram: '', email: '' };
+export function setContact(c) {
+  contact = { whatsapp: c?.whatsapp || '', instagram: c?.instagram || '', email: c?.email || '' };
+}
+
+// 12685551234 -> "+1 268 555 1234". Other numbers are shown as "+" and the digits.
+export const formatPhone = (d) => (/^1\d{10}$/.test(d) ? `+1 ${d.slice(1, 4)} ${d.slice(4, 7)} ${d.slice(7)}` : `+${d}`);
+
+// [label, url] for each contact detail that is set.
+export function contactLinks(c = contact) {
+  const links = [];
+  if (c.whatsapp) links.push([`WhatsApp ${formatPhone(c.whatsapp)}`, `https://wa.me/${c.whatsapp}`]);
+  if (c.instagram) links.push([`Instagram @${c.instagram}`, `https://instagram.com/${c.instagram}`]);
+  if (c.email) links.push([c.email, `mailto:${c.email}`]);
+  return links;
+}
+
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const nl2br = (s) => esc(s).replace(/\r?\n/g, '<br>');
 
@@ -83,6 +101,7 @@ ${o.cta.fallback ? `<p style="margin:14px 0 0;font-family:${FONT};font-size:12px
   }
 
   const preheader = o.preheader || lines[0] || o.title;
+  const links = contactLinks();
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -118,7 +137,7 @@ ${rows.join('\n')}
 </table>
 </td></tr>
 <tr><td align="center" style="padding:22px 16px 0;font-family:${FONT};font-size:11px;line-height:1.7;color:${C.dim};">
-On D' Road &middot; Antigua Carnival<br>18+ only. Invite only. Please don't forward this email.
+${links.length ? `Questions? ${links.map(([label, url]) => `<a href="${esc(url)}" style="color:${C.muted};text-decoration:underline;">${esc(label)}</a>`).join(' &middot; ')}<br>` : ''}On D' Road &middot; Antigua Carnival<br>18+ only. Invite only. Please don't forward this email.
 </td></tr>
 </table>
 </td></tr>
@@ -138,6 +157,7 @@ On D' Road &middot; Antigua Carnival<br>18+ only. Invite only. Please don't forw
     ...(o.callout && o.callout.text ? [`${o.callout.label}:`, o.callout.text, ''] : []),
     ...(o.cta && o.cta.url ? [`${o.cta.text}: ${o.cta.url}`, ''] : []),
     ...(o.fine ? [o.fine, ''] : []),
+    ...(links.length ? [`Questions? ${links.map(([label, url]) => (url.startsWith('mailto:') ? label : `${label}: ${url}`)).join(' · ')}`] : []),
     "On D' Road · Antigua Carnival · 18+ only. Invite only."
   ].join('\n');
 
