@@ -1,14 +1,51 @@
 // payments.js: payment instructions, pay-by deadline, auto-expiry and reminder emails.
 import { renderEmail } from './emails.js';
+import { promoLabel } from './pricing.js';
+import { getSizeLock, isSizeLocked } from './pickup.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const ANTIGUA_MS = 4 * 60 * 60 * 1000; // Antigua is UTC-4 all year (no daylight saving)
+const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+// SQL for a reserved order's deadline (NULL = none). p is the placeholder holding the current pay_days, e.g. '$1'.
+// New orders store their deadline in pay_by. Older ones keep the days-to-pay they were reserved under
+// (orders.pay_days; 0 = no deadline), and the oldest, from before that column, use the current setting.
+export const dueSql = (p) => `COALESCE(o.pay_by, CASE WHEN COALESCE(o.pay_days, ${p}::int) > 0
+    THEN o.created_at + make_interval(days => COALESCE(o.pay_days, ${p}::int)) END)`;
+
+// The "How to pay" text: the general instructions, then the package's own cash details.
+const howToPay = (instructions, payNote) => [instructions, payNote].map((t) => (t || '').trim()).filter(Boolean).join('\n\n');
 
 export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, requireAuth, requireAdmin, escapeHtml, beforeExpire }) {
+  // pay_rule 'days': pay within pay_days days of reserving (0 = no deadline).
+  // pay_rule 'weekday': pay by the next pay_weekday (0 = Sunday) at pay_time, Antigua time.
   async function getSettings() {
-    const r = await pool.query("SELECT key, value FROM settings WHERE key IN ('payment_instructions', 'pay_days')");
+    const r = await pool.query(
+      "SELECT key, value FROM settings WHERE key IN ('payment_instructions', 'pay_days', 'pay_rule', 'pay_weekday', 'pay_time')");
     const s = Object.fromEntries(r.rows.map((x) => [x.key, x.value]));
     const days = parseInt(s.pay_days, 10);
-    return { instructions: s.payment_instructions || '', payDays: Number.isNaN(days) ? 3 : days };
+    const weekday = parseInt(s.pay_weekday, 10);
+    return {
+      instructions: s.payment_instructions || '',
+      payDays: Number.isNaN(days) ? 3 : days,
+      payRule: s.pay_rule === 'weekday' ? 'weekday' : 'days',
+      payWeekday: weekday >= 0 && weekday <= 6 ? weekday : 5,
+      payTime: TIME_RE.test(s.pay_time || '') ? s.pay_time : '18:00'
+    };
+  }
+
+  // The deadline for a reservation made at createdAt under these settings (from getSettings()), or null for none.
+  // With the weekday rule it's the first chosen weekday at the chosen time that is at least 24 hours away.
+  function deadlineFor(createdAt, settings) {
+    const start = new Date(createdAt).getTime();
+    if (settings.payRule !== 'weekday') return settings.payDays > 0 ? new Date(start + settings.payDays * DAY_MS) : null;
+    const [h, m] = settings.payTime.split(':').map(Number);
+    const earliest = start + DAY_MS;
+    const local = new Date(earliest - ANTIGUA_MS); // Antigua's clock, read with the UTC getters
+    const ahead = (settings.payWeekday - local.getUTCDay() + 7) % 7;
+    let due = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate() + ahead, h, m) + ANTIGUA_MS;
+    if (due < earliest) due += 7 * DAY_MS;
+    return new Date(due);
   }
 
   const payBy = (createdAt, payDays) => new Date(new Date(createdAt).getTime() + payDays * DAY_MS);
@@ -32,16 +69,15 @@ export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, 
       const { instructions, payDays } = await getSettings();
       // PayPal payments that went through must count before anything is cancelled (see paypal.js).
       if (beforeExpire) await beforeExpire(payDays).catch((err) => console.error('PayPal check error:', err.message));
-      // Each order keeps the days-to-pay it was reserved under (orders.pay_days; 0 = no deadline). Orders from
-      // before that column existed use the current setting.
-      const DAYS = 'COALESCE(o.pay_days, $1::int)';
+      // Each order's deadline (see dueSql). NULL = no deadline, so the comparisons below are never true for it.
+      const DUE = dueSql('$1');
 
       // 1. Expire unpaid orders past the deadline (this also frees capacity). A PayPal checkout started in the
       //    last 30 minutes, or a PayPal payment PayPal is still processing, gets more time.
       const expired = await pool.query(
         `UPDATE orders o SET status = 'CANCELLED' FROM packages p
          WHERE p.id = o.package_id AND o.status = 'RESERVED'
-           AND ${DAYS} > 0 AND o.created_at + make_interval(days => ${DAYS}) < NOW()
+           AND ${DUE} < NOW()
            AND (o.paypal_started_at IS NULL OR o.paypal_started_at < NOW() - INTERVAL '30 minutes')
            AND o.paypal_status IS DISTINCT FROM 'PENDING'
          RETURNING o.guest_email, o.reference_code, p.name AS package_name`, [payDays]);
@@ -55,21 +91,24 @@ export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, 
         }));
       }
 
-      // 2. One reminder, about 24 hours before the deadline (needs a deadline of 2+ days).
+      // 2. One reminder, about 24 hours before the deadline (only when the guest had 2+ days to pay, and not for a
+      //    deadline that already passed: those are orders the PayPal exceptions above kept).
       {
         const due = await pool.query(
           `UPDATE orders o SET reminder_sent_at = NOW() FROM packages p
            WHERE p.id = o.package_id AND o.status = 'RESERVED' AND o.reminder_sent_at IS NULL
-             AND ${DAYS} >= 2 AND o.created_at + make_interval(days => ${DAYS}) - INTERVAL '24 hours' < NOW()
-           RETURNING o.guest_email, o.reference_code, o.created_at, ${DAYS} AS days, p.name AS package_name`, [payDays]);
+             AND ${DUE} - INTERVAL '24 hours' < NOW() AND ${DUE} > NOW()
+             AND ${DUE} - o.created_at >= INTERVAL '48 hours'
+           RETURNING o.guest_email, o.reference_code, ${DUE} AS due, p.name AS package_name, p.pay_note`, [payDays]);
         for (const o of due.rows) {
-          const due = fmt(payBy(o.created_at, o.days));
+          const due = fmt(o.due);
+          const how = howToPay(instructions, o.pay_note);
           await send(o.guest_email, "Pay soon to keep your spot — On D' Road", renderEmail({
             tone: 'warn', tag: 'Payment reminder', title: 'Pay by tomorrow',
             preheader: `Your reservation expires ${due}.`,
             lines: [`Your reservation for ${o.package_name} expires on ${due}.`, 'Unpaid reservations are cancelled automatically.'],
             details: [['Package', o.package_name], ['Reference', o.reference_code, true], ['Pay by', due]],
-            callout: instructions ? { label: 'How to pay', text: instructions } : null,
+            callout: how ? { label: 'How to pay', text: how } : null,
             cta: { text: 'View my order', url: FRONTEND_URL }
           }));
         }
@@ -81,21 +120,30 @@ export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, 
   setTimeout(tick, 30 * 1000).unref();
   setInterval(tick, 10 * 60 * 1000).unref();
 
-  // Replaces the existing /api/my-order (this is registered first): adds the deadline and instructions.
+  // Replaces the existing /api/my-order (this is registered first): adds the deadline, how to pay, what the guest
+  // owes (tier, code) and pickup. price_cents is the order's amount too, for older copies of the guest site.
   app.get('/api/my-order', requireAuth, async (req, res) => {
     try {
-      const { instructions, payDays } = await getSettings();
+      const [{ instructions, payDays }, sizeLock] = await Promise.all([getSettings(), getSizeLock(pool)]);
       const r = await pool.query(
-        `SELECT o.id, o.status, o.reference_code, o.created_at, o.cancel_requested_at, o.size, o.pay_days,
-                p.name AS package_name, p.price_cents, p.currency, p.includes, p.sizes AS package_sizes
-         FROM orders o JOIN packages p ON p.id = o.package_id
-         WHERE o.guest_email = $1 AND o.status <> 'CANCELLED' ORDER BY o.id DESC LIMIT 1`, [req.userEmail]);
-      const o = r.rows[0];
-      if (!o) return res.json(null);
+        `SELECT o.id, o.status, o.reference_code, o.created_at, o.cancel_requested_at, o.size, o.pay_days, ${dueSql('$2')} AS due,
+                COALESCE(o.amount_cents, p.price_cents) AS amount_cents, COALESCE(o.list_cents, p.price_cents) AS list_cents,
+                o.discount_cents, COALESCE(o.currency, p.currency) AS currency, o.promo_code, o.tier_name, o.paid_via,
+                o.picked_up_at, o.paypal_order_id IS NOT NULL AS paypal_started, pc.kind AS promo_kind, pc.value AS promo_value,
+                p.name AS package_name, p.includes, p.sizes AS package_sizes, p.pay_note
+         FROM orders o JOIN packages p ON p.id = o.package_id LEFT JOIN promo_codes pc ON pc.code = o.promo_code
+         WHERE o.guest_email = $1 AND o.status <> 'CANCELLED' ORDER BY o.id DESC LIMIT 1`, [req.userEmail, payDays]);
+      if (!r.rowCount) return res.json(null);
+      const { due, promo_kind: kind, promo_value: value, ...o } = r.rows[0];
       const open = o.status === 'RESERVED';
-      const days = o.pay_days ?? payDays;
-      o.pay_by = open && days > 0 ? payBy(o.created_at, days).toISOString() : null;
+      o.price_cents = o.amount_cents;
+      // A code's row can't be deleted once used, but if it's gone, describe what it took off.
+      o.promo_label = o.promo_code
+        ? promoLabel(kind ? { kind, value } : { kind: 'AMOUNT', value: o.discount_cents }, o.currency) : null;
+      o.size_locked = isSizeLocked(sizeLock, o.status);
+      o.pay_by = open && due ? new Date(due).toISOString() : null;
       o.payment_instructions = open ? instructions : '';
+      o.pay_note = open ? o.pay_note || '' : '';
       res.json(o);
     } catch (err) {
       console.error(err);
@@ -105,23 +153,40 @@ export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, 
 
   app.get('/api/admin/payment-settings', requireAdmin, async (req, res) => {
     try {
-      const { instructions, payDays } = await getSettings();
-      res.json({ instructions, pay_days: payDays });
+      const s = await getSettings();
+      res.json({ instructions: s.instructions, pay_days: s.payDays, pay_rule: s.payRule, pay_weekday: s.payWeekday, pay_time: s.payTime });
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: 'Server error.' });
     }
   });
 
+  // pay_rule, pay_weekday and pay_time are optional: left out, they keep their current values.
   app.post('/api/admin/payment-settings', requireAdmin, async (req, res) => {
-    const instructions = typeof req.body?.instructions === 'string' ? req.body.instructions.trim().slice(0, 2000) : '';
-    const days = parseInt(req.body?.pay_days, 10);
+    const b = req.body || {};
+    const instructions = typeof b.instructions === 'string' ? b.instructions.trim().slice(0, 2000) : '';
+    const days = parseInt(b.pay_days, 10);
     if (!(days >= 0 && days <= 30)) return res.status(400).json({ error: 'Days must be between 0 and 30.' });
+    if (b.pay_rule !== undefined && !['days', 'weekday'].includes(b.pay_rule)) {
+      return res.status(400).json({ error: 'Choose how the deadline works.' });
+    }
+    if (b.pay_weekday !== undefined && !/^[0-6]$/.test(String(b.pay_weekday))) {
+      return res.status(400).json({ error: 'Choose a day of the week.' });
+    }
+    if (b.pay_time !== undefined && !TIME_RE.test(String(b.pay_time))) {
+      return res.status(400).json({ error: 'Enter a time like 18:00.' });
+    }
     try {
-      for (const [k, v] of [['payment_instructions', instructions], ['pay_days', String(days)]]) {
-        await pool.query(
-          'INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value', [k, v]);
-      }
+      const cur = await getSettings();
+      const rows = [
+        ['payment_instructions', instructions], ['pay_days', String(days)],
+        ['pay_rule', b.pay_rule ?? cur.payRule], ['pay_weekday', String(b.pay_weekday ?? cur.payWeekday)],
+        ['pay_time', String(b.pay_time ?? cur.payTime)]
+      ];
+      // One statement, so the settings are saved together or not at all.
+      await pool.query(
+        `INSERT INTO settings (key, value) VALUES ${rows.map((_, i) => `($${i * 2 + 1}, $${i * 2 + 2})`).join(', ')}
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, rows.flat());
       res.json({ success: true });
     } catch (err) {
       console.error(err);

@@ -9,6 +9,8 @@ import { registerDoor } from './door.js';
 import { registerEvent } from './event.js';
 import { registerSite } from './site.js';
 import { registerPayPal } from './paypal.js';
+import { registerPricing, loadTiers, priceOf, checkPromo, discountFor, withStates, cleanCode } from './pricing.js';
+import { registerPickup, getSizeLock, isSizeLocked } from './pickup.js';
 import QRCode from 'qrcode';
 
 const { Pool } = pkg;
@@ -56,6 +58,9 @@ const sizeList = (v) => {
 };
 // The package's own spelling of the size the guest picked, or null if it isn't one of them.
 const pickSize = (sizes, v) => sizes.find((s) => s.toLowerCase() === String(v || '').trim().toLowerCase()) || null;
+// A whole number from a JSON number or a string of digits, else NaN. Stricter than parseInt: "12abc" and 1.5 fail.
+const toInt = (v) => (typeof v === 'number' || (typeof v === 'string' && /^\s*-?\d+\s*$/.test(v)) ? Number(v) : NaN);
+const money = (cents, cur) => (cur || 'XCD') + ' ' + (cents / 100).toFixed(2);
 const serverError = (res, err, msg = 'Server error.') => {
   console.error(err);
   res.status(500).json({ error: msg });
@@ -137,6 +142,11 @@ registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, requireAuth, requir
 // Paying online with PayPal (see paypal.js). Off until the PAYPAL_* settings are added.
 const paypal = registerPayPal({ app, pool, requireAuth, requireAdmin, rateLimit, perUser,
   onPaid: (o) => sendPaidEmail(o.guest_email, o.package_name, o.reference_code) });
+// Price tiers and promo codes (see pricing.js). A code that makes an unpaid reservation free confirms it straight away.
+registerPricing({ app, pool, requireAuth, requireAdmin, rateLimit, perUser,
+  onComp: (o) => sendPaidEmail(o.guest_email, o.package_name, o.reference_code, { free: true }) });
+// Size lock and package pickup tracking (see pickup.js).
+registerPickup({ app, pool, requireAdmin });
 const ADMIN_EMAIL = normalizeEmail(process.env.ADMIN_EMAIL); // optional: gets a copy of refund requests
 
 // Creates the packages/orders/settings tables and any missing columns on startup,
@@ -212,7 +222,45 @@ async function ensureSchema() {
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS paypal_amount TEXT;
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS paypal_capture_id TEXT;
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS paypal_refund_id TEXT;
+    CREATE TABLE IF NOT EXISTS package_tiers (
+      id SERIAL PRIMARY KEY,
+      package_id INTEGER NOT NULL REFERENCES packages(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      price_cents INTEGER NOT NULL,
+      ends_at TIMESTAMPTZ,
+      quantity INTEGER,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS promo_codes (
+      code TEXT PRIMARY KEY,
+      kind TEXT NOT NULL,
+      value INTEGER NOT NULL DEFAULT 0,
+      package_id INTEGER REFERENCES packages(id) ON DELETE CASCADE,
+      max_uses INTEGER,
+      expires_at TIMESTAMPTZ,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      note TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    ALTER TABLE packages ADD COLUMN IF NOT EXISTS pay_note TEXT NOT NULL DEFAULT '';
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS tier_id INTEGER REFERENCES package_tiers(id) ON DELETE SET NULL;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS tier_name TEXT;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS list_cents INTEGER;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_cents INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS amount_cents INTEGER;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS currency TEXT;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS promo_code TEXT;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS pay_by TIMESTAMPTZ;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS picked_up_at TIMESTAMPTZ;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS picked_up_by TEXT;
+    CREATE INDEX IF NOT EXISTS orders_tier_idx ON orders (tier_id);
+    CREATE INDEX IF NOT EXISTS orders_promo_idx ON orders (promo_code);
   `);
+  // Each order stores what it costs. Orders from before that keep the package price.
+  await pool.query(
+    `UPDATE orders o SET list_cents = p.price_cents, amount_cents = p.price_cents, currency = p.currency
+     FROM packages p WHERE p.id = o.package_id AND o.amount_cents IS NULL`);
 }
 
 // --- VIP LOGIN: step 1, request a one-time link ---
@@ -294,7 +342,7 @@ app.post('/api/update-shirt', requireAuth, async (req, res) => {
 // --- UPDATE RSVP ---
 app.post('/api/update-rsvp', requireAuth, async (req, res) => {
   const rsvp_status = typeof req.body?.rsvp_status === 'string' ? req.body.rsvp_status.trim() : '';
-  if (!rsvp_status || rsvp_status.length > 20) return res.status(400).json({ error: 'Invalid RSVP status.' });
+  if (!['CONFIRMED', 'PENDING'].includes(rsvp_status)) return res.status(400).json({ error: 'Invalid RSVP status.' });
   try {
     await pool.query('UPDATE guests SET rsvp_status = $1 WHERE LOWER(email) = $2', [rsvp_status, req.userEmail]);
     res.json({ success: true, rsvp_status });
@@ -449,13 +497,27 @@ app.post('/api/admin/create-invite', requireAdmin, async (req, res) => {
 });
 
 // ---------- Packages (public read, admin write) ----------
+// Each active package with what it costs right now. With price tiers, that's the tier on sale; when every tier
+// has ended or sold out, sales_closed is true (price_cents is then the package price, only for display).
 app.get('/api/packages', async (req, res) => {
   try {
     const r = await pool.query(
       `SELECT p.id, p.name, p.price_cents, p.currency, p.includes, p.requires_compliance, p.capacity, p.sizes,
               GREATEST(0, COALESCE(p.capacity, 2147483647) - (SELECT COUNT(*) FROM orders o WHERE o.package_id = p.id AND o.status <> 'CANCELLED')) AS spots_left
        FROM packages p WHERE p.active = TRUE ORDER BY p.sort_order ASC, p.id ASC`);
-    res.json(r.rows);
+    const tiers = await loadTiers(pool, r.rows.map((p) => p.id));
+    const now = new Date();
+    res.json(r.rows.map((p) => {
+      const { tier, next, list_cents, closed } = priceOf(p, tiers.get(p.id) || [], now);
+      return {
+        ...p,
+        price_cents: closed ? p.price_cents : list_cents,
+        sales_closed: closed,
+        tier: tier ? { id: tier.id, name: tier.name, ends_at: tier.ends_at,
+          left: tier.quantity === null ? null : Math.max(0, tier.quantity - tier.sold) } : null,
+        next_tier: next ? { name: next.name, price_cents: next.price_cents } : null
+      };
+    }));
   } catch (err) {
     serverError(res, err);
   }
@@ -469,27 +531,54 @@ app.get('/api/admin/packages', requireAdmin, async (req, res) => {
                 (SELECT o.size, COUNT(*) AS n FROM orders o
                  WHERE o.package_id = p.id AND o.status <> 'CANCELLED' AND o.size IS NOT NULL GROUP BY o.size) s) AS size_counts
        FROM packages p ORDER BY p.sort_order ASC, p.id ASC`);
-    res.json(r.rows);
+    const tiers = await loadTiers(pool, r.rows.map((p) => p.id));
+    const now = new Date();
+    res.json(r.rows.map((p) => {
+      const list = tiers.get(p.id) || [];
+      const price = priceOf(p, list, now);
+      return { ...p, tiers: withStates(list, now), price_now: price.list_cents, sales_closed: price.closed };
+    }));
   } catch (err) {
     serverError(res, err);
   }
 });
 
+// Package fields shared by create and edit. Returns { error } for bad input; never turns it into 0.
+function packageInput(b) {
+  const out = {};
+  if (typeof b.name === 'string') {
+    out.name = b.name.trim().slice(0, 80);
+    if (!out.name) return { error: 'Give the package a name.' };
+  }
+  if (b.price_cents !== undefined) {
+    out.price_cents = toInt(b.price_cents);
+    if (!(Number.isInteger(out.price_cents) && out.price_cents >= 0 && out.price_cents <= 10000000)) return { error: 'Enter a valid price.' };
+  }
+  if (b.capacity !== undefined) {
+    out.capacity = b.capacity === '' || b.capacity === null ? null : toInt(b.capacity);
+    if (out.capacity !== null && !(Number.isInteger(out.capacity) && out.capacity >= 1 && out.capacity <= 100000)) {
+      return { error: 'Capacity must be a whole number, or blank for no limit.' };
+    }
+  }
+  if (typeof b.includes === 'string') out.includes = b.includes.slice(0, 1000);
+  if (typeof b.sizes === 'string') out.sizes = sizeList(b.sizes).join(', ');
+  if (typeof b.pay_note === 'string') out.pay_note = b.pay_note.trim().slice(0, 1000);
+  if (b.requires_compliance !== undefined) out.requires_compliance = !!b.requires_compliance;
+  if (b.active !== undefined) out.active = !!b.active;
+  if (b.sort_order !== undefined) out.sort_order = Math.max(-100000, Math.min(100000, parseInt(b.sort_order, 10) || 0));
+  return { fields: out };
+}
+
 app.post('/api/admin/packages', requireAdmin, async (req, res) => {
-  const name = typeof req.body?.name === 'string' ? req.body.name.trim().slice(0, 80) : '';
-  const price = parseInt(req.body?.price_cents, 10);
-  const includes = typeof req.body?.includes === 'string' ? req.body.includes.slice(0, 1000) : '';
-  const requiresCompliance = !!req.body?.requires_compliance;
-  const capacity = req.body?.capacity === '' || req.body?.capacity == null ? null : parseInt(req.body.capacity, 10);
-  const sortOrder = parseInt(req.body?.sort_order, 10) || 0;
+  const { error, fields: f } = packageInput({ ...req.body, price_cents: req.body?.price_cents ?? '' });
+  if (error || !f.name) return res.status(400).json({ error: error || 'Give the package a name.' });
   const currency = ['XCD', 'USD'].includes(req.body?.currency) ? req.body.currency : 'XCD';
-  const sizes = sizeList(req.body?.sizes).join(', ');
-  if (!name || !Number.isFinite(price) || price < 0) return res.status(400).json({ error: 'A name and a valid price (in cents) are required.' });
   try {
     const r = await pool.query(
-      `INSERT INTO packages (name, price_cents, currency, includes, requires_compliance, capacity, sort_order, sizes)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
-      [name, price, currency, includes, requiresCompliance, capacity, sortOrder, sizes]);
+      `INSERT INTO packages (name, price_cents, currency, includes, requires_compliance, capacity, sort_order, sizes, pay_note)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+      [f.name, f.price_cents, currency, f.includes || '', !!f.requires_compliance, f.capacity ?? null, f.sort_order || 0,
+        f.sizes || '', f.pay_note || '']);
     res.json({ success: true, id: r.rows[0].id });
   } catch (err) {
     serverError(res, err);
@@ -498,19 +587,13 @@ app.post('/api/admin/packages', requireAdmin, async (req, res) => {
 
 app.post('/api/admin/packages/:id', requireAdmin, async (req, res) => {
   const id = parseInt(req.params.id, 10);
-  const fields = []; const values = []; let i = 1;
-  const push = (col, val) => { fields.push(`${col} = $${i++}`); values.push(val); };
-  if (typeof req.body?.name === 'string') push('name', req.body.name.trim().slice(0, 80));
-  if (req.body?.price_cents !== undefined) push('price_cents', parseInt(req.body.price_cents, 10) || 0);
-  if (typeof req.body?.includes === 'string') push('includes', req.body.includes.slice(0, 1000));
-  if (req.body?.requires_compliance !== undefined) push('requires_compliance', !!req.body.requires_compliance);
-  if (req.body?.capacity !== undefined) push('capacity', req.body.capacity === '' || req.body.capacity == null ? null : parseInt(req.body.capacity, 10));
-  if (req.body?.active !== undefined) push('active', !!req.body.active);
-  if (req.body?.sort_order !== undefined) push('sort_order', parseInt(req.body.sort_order, 10) || 0);
-  if (typeof req.body?.sizes === 'string') push('sizes', sizeList(req.body.sizes).join(', '));
-  if (!id || !fields.length) return res.status(400).json({ error: 'Nothing to update.' });
+  const { error, fields: f } = packageInput(req.body || {});
+  if (error) return res.status(400).json({ error });
+  const cols = Object.keys(f); // fixed column names from packageInput, never from the request
+  if (!id || !cols.length) return res.status(400).json({ error: 'Nothing to update.' });
   try {
-    await pool.query(`UPDATE packages SET ${fields.join(', ')} WHERE id = $${i}`, [...values, id]);
+    await pool.query(`UPDATE packages SET ${cols.map((c, n) => `${c} = $${n + 1}`).join(', ')} WHERE id = $${cols.length + 1}`,
+      [...cols.map((c) => f[c]), id]);
     res.json({ success: true });
   } catch (err) {
     serverError(res, err);
@@ -541,7 +624,8 @@ const newRef = () => 'ODR-' + crypto.randomBytes(4).toString('hex').toUpperCase(
 app.get('/api/my-order', requireAuth, async (req, res) => {
   try {
     const r = await pool.query(
-      `SELECT o.id, o.status, o.reference_code, o.created_at, p.name AS package_name, p.price_cents, p.currency, p.includes
+      `SELECT o.id, o.status, o.reference_code, o.created_at, p.name AS package_name,
+              COALESCE(o.amount_cents, p.price_cents) AS price_cents, COALESCE(o.currency, p.currency) AS currency, p.includes
        FROM orders o JOIN packages p ON p.id = o.package_id
        WHERE o.guest_email = $1 AND o.status <> 'CANCELLED' ORDER BY o.id DESC LIMIT 1`, [req.userEmail]);
     res.json(r.rows[0] || null);
