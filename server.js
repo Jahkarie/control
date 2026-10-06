@@ -5,6 +5,7 @@ import pkg from 'pg';
 import { Resend } from 'resend';
 import { registerPayments } from './payments.js';
 import { renderEmail } from './emails.js';
+import { registerDoor } from './door.js';
 
 const { Pool } = pkg;
 
@@ -102,6 +103,9 @@ app.set('trust proxy', 1); // Render sits behind a proxy
 const ALLOWED_ORIGINS = [FRONTEND_URL, 'https://ondroad.xyz', 'https://www.ondroad.xyz',
   ...(process.env.EXTRA_ORIGINS || '').split(',').map((o) => o.trim().replace(/\/$/, '')).filter(Boolean)];
 app.use(cors({ origin: ALLOWED_ORIGINS }));
+// Door check-in (staff scanner at /door). Registered before the 10kb body limit because
+// a phone coming back online can upload a batch of offline check-ins at once.
+registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLimit, requireAdmin });
 app.use(express.json({ limit: '10kb' }));
 
 // Payment instructions, pay-by deadline, auto-expiry and reminders (see payments.js).
@@ -149,6 +153,17 @@ async function ensureSchema() {
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS cancel_requested_at TIMESTAMPTZ;
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS cancel_reason TEXT;
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMPTZ;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS checked_in_at TIMESTAMPTZ;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS checked_in_by TEXT;
+    CREATE TABLE IF NOT EXISTS checkins (
+      id SERIAL PRIMARY KEY,
+      order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL,
+      device TEXT,
+      client_id TEXT UNIQUE,
+      scanned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
   `);
 }
 
@@ -590,7 +605,8 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   try {
     const r = await pool.query(
       `SELECT o.id, o.package_id, o.guest_email, o.status, o.reference_code, o.created_at, o.paid_at,
-              o.cancel_requested_at, o.cancel_reason, o.refunded_at, p.name AS package_name, p.price_cents, p.currency
+              o.cancel_requested_at, o.cancel_reason, o.refunded_at, o.checked_in_at, o.checked_in_by,
+              p.name AS package_name, p.price_cents, p.currency
        FROM orders o JOIN packages p ON p.id = o.package_id
        ORDER BY (o.status = 'PAID' AND o.cancel_requested_at IS NOT NULL) DESC, o.id DESC`);
     res.json(r.rows);
@@ -876,6 +892,7 @@ input[type=checkbox] { width: 18px; height: 18px; padding: 0; accent-color: var(
   display: inline-flex; align-items: center; justify-content: center; gap: 8px; white-space: nowrap;
   font: 600 13px var(--body); padding: 11px 16px; border-radius: 9px; cursor: pointer;
   color: var(--accent-ink); background: var(--accent); border: 1px solid var(--accent); transition: filter .15s, background .15s, border-color .15s, color .15s;
+  text-decoration: none;
 }
 .btn:hover { filter: brightness(1.08); }
 .btn:disabled { opacity: .5; cursor: progress; }
@@ -920,7 +937,7 @@ input[type=checkbox] { width: 18px; height: 18px; padding: 0; accent-color: var(
 .tab.on .count { color: var(--muted); }
 @media (max-width: 600px) {
   .tabs { width: 100%; }
-  .tab { flex: 1; justify-content: center; padding: 9px 6px; }
+  .tab { flex: 1 0 auto; justify-content: center; padding: 9px 10px; }
   .tab .count { display: none; }
 }
 .ping { width: 7px; height: 7px; border-radius: 50%; background: var(--warn); box-shadow: 0 0 0 3px rgba(240, 180, 60, .18); }
@@ -1008,6 +1025,7 @@ dialog p { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
 <header class="top">
   <div class="brand"><b>ON D<span>'</span> ROAD</b><span class="sub">Command Center</span></div>
   <nav class="top-right">
+    <a class="top-link" href="/door" target="_blank" rel="noopener">Door scanner</a>
     <a class="top-link" href="/admin/payments">Payment settings</a>
     <a class="top-link" href="${FRONTEND_URL}" target="_blank" rel="noopener">View site &#8599;</a>
     <span id="clock" class="clock"></span>
@@ -1054,6 +1072,7 @@ dialog p { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
     <button class="tab" id="tab-i" role="tab" aria-selected="false" type="button">Invites <span class="count" id="c-i"></span></button>
     <button class="tab" id="tab-p" role="tab" aria-selected="false" type="button">Packages <span class="count" id="c-p"></span></button>
     <button class="tab" id="tab-o" role="tab" aria-selected="false" type="button">Orders <span class="count" id="c-o"></span><span class="ping hidden" id="o-ping"></span></button>
+    <button class="tab" id="tab-d" role="tab" aria-selected="false" type="button">Door <span class="count" id="c-d"></span></button>
   </div>
 
   <section class="panel" id="guests-panel" role="tabpanel">
@@ -1094,9 +1113,17 @@ dialog p { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
   <section class="panel hidden" id="orders-panel" role="tabpanel">
     <div class="toolbar">
       <input id="order-search" class="grow" placeholder="Search email or reference" type="search">
-      <select id="order-filter" aria-label="Order status filter"><option value="">All orders</option><option value="REFUND">Refund requests</option><option value="RESERVED">Awaiting payment</option><option value="PAID">Paid</option><option value="CANCELLED">Cancelled</option></select>
+      <select id="order-filter" aria-label="Order status filter"><option value="">All orders</option><option value="REFUND">Refund requests</option><option value="RESERVED">Awaiting payment</option><option value="PAID">Paid</option><option value="CHECKED">Checked in</option><option value="CANCELLED">Cancelled</option></select>
     </div>
     <div class="scroll"><table class="cards"><thead><tr><th>Guest</th><th>Package</th><th class="num">Amount</th><th>Status</th><th>Reference</th><th>Reserved</th><th></th></tr></thead><tbody id="orderlist"></tbody></table></div>
+  </section>
+  <section class="panel hidden" id="door-panel" role="tabpanel">
+    <div class="toolbar">
+      <input id="door-search" class="grow" placeholder="Search email or reference" type="search">
+      <select id="door-filter" aria-label="Door event filter"><option value="">All door activity</option><option value="ENTRY">Entries</option><option value="OVERRIDE">Overrides</option><option value="DUPLICATE">Blocked repeat scans</option><option value="UNDO">Undone</option></select>
+      <a class="btn ghost" href="/door" target="_blank" rel="noopener">Open scanner</a>
+    </div>
+    <div class="scroll"><table class="cards"><thead><tr><th>Guest</th><th>Event</th><th>Package</th><th>Time</th><th>Phone</th><th>Reference</th></tr></thead><tbody id="doorlist"></tbody></table></div>
   </section>
 </main>
 
@@ -1117,7 +1144,7 @@ dialog p { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
 <script>
 const $ = (id) => document.getElementById(id);
 const NL = String.fromCharCode(10);
-let guests = [], invites = [], products = [], orders = [];
+let guests = [], invites = [], products = [], orders = [], checkins = [];
 
 async function api(path, body) {
   const opts = body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : undefined;
@@ -1131,6 +1158,7 @@ function td(tr, text, cls) { const c = el('td', text, cls); tr.appendChild(c); r
 function pill(text, tone) { return el('span', text, 'pill ' + (tone || 'neutral')); }
 function money(cents, cur) { return (cur || 'XCD') + ' ' + (Number(cents) / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
 function shortDate(iso) { return iso ? new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/Antigua' }) : ''; }
+function timeOf(iso) { return iso ? new Date(iso).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'America/Antigua' }) : ''; }
 function longDate(iso) { return iso ? new Date(iso).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'America/Antigua' }) : ''; }
 function plural(n, one, many) { return n + ' ' + (n === 1 ? one : many); }
 function emptyRow(tbody, cols, text) { const tr = el('tr', undefined, 'empty-row'); const c = td(tr, text); c.colSpan = cols; tbody.appendChild(tr); c.setAttribute('data-label', ''); }
@@ -1254,8 +1282,8 @@ function renderStats() {
     { label: 'Paid orders', value: paid.length.toLocaleString('en-US'), sub: plural(orders.length, 'order', 'orders') + ' in total' },
     { label: 'Collected', value: totals(paid), sub: 'From paid orders', money: true },
     { label: 'Awaiting payment', value: reserved.length.toLocaleString('en-US'), sub: reserved.length ? totals(reserved) + ' outstanding' : 'Nothing outstanding' },
-    { label: 'Invites pending', value: pending.toLocaleString('en-US'), sub: accepted + ' accepted' },
-    { label: 'Invites unused', value: unused.toLocaleString('en-US'), sub: "Still in guests' hands" }
+    { label: 'Invites pending', value: pending.toLocaleString('en-US'), sub: accepted + ' accepted · ' + unused + ' unused' },
+    { label: 'Checked in', value: paid.filter((o) => o.checked_in_at).length.toLocaleString('en-US'), sub: 'of ' + paid.length + ' paid at the door' }
   ];
   const box = $('stats'); box.replaceChildren();
   items.forEach((it) => {
@@ -1427,7 +1455,7 @@ function renderProducts() {
 function renderOrders() {
   const f = $('order-filter').value, q = $('order-search').value.trim().toLowerCase();
   const tbody = $('orderlist'); tbody.replaceChildren();
-  const list = orders.filter((o) => (!f || (f === 'REFUND' ? isRefundRequest(o) : o.status === f)) &&
+  const list = orders.filter((o) => (!f || (f === 'REFUND' ? isRefundRequest(o) : f === 'CHECKED' ? !!o.checked_in_at : o.status === f)) &&
     (String(o.guest_email).toLowerCase().includes(q) || String(o.reference_code).toLowerCase().includes(q)));
   if (!list.length) return emptyRow(tbody, 7, orders.length ? 'No orders match.' : 'No orders yet.');
   list.forEach((o) => {
@@ -1439,9 +1467,10 @@ function renderOrders() {
     st.appendChild(orderPill(o));
     if (isRefundRequest(o)) {
       st.appendChild(el('span', 'Requested ' + shortDate(o.cancel_requested_at) + (o.cancel_reason ? ': ' + o.cancel_reason : ''), 'subtext'));
-    } else if (o.status === 'PAID' && o.paid_at) {
+    } else if (o.status === 'PAID' && o.paid_at && !o.checked_in_at) {
       st.appendChild(el('span', 'Paid ' + shortDate(o.paid_at), 'subtext'));
     }
+    if (o.checked_in_at) st.appendChild(el('span', 'Checked in ' + timeOf(o.checked_in_at) + (o.checked_in_by ? ' · ' + o.checked_in_by : ''), 'subtext'));
     td(tr, o.reference_code, 'mono');
     const when = td(tr, shortDate(o.created_at), 'mono'); when.title = longDate(o.created_at);
     const act = td(tr, '', 'actions');
@@ -1461,7 +1490,8 @@ function renderOrders() {
     } else if (o.status === 'PAID') {
       const req = isRefundRequest(o);
       act.appendChild(actionBtn(req ? 'Approve refund' : 'Cancel + refund', req ? '' : 'danger', async () => {
-        const v = await ask({ title: req ? 'Approve this refund?' : 'Cancel and refund?', text: 'Cancels the order and records a refund of ' + money(o.price_cents, o.currency) + ' to ' + o.guest_email + '. Their entry pass stops working right away.', ok: req ? 'Approve refund' : 'Cancel and refund', danger: true });
+        const inAlready = o.checked_in_at ? 'Heads up: they already checked in at the door (' + timeOf(o.checked_in_at) + '). ' : '';
+        const v = await ask({ title: req ? 'Approve this refund?' : 'Cancel and refund?', text: inAlready + 'Cancels the order and records a refund of ' + money(o.price_cents, o.currency) + ' to ' + o.guest_email + '. Their entry pass stops working right away.', ok: req ? 'Approve refund' : 'Cancel and refund', danger: true });
         if (!v) return false;
         await api('/api/admin/orders/' + o.id + '/approve-refund', {});
         return 'Refund recorded. The guest has been emailed.';
@@ -1472,11 +1502,33 @@ function renderOrders() {
   labelCells(tbody);
 }
 
+const DOOR_EVENTS = { ENTRY: ['Entry', 'good'], OVERRIDE: ['Override', 'warn'], DUPLICATE: ['Blocked repeat', 'bad'], UNDO: ['Undone', 'neutral'] };
+function renderDoor() {
+  const q = $('door-search').value.trim().toLowerCase(), f = $('door-filter').value;
+  const tbody = $('doorlist'); tbody.replaceChildren();
+  const list = checkins.filter((c) => (!f || c.kind === f) && (String(c.email).toLowerCase().includes(q) || String(c.ref).toLowerCase().includes(q)));
+  if (!list.length) return emptyRow(tbody, 6, checkins.length ? 'No door activity matches.' : 'No check-ins yet. They show up here as staff scan passes at the door.');
+  list.forEach((c) => {
+    const tr = el('tr');
+    td(tr, c.email, 'strong');
+    const ev = DOOR_EVENTS[c.kind] || [c.kind, 'neutral'];
+    td(tr, '').appendChild(pill(ev[0], ev[1]));
+    td(tr, c.package);
+    const when = td(tr, timeOf(c.scanned_at), 'mono');
+    if (c.synced_at && new Date(c.synced_at) - new Date(c.scanned_at) > 120000) when.title = 'Scanned offline, synced ' + timeOf(c.synced_at);
+    td(tr, c.device || '');
+    td(tr, c.ref, 'mono');
+    tbody.appendChild(tr);
+  });
+  labelCells(tbody);
+}
+
 function renderCounts() {
   $('c-g').textContent = guests.length;
   $('c-i').textContent = invites.length;
   $('c-p').textContent = products.length;
   $('c-o').textContent = orders.length;
+  $('c-d').textContent = checkins.filter((c) => c.kind === 'ENTRY').length;
   $('o-ping').classList.toggle('hidden', !orders.some(isRefundRequest));
 }
 
@@ -1485,20 +1537,20 @@ function labelCells(tbody) {
   const heads = Array.from(tbody.closest('table').querySelectorAll('thead th')).map((th) => th.textContent.trim());
   Array.from(tbody.rows).forEach((tr) => Array.from(tr.cells).forEach((c, i) => c.setAttribute('data-label', tr.classList.contains('empty-row') ? '' : (heads[i] || ''))));
 }
-function renderAll() { renderStats(); renderSales(); renderGuests(); renderInvites(); renderProducts(); renderOrders(); renderCounts(); }
+function renderAll() { renderStats(); renderSales(); renderGuests(); renderInvites(); renderProducts(); renderOrders(); renderDoor(); renderCounts(); }
 
 async function refresh() {
   try {
-    const r = await Promise.all([api('/api/admin/guests'), api('/api/admin/invites'), api('/api/admin/packages'), api('/api/admin/orders')]);
-    guests = r[0]; invites = r[1]; products = r[2]; orders = r[3];
+    const r = await Promise.all([api('/api/admin/guests'), api('/api/admin/invites'), api('/api/admin/packages'), api('/api/admin/orders'), api('/api/admin/checkins')]);
+    guests = r[0]; invites = r[1]; products = r[2]; orders = r[3]; checkins = Array.isArray(r[4]) ? r[4] : [];
   } catch (e) { toast(e.message, true); return; }
   renderAll();
   $('updated').textContent = 'Updated ' + new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'America/Antigua' }) + ' Antigua time';
 }
 
 // ---------- Tabs ----------
-const panels = ['guests-panel', 'invites-panel', 'products-panel', 'orders-panel'];
-const tabs = ['tab-g', 'tab-i', 'tab-p', 'tab-o'];
+const panels = ['guests-panel', 'invites-panel', 'products-panel', 'orders-panel', 'door-panel'];
+const tabs = ['tab-g', 'tab-i', 'tab-p', 'tab-o', 'tab-d'];
 function showTab(which) {
   panels.forEach((p, i) => $(p).classList.toggle('hidden', tabs[i] !== which));
   tabs.forEach((t) => { $(t).classList.toggle('on', t === which); $(t).setAttribute('aria-selected', t === which ? 'true' : 'false'); });
@@ -1513,6 +1565,8 @@ $('inv-search').addEventListener('input', renderInvites);
 $('inv-filter').addEventListener('change', renderInvites);
 $('order-search').addEventListener('input', renderOrders);
 $('order-filter').addEventListener('change', renderOrders);
+$('door-search').addEventListener('input', renderDoor);
+$('door-filter').addEventListener('change', renderDoor);
 $('refresh-btn').addEventListener('click', async () => { await refresh(); toast('Up to date.'); });
 
 // ---------- Forms ----------
@@ -1559,9 +1613,9 @@ $('p-form').addEventListener('submit', async (e) => {
 
 $('csv-btn').addEventListener('click', () => {
   const q = (v) => '"' + String(v === null || v === undefined ? '' : v).split('"').join('""') + '"';
-  const rows = [['email', 'attendance', 'invites_left', 'package', 'order_status', 'reference']].concat(guests.map((g) => {
+  const rows = [['email', 'attendance', 'invites_left', 'package', 'order_status', 'reference', 'checked_in_at']].concat(guests.map((g) => {
     const o = latestOrderFor(g.email);
-    return [g.email, g.rsvp_status || 'PENDING', g.invites_left, o ? o.package_name : '', o ? (isRefundRequest(o) ? 'REFUND_REQUESTED' : o.status) : '', o ? o.reference_code : ''];
+    return [g.email, g.rsvp_status || 'PENDING', g.invites_left, o ? o.package_name : '', o ? (isRefundRequest(o) ? 'REFUND_REQUESTED' : o.status) : '', o ? o.reference_code : '', o && o.checked_in_at ? o.checked_in_at : ''];
   }));
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([rows.map((r) => r.map(q).join(',')).join(NL)], { type: 'text/csv' }));
