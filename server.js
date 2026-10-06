@@ -8,6 +8,7 @@ import { renderEmail } from './emails.js';
 import { registerDoor } from './door.js';
 import { registerEvent } from './event.js';
 import { registerSite } from './site.js';
+import { registerPayPal } from './paypal.js';
 
 const { Pool } = pkg;
 
@@ -125,9 +126,13 @@ app.use(express.json({ limit: '10kb' }));
 
 // Payment instructions, pay-by deadline, auto-expiry and reminders (see payments.js).
 // Registered before the other routes on purpose: it replaces /api/my-order below.
-const mail = registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, requireAuth, requireAdmin, escapeHtml });
+const mail = registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, requireAuth, requireAdmin, escapeHtml,
+  beforeExpire: (payDays) => paypal.syncDue(payDays) });
 // Event details in guests' accounts and email updates to groups of guests (see event.js).
 registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, requireAuth, requireAdmin, mail });
+// Paying online with PayPal (see paypal.js). Off until the PAYPAL_* settings are added.
+const paypal = registerPayPal({ app, pool, requireAuth, requireAdmin, rateLimit,
+  onPaid: (o) => sendPaidEmail(o.guest_email, o.package_name, o.reference_code) });
 const ADMIN_EMAIL = normalizeEmail(process.env.ADMIN_EMAIL); // optional: gets a copy of refund requests
 
 // Creates the packages/orders/settings tables and any missing columns on startup,
@@ -195,6 +200,13 @@ async function ensureSchema() {
     ALTER TABLE packages ADD COLUMN IF NOT EXISTS sizes TEXT NOT NULL DEFAULT '';
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS size TEXT;
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS terms_accepted_at TIMESTAMPTZ;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS paid_via TEXT;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS paypal_order_id TEXT;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS paypal_status TEXT;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS paypal_started_at TIMESTAMPTZ;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS paypal_amount TEXT;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS paypal_capture_id TEXT;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS paypal_refund_id TEXT;
   `);
 }
 
@@ -681,6 +693,7 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
     const r = await pool.query(
       `SELECT o.id, o.package_id, o.guest_email, o.status, o.reference_code, o.created_at, o.paid_at,
               o.cancel_requested_at, o.cancel_reason, o.refunded_at, o.checked_in_at, o.checked_in_by, o.size,
+              o.paid_via, o.paypal_status, o.paypal_amount, o.paypal_refund_id,
               p.name AS package_name, p.price_cents, p.currency
        FROM orders o JOIN packages p ON p.id = o.package_id
        ORDER BY (o.status = 'PAID' AND o.cancel_requested_at IS NOT NULL) DESC, o.id DESC`);
@@ -724,7 +737,7 @@ app.post('/api/admin/orders/:id/mark-paid', requireAdmin, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   try {
     const r = await pool.query(
-      `UPDATE orders SET status = 'PAID', paid_at = NOW() WHERE id = $1 AND status = 'RESERVED'
+      `UPDATE orders SET status = 'PAID', paid_at = NOW(), paid_via = 'MANUAL' WHERE id = $1 AND status = 'RESERVED'
        RETURNING guest_email, reference_code, (SELECT name FROM packages WHERE id = orders.package_id) AS package_name`, [id]);
     if (!r.rowCount) return res.status(400).json({ error: 'Order not found or already resolved.' });
     const { guest_email, reference_code, package_name } = r.rows[0];
@@ -758,20 +771,32 @@ app.post('/api/admin/orders/:id/cancel', requireAdmin, async (req, res) => {
 });
 
 // Cancels a paid order and records the refund. The guest's pass stops working immediately.
+// A PayPal payment is refunded through PayPal first; if PayPal refuses, nothing changes here.
 app.post('/api/admin/orders/:id/approve-refund', requireAdmin, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   try {
+    const cur = await pool.query(
+      "SELECT reference_code, paid_via, paypal_capture_id, paypal_amount FROM orders WHERE id = $1 AND status = 'PAID'", [id]);
+    if (!cur.rowCount) return res.status(400).json({ error: 'Order not found or not paid.' });
+    const pp = cur.rows[0].paid_via === 'PAYPAL' && cur.rows[0].paypal_capture_id ? cur.rows[0] : null;
+    let refundId = null;
+    if (pp) {
+      const rf = await paypal.refund(pp);
+      if (!rf.ok) return res.status(502).json({ error: `PayPal didn't accept the refund (${rf.error}), so nothing was changed. Try again, or refund it in PayPal and then approve it here.` });
+      refundId = rf.id;
+    }
     const r = await pool.query(
-      `UPDATE orders o SET status = 'CANCELLED', refunded_at = NOW() FROM packages p
+      `UPDATE orders o SET status = 'CANCELLED', refunded_at = NOW(), paypal_refund_id = COALESCE($2, o.paypal_refund_id) FROM packages p
        WHERE o.id = $1 AND p.id = o.package_id AND o.status = 'PAID'
-       RETURNING o.guest_email, o.reference_code, p.name AS package_name, p.price_cents, p.currency`, [id]);
+       RETURNING o.guest_email, o.reference_code, p.name AS package_name, p.price_cents, p.currency`, [id, refundId]);
     if (!r.rowCount) return res.status(400).json({ error: 'Order not found or not paid.' });
     const o = r.rows[0];
     const emailError = await mail.send(o.guest_email, "Refund approved — On D' Road", renderEmail({
       tone: 'good', tag: 'Refund approved', title: 'Refund approved',
       lines: [`Your order for ${o.package_name} is cancelled and your refund is approved.`,
-        'Refunds are paid in cash where you paid. Bring your reference code. Your entry pass no longer works.'],
-      details: [['Package', o.package_name], ['Refund', money(o.price_cents, o.currency)], ['Reference', o.reference_code, true]]
+        pp ? 'The money is going back to the PayPal account or card you paid with. It can take a few days to show. Your entry pass no longer works.'
+          : 'Refunds are paid in cash where you paid. Bring your reference code. Your entry pass no longer works.'],
+      details: [['Package', o.package_name], ['Refund', pp ? `USD ${pp.paypal_amount}` : money(o.price_cents, o.currency)], ['Reference', o.reference_code, true]]
     }));
     res.json({ success: true, emailed: !emailError });
   } catch (err) {
@@ -1552,10 +1577,13 @@ function renderOrders() {
     td(tr, money(o.price_cents, o.currency), 'num');
     const st = td(tr, '');
     st.appendChild(orderPill(o));
+    const ppNote = { CREATED: 'PayPal checkout started', PENDING: 'PayPal is still processing the payment', AMOUNT_MISMATCH: "PayPal amount didn't match. Check PayPal." }[o.paypal_status];
+    if (o.status === 'RESERVED' && ppNote) st.appendChild(el('span', ppNote, 'subtext'));
+    if (o.status === 'CANCELLED' && o.refunded_at && o.paid_via === 'PAYPAL') st.appendChild(el('span', 'Refunded through PayPal', 'subtext'));
     if (isRefundRequest(o)) {
       st.appendChild(el('span', 'Requested ' + shortDate(o.cancel_requested_at) + (o.cancel_reason ? ': ' + o.cancel_reason : ''), 'subtext'));
     } else if (o.status === 'PAID' && o.paid_at && !o.checked_in_at) {
-      st.appendChild(el('span', 'Paid ' + shortDate(o.paid_at), 'subtext'));
+      st.appendChild(el('span', 'Paid ' + (o.paid_via === 'PAYPAL' ? 'with PayPal (USD ' + o.paypal_amount + ') ' : '') + shortDate(o.paid_at), 'subtext'));
     }
     if (o.checked_in_at) st.appendChild(el('span', 'Checked in ' + timeOf(o.checked_in_at) + (o.checked_in_by ? ' · ' + o.checked_in_by : ''), 'subtext'));
     td(tr, o.reference_code, 'mono');
@@ -1578,7 +1606,10 @@ function renderOrders() {
       const req = isRefundRequest(o);
       act.appendChild(actionBtn(req ? 'Approve refund' : 'Cancel + refund', req ? '' : 'danger', async () => {
         const inAlready = o.checked_in_at ? 'Heads up: they already checked in at the door (' + timeOf(o.checked_in_at) + '). ' : '';
-        const v = await ask({ title: req ? 'Approve this refund?' : 'Cancel and refund?', text: inAlready + 'Cancels the order and records a refund of ' + money(o.price_cents, o.currency) + ' to ' + o.guest_email + '. Their entry pass stops working right away.', ok: req ? 'Approve refund' : 'Cancel and refund', danger: true });
+        const how = o.paid_via === 'PAYPAL'
+          ? 'Cancels the order and sends USD ' + o.paypal_amount + ' back to ' + o.guest_email + ' through PayPal right away. '
+          : 'Cancels the order and records a refund of ' + money(o.price_cents, o.currency) + ' to ' + o.guest_email + '. ';
+        const v = await ask({ title: req ? 'Approve this refund?' : 'Cancel and refund?', text: inAlready + how + 'Their entry pass stops working right away.', ok: req ? 'Approve refund' : 'Cancel and refund', danger: true });
         if (!v) return false;
         await api('/api/admin/orders/' + o.id + '/approve-refund', {});
         return 'Refund recorded. The guest has been emailed.';
