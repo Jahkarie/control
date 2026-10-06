@@ -103,19 +103,56 @@ const ALLOWED_ORIGINS = [FRONTEND_URL, 'https://ondroad.xyz', 'https://www.ondro
 app.use(cors({ origin: ALLOWED_ORIGINS }));
 app.use(express.json({ limit: '10kb' }));
 
-// --- VIP LOGIN ---
-app.post('/api/login', rateLimit(10, 15 * 60 * 1000), async (req, res) => {
+// --- VIP LOGIN: step 1, request a one-time link ---
+// Always returns the same generic response whether or not the email is on the roster,
+// so this endpoint can't be used to check who is or isn't invited.
+app.post('/api/login', rateLimit(6, 15 * 60 * 1000), async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   if (!isValidEmail(email)) return res.status(400).json({ error: 'A valid email is required' });
+  const generic = { success: true, message: "If that email is on the roster, we've sent a login link." };
   try {
-    const result = await pool.query('SELECT * FROM guests WHERE LOWER(email) = $1', [email]);
-    if (!result.rows.length) {
-      return res.status(403).json({ error: 'ACCESS DENIED: Email not found on VIP roster.' });
-    }
-    const user = result.rows[0];
-    res.json({ success: true, user, token: createToken(email) });
+    const result = await pool.query('SELECT 1 FROM guests WHERE LOWER(email) = $1', [email]);
+    if (!result.rowCount) return res.json(generic); // don't reveal roster membership
+
+    const code = newInviteToken();
+    await pool.query(
+      `INSERT INTO login_links (code_hash, email, expires_at) VALUES ($1, $2, NOW() + INTERVAL '15 minutes')`,
+      [hashToken(code), email]);
+    const link = `${FRONTEND_URL}/?login=${code}`;
+    const error = await sendLoginEmail(email, link);
+    if (error) console.error('Login email failed:', error);
+    res.json(generic);
   } catch (err) {
     serverError(res, err);
+  }
+});
+
+// --- VIP LOGIN: step 2, exchange the one-time code for a session ---
+app.post('/api/login/verify', rateLimit(15, 15 * 60 * 1000), async (req, res) => {
+  const code = req.body?.code;
+  if (!code) return res.status(400).json({ error: 'Missing login code.' });
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query('BEGIN');
+    const r = await client.query(
+      `SELECT id, email FROM login_links WHERE code_hash = $1 AND used_at IS NULL AND expires_at > NOW() FOR UPDATE`,
+      [hashToken(code)]);
+    if (!r.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'This login link is invalid or has expired. Request a new one.' });
+    }
+    const email = r.rows[0].email;
+    await client.query('UPDATE login_links SET used_at = NOW() WHERE id = $1', [r.rows[0].id]);
+    const userRes = await client.query('SELECT * FROM guests WHERE LOWER(email) = $1', [email]);
+    await client.query('COMMIT');
+    if (!userRes.rowCount) return res.status(403).json({ error: 'That account is no longer on the roster.' });
+    res.json({ success: true, user: userRes.rows[0], token: createToken(email) });
+  } catch (err) {
+    await client?.query('ROLLBACK').catch(() => {});
+    serverError(res, err);
+  } finally {
+    client?.release();
   }
 });
 
@@ -203,6 +240,40 @@ async function sendInviteEmail(to, from, note, link) {
     return null;
   } catch (err) {
     console.error('Resend send threw:', err);
+    return err;
+  }
+}
+
+// Sends a one-time login link. Returns an error object (or null). Never throws.
+async function sendLoginEmail(to, link) {
+  try {
+    const { error } = await resend.emails.send({
+      from: EMAIL_FROM,
+      to,
+      subject: "Your login link — On D' Road",
+      html: `
+      <div style="background-color: #f4f1ea; padding: 32px 16px; font-family: Arial, Helvetica, sans-serif;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width: 540px; margin: 0 auto;">
+          <tr><td style="background-color: #7fd63c; border: 3px solid #0d0d0d; padding: 28px 24px 24px;">
+            <p style="display: inline-block; font-size: 11px; font-weight: 800; letter-spacing: 2px; color: #0d0d0d; border: 2px solid #0d0d0d; border-radius: 999px; padding: 5px 12px; margin: 0 0 16px;">LOGIN LINK</p>
+            <h1 style="font-family: Arial Black, Arial, sans-serif; font-size: 30px; line-height: 1; text-transform: uppercase; color: #0d0d0d; margin: 0;">On D' Road</h1>
+          </td></tr>
+          <tr><td style="background-color: #0d0d0d; border: 3px solid #0d0d0d; border-top: none; padding: 26px 24px;">
+            <p style="color: #f4f1ea; font-size: 15px; font-weight: 600; line-height: 1.5; margin: 0 0 6px;">Tap below to log in. This link works once and expires in 15 minutes.</p>
+            <p style="color: #b8b3a6; font-size: 12px; font-weight: 600; line-height: 1.5; margin: 0;">Didn't request this? You can ignore this email — no one can access your account without it.</p>
+            <table role="presentation" cellpadding="0" cellspacing="0" style="margin: 26px auto 6px;">
+              <tr><td style="background-color: #ff6a1f; border: 3px solid #f4f1ea; border-radius: 999px;">
+                <a href="${link}" style="display: inline-block; padding: 15px 32px; font-family: Arial Black, Arial, sans-serif; font-size: 13px; letter-spacing: 1.5px; text-transform: uppercase; color: #0d0d0d; text-decoration: none;">Log In</a>
+              </td></tr>
+            </table>
+          </td></tr>
+        </table>
+      </div>`
+    });
+    if (error) { console.error('Resend login email failed:', error); return error; }
+    return null;
+  } catch (err) {
+    console.error('Resend login email threw:', err);
     return err;
   }
 }
@@ -472,12 +543,50 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   }
 });
 
+async function sendPaidEmail(to, packageName, ref) {
+  try {
+    const { error } = await resend.emails.send({
+      from: EMAIL_FROM,
+      to,
+      subject: "You're confirmed — On D' Road",
+      html: `
+      <div style="background-color: #f4f1ea; padding: 32px 16px; font-family: Arial, Helvetica, sans-serif;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width: 540px; margin: 0 auto;">
+          <tr><td style="background-color: #7fd63c; border: 3px solid #0d0d0d; padding: 28px 24px 24px;">
+            <p style="display: inline-block; font-size: 11px; font-weight: 800; letter-spacing: 2px; color: #0d0d0d; border: 2px solid #0d0d0d; border-radius: 999px; padding: 5px 12px; margin: 0 0 16px;">PAYMENT CONFIRMED</p>
+            <h1 style="font-family: Arial Black, Arial, sans-serif; font-size: 30px; line-height: 1; text-transform: uppercase; color: #0d0d0d; margin: 0;">You're In</h1>
+          </td></tr>
+          <tr><td style="background-color: #0d0d0d; border: 3px solid #0d0d0d; border-top: none; padding: 26px 24px;">
+            <p style="color: #f4f1ea; font-size: 15px; font-weight: 700; line-height: 1.5; margin: 0 0 6px;">Your package is confirmed: ${escapeHtml(packageName)}.</p>
+            <p style="color: #b8b3a6; font-size: 12px; font-weight: 600; line-height: 1.5; margin: 0 0 16px;">Reference: ${escapeHtml(ref)}</p>
+            <p style="color: #b8b3a6; font-size: 12px; font-weight: 600; line-height: 1.5; margin: 0;">Your digital entry pass is in your account. Final event details, location, and package pickup info will follow closer to the date.</p>
+            <table role="presentation" cellpadding="0" cellspacing="0" style="margin: 26px auto 6px;">
+              <tr><td style="background-color: #ff6a1f; border: 3px solid #f4f1ea; border-radius: 999px;">
+                <a href="${FRONTEND_URL}" style="display: inline-block; padding: 15px 32px; font-family: Arial Black, Arial, sans-serif; font-size: 13px; letter-spacing: 1.5px; text-transform: uppercase; color: #0d0d0d; text-decoration: none;">View Your Pass</a>
+              </td></tr>
+            </table>
+          </td></tr>
+        </table>
+      </div>`
+    });
+    if (error) { console.error('Resend paid-confirmation email failed:', error); return error; }
+    return null;
+  } catch (err) {
+    console.error('Resend paid-confirmation email threw:', err);
+    return err;
+  }
+}
+
 app.post('/api/admin/orders/:id/mark-paid', requireAdmin, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   try {
-    const r = await pool.query("UPDATE orders SET status = 'PAID', paid_at = NOW() WHERE id = $1 AND status = 'RESERVED'", [id]);
+    const r = await pool.query(
+      `UPDATE orders SET status = 'PAID', paid_at = NOW() WHERE id = $1 AND status = 'RESERVED'
+       RETURNING guest_email, reference_code, (SELECT name FROM packages WHERE id = orders.package_id) AS package_name`, [id]);
     if (!r.rowCount) return res.status(400).json({ error: 'Order not found or already resolved.' });
-    res.json({ success: true });
+    const { guest_email, reference_code, package_name } = r.rows[0];
+    const emailError = await sendPaidEmail(guest_email, package_name, reference_code);
+    res.json({ success: true, emailed: !emailError });
   } catch (err) {
     serverError(res, err);
   }
