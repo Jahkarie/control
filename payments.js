@@ -93,7 +93,8 @@ ${bodyHtml}
     try {
       const { instructions, payDays } = await getSettings();
       const r = await pool.query(
-        `SELECT o.id, o.status, o.reference_code, o.created_at, p.name AS package_name, p.price_cents, p.currency, p.includes
+        `SELECT o.id, o.status, o.reference_code, o.created_at, o.cancel_requested_at,
+                p.name AS package_name, p.price_cents, p.currency, p.includes
          FROM orders o JOIN packages p ON p.id = o.package_id
          WHERE o.guest_email = $1 AND o.status <> 'CANCELLED' ORDER BY o.id DESC LIMIT 1`, [req.userEmail]);
       const o = r.rows[0];
@@ -180,4 +181,7 @@ $('save').addEventListener('click', function () {
 </script></body></html>`;
 
   app.get('/admin/payments', requireAdmin, (req, res) => res.type('html').send(PAGE));
+
+  // Shared with server.js so every order email uses the same look.
+  return { getSettings, payBy, fmt, send, shell, p1, p2, instrBlock };
 }
