@@ -660,37 +660,78 @@ app.post('/api/orders', requireAuth, rateLimit(10, 60 * 60 * 1000, perUser), rat
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'You already have a package reserved. Cancel it first to choose another.' });
     }
-    const pkg = await client.query('SELECT name, price_cents, currency, capacity, active, sizes FROM packages WHERE id = $1 FOR UPDATE', [packageId]);
-    if (!pkg.rowCount || !pkg.rows[0].active) {
+    const pkg = await client.query(
+      'SELECT id, name, price_cents, currency, capacity, active, sizes, pay_note FROM packages WHERE id = $1 FOR UPDATE', [packageId]);
+    const p = pkg.rows[0];
+    if (!p || !p.active) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'That package is no longer available.' });
     }
-    const sizes = sizeList(pkg.rows[0].sizes);
+    const sizes = sizeList(p.sizes);
     const size = pickSize(sizes, req.body?.size);
     if (sizes.length && !size) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Choose your size.', code: 'SIZE_REQUIRED' });
     }
-    if (pkg.rows[0].capacity !== null) {
+    if (p.capacity !== null) {
       const claimed = await client.query("SELECT COUNT(*) FROM orders WHERE package_id = $1 AND status <> 'CANCELLED'", [packageId]);
-      if (parseInt(claimed.rows[0].count, 10) >= pkg.rows[0].capacity) {
+      if (parseInt(claimed.rows[0].count, 10) >= p.capacity) {
         await client.query('ROLLBACK');
-        return res.status(400).json({ error: 'That package just sold out.' });
+        return res.status(400).json({ error: 'That package just sold out.', code: 'SOLD_OUT' });
       }
     }
+    // The price on sale now (see pricing.js). The package row is locked, so two guests can't both take a tier's last spot.
+    const price = priceOf(p, (await loadTiers(client, [packageId])).get(packageId) || []);
+    if (price.closed) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Sales for this package are closed.', code: 'SOLD_OUT' });
+    }
+    // The guest site sends the tier it showed. If the price has moved on since, the guest sees the new one first.
+    const tierId = price.tier ? price.tier.id : null;
+    if (req.body && Object.hasOwn(req.body, 'tier_id') && (req.body.tier_id == null ? null : toInt(req.body.tier_id)) !== tierId) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: `The price just changed to ${money(price.list_cents, p.currency)}. Check it and try again.`,
+        code: 'PRICE_CHANGED', price_cents: price.list_cents, tier_name: price.tier ? price.tier.name : null });
+    }
+    // Locking the code row stops two guests from both taking its last use.
+    const code = cleanCode(req.body?.promo_code);
+    let promo = null;
+    if (code) {
+      const check = await checkPromo(client, code, packageId, { lock: true });
+      if (check.error) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: check.error, code: 'PROMO_INVALID' });
+      }
+      promo = check.promo;
+    }
+    const list = price.list_cents;
+    const discount = promo ? discountFor(promo, list) : 0;
+    const amount = list - discount;
+    const free = amount === 0; // a free pass is confirmed straight away
+    // The order keeps the deadline worked out now, so changing the payment settings later only affects new
+    // reservations. NOW() is the same for the whole transaction, so this is the new row's created_at.
+    const settings = await mail.getSettings();
+    const now = (await client.query('SELECT NOW() AS now')).rows[0].now;
+    const payBy = free ? null : mail.deadlineFor(now, settings);
     const ref = newRef();
-    // The order keeps the days-to-pay in force now, so changing the setting later only affects new reservations.
-    const { payDays } = await mail.getSettings();
-    const created = await client.query(
-      `INSERT INTO orders (guest_email, package_id, reference_code, size, terms_accepted_at, pay_days)
-       VALUES ($1, $2, $3, $4, NOW(), $5) RETURNING created_at`,
-      [req.userEmail, packageId, ref, size, payDays]);
+    await client.query(
+      `INSERT INTO orders (guest_email, package_id, reference_code, size, terms_accepted_at, pay_days, pay_by, tier_id, tier_name,
+                           list_cents, discount_cents, amount_cents, currency, promo_code, status, paid_at, paid_via)
+       VALUES ($1, $2, $3, $4, NOW(), $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+      [req.userEmail, packageId, ref, size, settings.payDays, payBy, tierId, price.tier ? price.tier.name : null,
+        list, discount, amount, p.currency, promo ? promo.code : null,
+        free ? 'PAID' : 'RESERVED', free ? now : null, free ? 'COMP' : null]);
     await client.query('COMMIT');
-    res.json({ success: true, reference_code: ref });
+    res.json({ success: true, reference_code: ref, status: free ? 'PAID' : 'RESERVED', amount_cents: amount, currency: p.currency });
     // Sent after responding so a slow email never holds up the guest.
-    const p = pkg.rows[0];
-    sendOrderReceivedEmail(req.userEmail, p.name, money(p.price_cents, p.currency), ref, created.rows[0].created_at, payDays)
-      .catch((e) => console.error('Order-received email error:', e));
+    if (free) {
+      sendPaidEmail(req.userEmail, p.name, ref, { free: true });
+    } else {
+      sendOrderReceivedEmail(req.userEmail, {
+        package_name: p.name, reference_code: ref, list_cents: list, discount_cents: discount, amount_cents: amount,
+        currency: p.currency, promo_code: promo ? promo.code : null, pay_by: payBy, pay_note: p.pay_note
+      }, settings.instructions).catch((e) => console.error('Order-received email error:', e));
+    }
   } catch (err) {
     await client?.query('ROLLBACK').catch(() => {});
     serverError(res, err);
@@ -699,13 +740,17 @@ app.post('/api/orders', requireAuth, rateLimit(10, 60 * 60 * 1000, perUser), rat
   }
 });
 
-// Lets a guest change the size on their current order (from the sizes the package offers).
+// Lets a guest change the size on their current order (from the sizes the package offers), unless the organizers
+// have locked sizes (see pickup.js). The admin can still change it from the Orders tab.
 app.post('/api/orders/size', requireAuth, async (req, res) => {
   try {
     const r = await pool.query(
-      `SELECT o.id, p.sizes FROM orders o JOIN packages p ON p.id = o.package_id
+      `SELECT o.id, o.status, p.sizes FROM orders o JOIN packages p ON p.id = o.package_id
        WHERE o.guest_email = $1 AND o.status <> 'CANCELLED' ORDER BY o.id DESC LIMIT 1`, [req.userEmail]);
     if (!r.rowCount) return res.status(400).json({ error: 'You have no order to change.' });
+    if (isSizeLocked(await getSizeLock(pool), r.rows[0].status)) {
+      return res.status(409).json({ error: 'Sizes are locked now. Contact us if yours needs to change.', code: 'SIZE_LOCKED' });
+    }
     const size = pickSize(sizeList(r.rows[0].sizes), req.body?.size);
     if (!size) return res.status(400).json({ error: 'Choose one of the sizes listed.' });
     await pool.query('UPDATE orders SET size = $1 WHERE id = $2', [size, r.rows[0].id]);
@@ -742,22 +787,28 @@ app.post('/api/orders/request-refund', requireAuth, rateLimit(5, 60 * 60 * 1000,
     const r = await pool.query(
       `UPDATE orders SET cancel_requested_at = NOW(), cancel_reason = $2
        WHERE guest_email = $1 AND status = 'PAID' AND cancel_requested_at IS NULL
-       RETURNING reference_code, (SELECT name FROM packages WHERE id = orders.package_id) AS package_name`, [req.userEmail, reason]);
+       RETURNING reference_code, amount_cents = 0 AS free,
+                 (SELECT name FROM packages WHERE id = orders.package_id) AS package_name`, [req.userEmail, reason]);
     if (!r.rowCount) return res.status(400).json({ error: 'No paid order to cancel, or a request is already open.' });
     res.json({ success: true });
     const o = r.rows[0];
-    mail.send(req.userEmail, "Refund request received — On D' Road", renderEmail({
+    // A free pass has nothing to refund: the guest is only asking to give the spot up.
+    mail.send(req.userEmail, o.free ? "Cancellation request received — On D' Road" : "Refund request received — On D' Road", renderEmail({
       tone: 'warn', tag: 'Request received', title: 'We got your request',
-      lines: [`You asked to cancel ${o.package_name} and get your money back.`,
-        "We'll email you when your refund is approved, with how to collect it. Your pass keeps working until then."],
+      lines: o.free
+        ? [`You asked to cancel your free pass for ${o.package_name}.`,
+          "We'll email you once it's cancelled. Your pass keeps working until then."]
+        : [`You asked to cancel ${o.package_name} and get your money back.`,
+          "We'll email you when your refund is approved, with how to collect it. Your pass keeps working until then."],
       details: [['Package', o.package_name], ['Reference', o.reference_code, true]],
       cta: { text: 'Open my account', url: FRONTEND_URL },
       fine: 'Changed your mind? You can withdraw the request from your account.'
     }));
     if (ADMIN_EMAIL) {
-      mail.send(ADMIN_EMAIL, `Refund requested: ${o.reference_code}`, renderEmail({
-        tone: 'warn', tag: 'Refund request', title: 'Action needed',
-        lines: [`${req.userEmail} wants to cancel ${o.package_name} and get a refund.`,
+      mail.send(ADMIN_EMAIL, `${o.free ? 'Cancellation' : 'Refund'} requested: ${o.reference_code}`, renderEmail({
+        tone: 'warn', tag: o.free ? 'Cancellation request' : 'Refund request', title: 'Action needed',
+        lines: [o.free ? `${req.userEmail} wants to cancel their free pass for ${o.package_name}.`
+          : `${req.userEmail} wants to cancel ${o.package_name} and get a refund.`,
           'Approve it in the Orders tab of the Command Center.'],
         details: [['Guest', req.userEmail], ['Package', o.package_name], ['Reference', o.reference_code, true], ['Reason', reason || 'None given']],
         cta: { text: 'Open Command Center', url: `${req.protocol}://${req.get('host')}/admin` }
@@ -785,9 +836,12 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
     const r = await pool.query(
       `SELECT o.id, o.package_id, o.guest_email, o.status, o.reference_code, o.created_at, o.paid_at,
               o.cancel_requested_at, o.cancel_reason, o.refunded_at, o.checked_in_at, o.checked_in_by, o.size,
-              o.paid_via, o.paypal_status, o.paypal_amount, o.paypal_refund_id,
+              o.paid_via, o.paypal_status, o.paypal_amount, o.paypal_refund_id, o.tier_name, o.promo_code,
+              o.discount_cents, o.picked_up_at, o.picked_up_by,
+              COALESCE(o.amount_cents, p.price_cents) AS amount_cents, COALESCE(o.list_cents, p.price_cents) AS list_cents,
+              COALESCE(o.amount_cents, p.price_cents) AS price_cents, COALESCE(o.currency, p.currency) AS currency,
               NOT EXISTS (SELECT 1 FROM guests g WHERE LOWER(g.email) = LOWER(o.guest_email)) AS removed_guest,
-              p.name AS package_name, p.price_cents, p.currency
+              p.name AS package_name, p.sizes AS package_sizes
        FROM orders o JOIN packages p ON p.id = o.package_id
        ORDER BY (o.status = 'PAID' AND o.cancel_requested_at IS NOT NULL) DESC, o.id DESC`);
     res.json(r.rows);
@@ -796,18 +850,21 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   }
 });
 
-const money = (cents, cur) => (cur || 'XCD') + ' ' + (cents / 100).toFixed(2);
-
-async function sendOrderReceivedEmail(to, packageName, price, ref, createdAt, payDays) {
-  const { instructions } = await mail.getSettings();
-  const due = payDays > 0 ? mail.fmt(mail.payBy(createdAt, payDays)) : null;
+// "Your spot is held" email for a new reservation. o: package_name, reference_code, list_cents, discount_cents,
+// amount_cents, currency, promo_code, pay_by (the stored deadline, or null) and pay_note (the package's own cash details).
+async function sendOrderReceivedEmail(to, o, instructions) {
+  const due = o.pay_by ? mail.fmt(new Date(o.pay_by)) : null;
+  const howToPay = [instructions, o.pay_note].map((t) => (t || '').trim()).filter(Boolean).join('\n\n');
+  const discounted = o.discount_cents > 0
+    ? [['Price', money(o.list_cents, o.currency)], [`Code ${o.promo_code}`, `${money(o.discount_cents, o.currency)} off`]] : [];
   return mail.send(to, "Order received — On D' Road", renderEmail({
     tone: 'warn', tag: 'Order received', title: 'Your spot is held',
     preheader: due ? `Pay by ${due} to confirm your spot.` : 'Your spot is held until you pay.',
-    lines: [`You reserved ${packageName}. Your spot is confirmed once you pay.`,
+    lines: [`You reserved ${o.package_name}. Your spot is confirmed once you pay.`,
       'Your entry pass shows up in your account as soon as your payment is received.'],
-    details: [['Package', packageName], ['Amount', price], ['Reference', ref, true], ['Pay by', due]],
-    callout: instructions ? { label: 'How to pay', text: instructions } : null,
+    details: [['Package', o.package_name], ...discounted, [discounted.length ? 'You pay' : 'Amount', money(o.amount_cents, o.currency)],
+      ['Reference', o.reference_code, true], ['Pay by', due]],
+    callout: howToPay ? { label: 'How to pay', text: howToPay } : null,
     cta: { text: 'View my order', url: FRONTEND_URL },
     fine: due
       ? 'Bring your reference code when you pay. Unpaid reservations are cancelled automatically after the deadline.'
@@ -836,7 +893,8 @@ app.get('/api/pass/:ref.png', rateLimit(300, 15 * 60 * 1000), async (req, res) =
   }
 });
 
-async function sendPaidEmail(to, packageName, ref) {
+// "You're confirmed" email with the entry pass. free: a free pass (promo code or free package), so nothing was paid.
+async function sendPaidEmail(to, packageName, ref, { free } = {}) {
   let attachments;
   try {
     attachments = [{ filename: `ondroad-pass-${ref}.png`, content: await passPng(ref, to) }];
@@ -844,9 +902,9 @@ async function sendPaidEmail(to, packageName, ref) {
     console.error('Pass QR failed:', ref, err.message); // still send the confirmation without it
   }
   return mail.send(to, "You're confirmed — On D' Road", renderEmail({
-    tone: 'good', tag: 'Payment confirmed', title: "You're in",
-    preheader: 'Payment received. Your entry pass is ready.',
-    lines: ['Payment received. Your spot is confirmed.',
+    tone: 'good', tag: free ? 'Free pass' : 'Payment confirmed', title: "You're in",
+    preheader: free ? 'Your free pass is confirmed. Your entry pass is ready.' : 'Payment received. Your entry pass is ready.',
+    lines: [free ? 'Your free pass is confirmed.' : 'Payment received. Your spot is confirmed.',
       'Your entry pass is below and attached to this email. Save it to your phone so you can show it at the entrance even without signal. Final event details, location and package pickup info will follow closer to the date.'],
     image: PUBLIC_URL ? { src: `${PUBLIC_URL}/api/pass/${ref}.png?s=${passSig(ref)}`, alt: `Entry pass ${ref}`, caption: 'Show this at the entrance. One scan, one person.' } : null,
     details: [['Package', packageName], ['Reference', ref, true]],
@@ -909,15 +967,23 @@ app.post('/api/admin/orders/:id/approve-refund', requireAdmin, async (req, res) 
     const r = await pool.query(
       `UPDATE orders o SET status = 'CANCELLED', refunded_at = NOW(), paypal_refund_id = COALESCE($2, o.paypal_refund_id) FROM packages p
        WHERE o.id = $1 AND p.id = o.package_id AND o.status = 'PAID'
-       RETURNING o.guest_email, o.reference_code, p.name AS package_name, p.price_cents, p.currency`, [id, refundId]);
+       RETURNING o.guest_email, o.reference_code, p.name AS package_name,
+                 COALESCE(o.amount_cents, p.price_cents) AS amount_cents, COALESCE(o.currency, p.currency) AS currency`, [id, refundId]);
     if (!r.rowCount) return res.status(400).json({ error: 'Order not found or not paid.' });
     const o = r.rows[0];
-    const emailError = await mail.send(o.guest_email, "Refund approved — On D' Road", renderEmail({
+    // A free pass has nothing to refund, so the guest just hears it's cancelled.
+    const emailError = o.amount_cents === 0 && !pp ? await mail.send(o.guest_email, "Free pass cancelled — On D' Road", renderEmail({
+      tone: 'bad', tag: 'Pass cancelled', title: 'Cancelled',
+      lines: [`Your free pass for ${o.package_name} is cancelled.`,
+        'Nothing was paid, so nothing is owed. Your entry pass no longer works.'],
+      details: [['Package', o.package_name], ['Reference', o.reference_code, true]],
+      cta: { text: 'Open my account', url: FRONTEND_URL }
+    })) : await mail.send(o.guest_email, "Refund approved — On D' Road", renderEmail({
       tone: 'good', tag: 'Refund approved', title: 'Refund approved',
       lines: [`Your order for ${o.package_name} is cancelled and your refund is approved.`,
         pp ? 'The money is going back to the PayPal account or card you paid with. It can take a few days to show. Your entry pass no longer works.'
           : 'Refunds are paid in cash where you paid. Bring your reference code. Your entry pass no longer works.'],
-      details: [['Package', o.package_name], ['Refund', pp ? `USD ${pp.paypal_amount}` : money(o.price_cents, o.currency)], ['Reference', o.reference_code, true]]
+      details: [['Package', o.package_name], ['Refund', pp ? `USD ${pp.paypal_amount}` : money(o.amount_cents, o.currency)], ['Reference', o.reference_code, true]]
     }));
     res.json({ success: true, emailed: !emailError });
   } catch (err) {
@@ -1199,6 +1265,7 @@ td.actions { text-align: right; white-space: nowrap; }
 td.actions .btn + .btn { margin-left: 6px; }
 .subtext { display: block; font-size: 12px; color: var(--muted); margin-top: 4px; max-width: 280px; white-space: normal; }
 .subtext.bad { color: var(--bad); }
+td.num .subtext { margin-left: auto; }
 .empty-row td { text-align: center; color: var(--muted); padding: 40px 14px; }
 
 .pill { display: inline-flex; align-items: center; gap: 7px; padding: 4px 10px; border-radius: 999px; font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; border: 1px solid var(--line-strong); color: var(--muted); }
@@ -1237,6 +1304,8 @@ td.actions .btn + .btn { margin-left: 6px; }
 .create h3 { margin: 0 0 14px; font-size: 14px; font-weight: 600; }
 .create-grid { display: grid; grid-template-columns: 2fr 1fr 110px 1fr; gap: 10px; }
 .create-grid textarea, .create-grid #p-sizes { grid-column: 1 / -1; }
+.create .hint { font-size: 13px; color: var(--muted); margin: 10px 0 0; }
+.create .hint a { color: var(--text); }
 .create-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
 .check { display: inline-flex; align-items: center; gap: 10px; font-size: 14px; color: var(--text); cursor: pointer; }
 @media (max-width: 700px) { .create-grid { grid-template-columns: 1fr 1fr; } .create-grid input:first-child { grid-column: 1 / -1; } }
@@ -1266,8 +1335,10 @@ dialog p { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
   <nav class="top-right">
     <a class="top-link" href="/door" target="_blank" rel="noopener">Door scanner</a>
     <a class="top-link" href="/admin/payments">Payment settings</a>
+    <a class="top-link" href="/admin/pricing">Prices &amp; codes</a>
+    <a class="top-link" href="/admin/pickup">Sizes &amp; pickup</a>
     <a class="top-link" href="/admin/event">Event &amp; messages</a>
-    <a class="top-link" href="/admin/site">Contact &amp; terms</a>
+    <a class="top-link" href="/admin/site">Contact, terms &amp; FAQ</a>
     <a class="top-link" href="${FRONTEND_URL}" target="_blank" rel="noopener">View site &#8599;</a>
     <span id="clock" class="clock"></span>
   </nav>
@@ -1343,7 +1414,9 @@ dialog p { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
         <input id="p-capacity" type="number" min="1" placeholder="Capacity (blank = no limit)" aria-label="Capacity">
         <textarea id="p-includes" placeholder="What's included, one item per line" aria-label="What's included"></textarea>
         <input id="p-sizes" placeholder="Sizes guests choose from, e.g. S, M, L, XL (leave blank if no size is needed)" aria-label="Sizes">
+        <textarea id="p-paynote" maxlength="1000" placeholder="Cash payment details for this package (optional). Shown under the general payment instructions, e.g. who to pay and where." aria-label="Cash payment details for this package (optional)"></textarea>
       </div>
+      <p class="hint">Want early bird pricing or promo codes? Create the package, then set them up in <a href="/admin/pricing">Prices &amp; codes</a>.</p>
       <div class="create-foot">
         <label class="check"><input type="checkbox" id="p-compliance" checked> Requires costume compliance</label>
         <button class="btn" type="submit">Create package</button>
@@ -1355,14 +1428,15 @@ dialog p { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
   <section class="panel hidden" id="orders-panel" role="tabpanel">
     <div class="toolbar">
       <input id="order-search" class="grow" placeholder="Search email or reference" type="search">
-      <select id="order-filter" aria-label="Order status filter"><option value="">All orders</option><option value="REFUND">Refund requests</option><option value="RESERVED">Awaiting payment</option><option value="PAID">Paid</option><option value="CHECKED">Checked in</option><option value="CANCELLED">Cancelled</option></select>
+      <select id="order-filter" aria-label="Order status filter"><option value="">All orders</option><option value="REFUND">Refund requests</option><option value="RESERVED">Awaiting payment</option><option value="PAID">Paid</option><option value="COMP">Free passes</option><option value="COLLECTED">Package collected</option><option value="UNCOLLECTED">Paid, not collected</option><option value="CHECKED">Checked in</option><option value="CANCELLED">Cancelled</option></select>
+      <button class="btn ghost" id="orders-csv-btn" type="button">Export orders CSV</button>
     </div>
     <div class="scroll"><table class="cards"><thead><tr><th>Guest</th><th>Package</th><th class="num">Amount</th><th>Status</th><th>Reference</th><th>Reserved</th><th></th></tr></thead><tbody id="orderlist"></tbody></table></div>
   </section>
   <section class="panel hidden" id="door-panel" role="tabpanel">
     <div class="toolbar">
       <input id="door-search" class="grow" placeholder="Search email or reference" type="search">
-      <select id="door-filter" aria-label="Door event filter"><option value="">All door activity</option><option value="ENTRY">Entries</option><option value="OVERRIDE">Overrides</option><option value="DUPLICATE">Blocked repeat scans</option><option value="UNDO">Undone</option></select>
+      <select id="door-filter" aria-label="Door event filter"><option value="">All door activity</option><option value="ENTRY">Entries</option><option value="OVERRIDE">Overrides</option><option value="DUPLICATE">Blocked repeat scans</option><option value="UNDO">Undone</option><option value="PICKUP">Packages collected</option><option value="PICKUP_DUP">Blocked repeat pickups</option><option value="PICKUP_UNDO">Pickups undone</option></select>
       <a class="btn ghost" href="/door" target="_blank" rel="noopener">Open scanner</a>
     </div>
     <div class="scroll"><table class="cards"><thead><tr><th>Guest</th><th>Event</th><th>Package</th><th>Time</th><th>Phone</th><th>Reference</th></tr></thead><tbody id="doorlist"></tbody></table></div>
@@ -1492,22 +1566,24 @@ function actionBtn(label, cls, fn) {
 
 // ---------- Derived data ----------
 const isRefundRequest = (o) => o.status === 'PAID' && !!o.cancel_requested_at;
+const amountOf = (o) => Number(o.amount_cents ?? o.price_cents);
+const isFree = (o) => o.paid_via === 'COMP' || amountOf(o) === 0; // nothing was paid, so nothing to refund
 function latestOrderFor(email) {
   const e = String(email).toLowerCase();
   return orders.find((o) => String(o.guest_email).toLowerCase() === e && o.status !== 'CANCELLED') || null;
 }
 function totals(list) {
   const t = {};
-  list.forEach((o) => { const c = o.currency || 'XCD'; t[c] = (t[c] || 0) + Number(o.price_cents); });
+  list.forEach((o) => { const c = o.currency || 'XCD'; t[c] = (t[c] || 0) + amountOf(o); });
   const keys = Object.keys(t);
   return keys.length ? keys.map((c) => money(t[c], c)).join(' + ') : money(0, 'XCD');
 }
 function orderPill(o) {
   if (!o) return pill('None', 'neutral');
-  if (isRefundRequest(o)) return pill('Refund requested', 'warn');
-  if (o.status === 'PAID') return pill('Paid', 'good');
+  if (isRefundRequest(o)) return pill(isFree(o) ? 'Cancel requested' : 'Refund requested', 'warn');
+  if (o.status === 'PAID') return o.paid_via === 'COMP' ? pill('Free pass', 'good') : pill('Paid', 'good');
   if (o.status === 'RESERVED') return pill('Awaiting payment', 'warn');
-  if (o.status === 'CANCELLED' && o.refunded_at) return pill('Refunded', 'bad');
+  if (o.status === 'CANCELLED' && o.refunded_at) return isFree(o) ? pill('Pass cancelled', 'neutral') : pill('Refunded', 'bad');
   return pill('Cancelled', 'neutral');
 }
 
@@ -1522,7 +1598,7 @@ function renderStats() {
   const items = [
     { label: 'Guests', value: guests.length.toLocaleString('en-US'), sub: confirmed + ' confirmed attendance' },
     { label: 'Paid orders', value: paid.length.toLocaleString('en-US'), sub: plural(orders.length, 'order', 'orders') + ' in total' },
-    { label: 'Collected', value: totals(paid), sub: 'From paid orders', money: true },
+    { label: 'Received', value: totals(paid), sub: 'From paid orders', money: true },
     { label: 'Awaiting payment', value: reserved.length.toLocaleString('en-US'), sub: reserved.length ? totals(reserved) + ' outstanding' : 'Nothing outstanding' },
     { label: 'Invites pending', value: pending.toLocaleString('en-US'), sub: accepted + ' accepted · ' + unused + ' unused' },
     { label: 'Checked in', value: paid.filter((o) => o.checked_in_at).length.toLocaleString('en-US'), sub: 'of ' + paid.length + ' paid at the door' }
@@ -1655,6 +1731,7 @@ function renderProducts() {
     if (lines.length) meta.push(plural(lines.length, 'item', 'items') + ' included');
     if (p.requires_compliance) meta.push('Costume compliance');
     if (p.sizes) meta.push('Sizes: ' + p.sizes);
+    if (p.pay_note) meta.push('Own cash payment details');
     if (meta.length) name.appendChild(el('span', meta.join(' · '), 'subtext'));
     // How many active orders picked each size, in the package's own size order.
     const counts = p.size_counts || {};
@@ -1662,7 +1739,15 @@ function renderProducts() {
     Object.keys(counts).forEach((k) => { if (order.indexOf(k) < 0) order.push(k); });
     const picked = order.filter((k) => counts[k]).map((k) => k + ' ' + counts[k]);
     if (picked.length) name.appendChild(el('span', 'Ordered: ' + picked.join(' · '), 'subtext'));
-    td(tr, money(p.price_cents, p.currency), 'num');
+    // With price tiers, the price now is the tier on sale (see Prices & codes).
+    const tiers = p.tiers || [];
+    const price = td(tr, p.sales_closed ? 'Closed' : money(p.price_now ?? p.price_cents, p.currency), 'num');
+    if (tiers.length) {
+      const i = tiers.findIndex((t) => t.state === 'CURRENT');
+      const next = i < 0 ? null : tiers.slice(i + 1).find((t) => t.state === 'UPCOMING');
+      price.appendChild(el('span', p.sales_closed || i < 0 ? 'Sales closed: every tier has ended or sold out'
+        : tiers[i].name + ' now' + (next ? ' · then ' + next.name + ' ' + money(next.price_cents, p.currency) : ''), 'subtext' + (p.sales_closed ? ' bad' : '')));
+    }
     td(tr, p.claimed + (p.capacity !== null && p.capacity !== undefined ? ' / ' + p.capacity : ''), 'num');
     const vis = td(tr, '');
     const t = el('button', p.active ? 'Visible' : 'Hidden', 'toggle' + (p.active ? ' on' : ''));
@@ -1675,19 +1760,24 @@ function renderProducts() {
     });
     vis.appendChild(t);
     const act = td(tr, '', 'actions');
+    const prices = el('a', 'Prices', 'btn small ghost');
+    prices.href = '/admin/pricing#p' + p.id;
+    prices.title = 'Price tiers and promo codes for this package';
+    act.appendChild(prices);
     act.appendChild(actionBtn('Edit', 'ghost', async () => {
       const v = await ask({ title: 'Edit package', ok: 'Save changes', fields: [
         { name: 'name', label: 'Name', value: p.name, required: true },
-        { name: 'price', label: 'Price (' + (p.currency || 'XCD') + ')', type: 'number', step: '0.01', min: 0, value: (p.price_cents / 100).toFixed(2), required: true },
+        { name: 'price', label: 'Price (' + (p.currency || 'XCD') + ')' + (tiers.length ? ', not used while it has tiers' : ''), type: 'number', step: '0.01', min: 0, value: (p.price_cents / 100).toFixed(2), required: true },
         { name: 'capacity', label: 'Capacity (blank = no limit)', type: 'number', min: 1, value: p.capacity },
         { name: 'includes', label: "What's included (one per line)", type: 'textarea', value: p.includes },
         { name: 'sizes', label: 'Sizes (comma-separated, blank = no size)', value: p.sizes, placeholder: 'S, M, L, XL' },
+        { name: 'pay_note', label: 'Cash payment details for this package (optional)', type: 'textarea', value: p.pay_note, placeholder: 'Shown under the general payment instructions' },
         { name: 'requires_compliance', label: 'Requires costume compliance', type: 'checkbox', value: p.requires_compliance }
       ] });
       if (!v) return false;
       const price = parseFloat(v.price);
       if (!v.name.trim() || !(price >= 0)) throw new Error('Name and a valid price are required.');
-      await api('/api/admin/packages/' + p.id, { name: v.name, price_cents: Math.round(price * 100), capacity: v.capacity, includes: v.includes, sizes: v.sizes, requires_compliance: v.requires_compliance });
+      await api('/api/admin/packages/' + p.id, { name: v.name, price_cents: Math.round(price * 100), capacity: v.capacity, includes: v.includes, sizes: v.sizes, pay_note: v.pay_note, requires_compliance: v.requires_compliance });
       return 'Package saved.';
     }));
     act.appendChild(actionBtn('Delete', 'danger', async () => {
@@ -1702,10 +1792,18 @@ function renderProducts() {
   labelCells(tbody);
 }
 
+// Order filters beyond a plain status match.
+const ORDER_FILTERS = {
+  REFUND: isRefundRequest,
+  CHECKED: (o) => !!o.checked_in_at,
+  COMP: (o) => o.paid_via === 'COMP',
+  COLLECTED: (o) => !!o.picked_up_at,
+  UNCOLLECTED: (o) => o.status === 'PAID' && !o.picked_up_at
+};
 function renderOrders() {
   const f = $('order-filter').value, q = $('order-search').value.trim().toLowerCase();
   const tbody = $('orderlist'); tbody.replaceChildren();
-  const list = orders.filter((o) => (!f || (f === 'REFUND' ? isRefundRequest(o) : f === 'CHECKED' ? !!o.checked_in_at : o.status === f)) &&
+  const list = orders.filter((o) => (!f || (ORDER_FILTERS[f] ? ORDER_FILTERS[f](o) : o.status === f)) &&
     (String(o.guest_email).toLowerCase().includes(q) || String(o.reference_code).toLowerCase().includes(q)));
   if (!list.length) return emptyRow(tbody, 7, orders.length ? 'No orders match.' : 'No orders yet.');
   list.forEach((o) => {
@@ -1713,7 +1811,11 @@ function renderOrders() {
     td(tr, o.guest_email, 'strong');
     const pk = td(tr, o.package_name);
     if (o.size) pk.appendChild(el('span', 'Size ' + o.size, 'subtext'));
-    td(tr, money(o.price_cents, o.currency), 'num');
+    // What this guest owes or paid: the tier price at reservation, less any code.
+    const amt = td(tr, money(amountOf(o), o.currency), 'num');
+    if (o.tier_name) amt.appendChild(el('span', o.tier_name + ' price', 'subtext'));
+    if (o.paid_via === 'COMP') amt.appendChild(el('span', 'Free pass' + (o.promo_code ? ' (code ' + o.promo_code + ')' : ''), 'subtext'));
+    else if (o.promo_code) amt.appendChild(el('span', 'Code ' + o.promo_code + (Number(o.discount_cents) > 0 ? ': ' + money(o.discount_cents, o.currency) + ' off' : ''), 'subtext'));
     const st = td(tr, '');
     st.appendChild(orderPill(o));
     const ppNote = { CREATED: 'PayPal checkout started', PENDING: 'PayPal is still processing the payment', AMOUNT_MISMATCH: "PayPal amount didn't match. Check PayPal." }[o.paypal_status];
@@ -1723,15 +1825,28 @@ function renderOrders() {
     if (isRefundRequest(o)) {
       st.appendChild(el('span', 'Requested ' + shortDate(o.cancel_requested_at) + (o.cancel_reason ? ': ' + o.cancel_reason : ''), 'subtext'));
     } else if (o.status === 'PAID' && o.paid_at && !o.checked_in_at) {
-      st.appendChild(el('span', 'Paid ' + (o.paid_via === 'PAYPAL' ? 'with PayPal (USD ' + o.paypal_amount + ') ' : '') + shortDate(o.paid_at), 'subtext'));
+      st.appendChild(el('span', o.paid_via === 'COMP' ? 'Confirmed ' + shortDate(o.paid_at)
+        : 'Paid ' + (o.paid_via === 'PAYPAL' ? 'with PayPal (USD ' + o.paypal_amount + ') ' : '') + shortDate(o.paid_at), 'subtext'));
     }
+    if (o.picked_up_at) st.appendChild(el('span', 'Package collected ' + timeOf(o.picked_up_at) + (o.picked_up_by ? ' · ' + o.picked_up_by : ''), 'subtext'));
     if (o.checked_in_at) st.appendChild(el('span', 'Checked in ' + timeOf(o.checked_in_at) + (o.checked_in_by ? ' · ' + o.checked_in_by : ''), 'subtext'));
     td(tr, o.reference_code, 'mono');
     const when = td(tr, shortDate(o.created_at), 'mono'); when.title = longDate(o.created_at);
     const act = td(tr, '', 'actions');
+    // The admin can change a size even when sizes are locked for guests.
+    if (o.status !== 'CANCELLED' && o.package_sizes) {
+      act.appendChild(actionBtn('Size', 'ghost', async () => {
+        const v = await ask({ title: 'Change size', text: o.guest_email + ' (' + o.reference_code + '). This works even when sizes are locked for guests.', ok: 'Save size', fields: [
+          { name: 'size', label: 'Size', value: o.size || '', placeholder: o.package_sizes, required: true }
+        ] });
+        if (!v) return false;
+        const r = await api('/api/admin/orders/' + o.id + '/size', { size: v.size });
+        return r.size ? 'Size set to ' + r.size + '.' : 'Size updated.';
+      }));
+    }
     if (o.status === 'RESERVED') {
       act.appendChild(actionBtn('Mark paid', 'good', async () => {
-        const v = await ask({ title: 'Mark as paid?', text: money(o.price_cents, o.currency) + ' from ' + o.guest_email + ' (' + o.reference_code + '). They get a confirmation email and their entry pass.', ok: 'Mark paid' });
+        const v = await ask({ title: 'Mark as paid?', text: money(amountOf(o), o.currency) + ' from ' + o.guest_email + ' (' + o.reference_code + '). They get a confirmation email and their entry pass.', ok: 'Mark paid' });
         if (!v) return false;
         const r = await api('/api/admin/orders/' + o.id + '/mark-paid', {});
         return r.emailed ? 'Marked paid. Confirmation sent.' : 'Marked paid, but the email failed to send.';
@@ -1743,16 +1858,20 @@ function renderOrders() {
         return 'Reservation cancelled.';
       }));
     } else if (o.status === 'PAID') {
-      const req = isRefundRequest(o);
-      act.appendChild(actionBtn(req ? 'Approve refund' : 'Cancel + refund', req ? '' : 'danger', async () => {
+      const req = isRefundRequest(o), free = isFree(o);
+      const label = free ? (req ? 'Approve cancel' : 'Cancel pass') : (req ? 'Approve refund' : 'Cancel + refund');
+      act.appendChild(actionBtn(label, req ? '' : 'danger', async () => {
         const inAlready = o.checked_in_at ? 'Heads up: they already checked in at the door (' + timeOf(o.checked_in_at) + '). ' : '';
-        const how = o.paid_via === 'PAYPAL'
-          ? 'Cancels the order and sends USD ' + o.paypal_amount + ' back to ' + o.guest_email + ' through PayPal right away. '
-          : 'Cancels the order and records a refund of ' + money(o.price_cents, o.currency) + ' to ' + o.guest_email + '. ';
-        const v = await ask({ title: req ? 'Approve this refund?' : 'Cancel and refund?', text: inAlready + how + 'Their entry pass stops working right away.', ok: req ? 'Approve refund' : 'Cancel and refund', danger: true });
+        const how = free
+          ? 'Cancels the free pass of ' + o.guest_email + '. Nothing was paid, so there is no refund. '
+          : o.paid_via === 'PAYPAL'
+            ? 'Cancels the order and sends USD ' + o.paypal_amount + ' back to ' + o.guest_email + ' through PayPal right away. '
+            : 'Cancels the order and records a refund of ' + money(amountOf(o), o.currency) + ' to ' + o.guest_email + '. ';
+        const title = free ? 'Cancel this free pass?' : req ? 'Approve this refund?' : 'Cancel and refund?';
+        const v = await ask({ title, text: inAlready + how + 'Their entry pass stops working right away.', ok: free ? 'Cancel pass' : req ? 'Approve refund' : 'Cancel and refund', danger: true });
         if (!v) return false;
         await api('/api/admin/orders/' + o.id + '/approve-refund', {});
-        return 'Refund recorded. The guest has been emailed.';
+        return free ? 'Pass cancelled. The guest has been emailed.' : 'Refund recorded. The guest has been emailed.';
       }));
     }
     tbody.appendChild(tr);
@@ -1760,7 +1879,8 @@ function renderOrders() {
   labelCells(tbody);
 }
 
-const DOOR_EVENTS = { ENTRY: ['Entry', 'good'], OVERRIDE: ['Override', 'warn'], DUPLICATE: ['Blocked repeat', 'bad'], UNDO: ['Undone', 'neutral'] };
+const DOOR_EVENTS = { ENTRY: ['Entry', 'good'], OVERRIDE: ['Override', 'warn'], DUPLICATE: ['Blocked repeat', 'bad'], UNDO: ['Undone', 'neutral'],
+  PICKUP: ['Package collected', 'good'], PICKUP_DUP: ['Blocked repeat pickup', 'bad'], PICKUP_UNDO: ['Pickup undone', 'neutral'] };
 function renderDoor() {
   const q = $('door-search').value.trim().toLowerCase(), f = $('door-filter').value;
   const tbody = $('doorlist'); tbody.replaceChildren();
@@ -1861,23 +1981,34 @@ $('p-form').addEventListener('submit', async (e) => {
   try {
     await api('/api/admin/packages', {
       name, price_cents: Math.round(price * 100), currency: $('p-currency').value, includes: $('p-includes').value,
-      requires_compliance: $('p-compliance').checked, capacity: $('p-capacity').value || null, sizes: $('p-sizes').value
+      requires_compliance: $('p-compliance').checked, capacity: $('p-capacity').value || null, sizes: $('p-sizes').value,
+      pay_note: $('p-paynote').value
     });
-    ['p-name', 'p-price', 'p-includes', 'p-capacity', 'p-sizes'].forEach((id) => { $(id).value = ''; });
+    ['p-name', 'p-price', 'p-includes', 'p-capacity', 'p-sizes', 'p-paynote'].forEach((id) => { $(id).value = ''; });
     toast('Package created.');
     await refresh();
   } catch (err) { toast(err.message, true); }
 });
 
-$('csv-btn').addEventListener('click', () => {
+function downloadCsv(filename, rows) {
   const q = (v) => '"' + String(v === null || v === undefined ? '' : v).split('"').join('""') + '"';
-  const rows = [['email', 'attendance', 'invites_left', 'package', 'size', 'order_status', 'reference', 'checked_in_at']].concat(guests.map((g) => {
-    const o = latestOrderFor(g.email);
-    return [g.email, g.rsvp_status || 'PENDING', g.invites_left, o ? o.package_name : '', o && o.size ? o.size : '', o ? (isRefundRequest(o) ? 'REFUND_REQUESTED' : o.status) : '', o ? o.reference_code : '', o && o.checked_in_at ? o.checked_in_at : ''];
-  }));
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([rows.map((r) => r.map(q).join(',')).join(NL)], { type: 'text/csv' }));
-  a.download = 'ondroad-guests.csv'; a.click();
+  a.download = filename; a.click();
+}
+$('csv-btn').addEventListener('click', () => {
+  downloadCsv('ondroad-guests.csv', [['email', 'attendance', 'invites_left', 'package', 'size', 'order_status', 'reference', 'checked_in_at']].concat(guests.map((g) => {
+    const o = latestOrderFor(g.email);
+    return [g.email, g.rsvp_status || 'PENDING', g.invites_left, o ? o.package_name : '', o && o.size ? o.size : '', o ? (isRefundRequest(o) ? 'REFUND_REQUESTED' : o.status) : '', o ? o.reference_code : '', o && o.checked_in_at ? o.checked_in_at : ''];
+  })));
+});
+// Every order, newest first. Amounts are in the order's currency, e.g. 250.00.
+$('orders-csv-btn').addEventListener('click', () => {
+  const amount = (c) => (c === null || c === undefined ? '' : (Number(c) / 100).toFixed(2));
+  downloadCsv('ondroad-orders.csv', [['reference', 'email', 'package', 'tier', 'size', 'list', 'discount', 'code', 'amount', 'currency', 'status', 'paid_via', 'reserved_at', 'paid_at', 'picked_up_at', 'checked_in_at']].concat(
+    orders.slice().sort((a, b) => b.id - a.id).map((o) => [o.reference_code, o.guest_email, o.package_name, o.tier_name, o.size, amount(o.list_cents ?? o.price_cents),
+      amount(o.discount_cents || 0), o.promo_code, amount(amountOf(o)), o.currency, isRefundRequest(o) ? 'REFUND_REQUESTED' : o.status, o.paid_via,
+      o.created_at, o.paid_at, o.picked_up_at, o.checked_in_at])));
 });
 
 const tick = () => { $('clock').textContent = new Date().toLocaleString('en-US', { weekday: 'short', hour: 'numeric', minute: '2-digit', timeZone: 'America/Antigua' }); };

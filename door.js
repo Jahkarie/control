@@ -2,6 +2,8 @@
 // Staff open /door on their phones and sign in with DOOR_KEY (the admin key also works).
 // Each phone keeps a copy of the guest list, so scanning still works with no signal;
 // check-ins made offline sync to the server as soon as the phone is back online.
+// The same scanner has a Pickup mode for handing out packages: a scan marks the package collected
+// (once per order) and shows the guest's size. Pickup can also be marked from /admin/pickup (pickup.js).
 
 export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLimit, requireAdmin }) {
   const DOOR_KEY = process.env.DOOR_KEY || '';
@@ -19,9 +21,11 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
     res.status(401).json({ error: 'Wrong staff password.' });
   };
 
+  // sized: the package has sizes, so an order without one shows "No size picked" at pickup.
   const PASS_SQL = `SELECT o.id, o.reference_code AS ref, LOWER(o.guest_email) AS email, o.status,
       o.checked_in_at, o.checked_in_by, (o.cancel_requested_at IS NOT NULL) AS refund_requested,
-      p.name AS package, p.requires_compliance AS costume
+      o.size, o.picked_up_at, o.picked_up_by,
+      p.name AS package, p.requires_compliance AS costume, (TRIM(REPLACE(p.sizes, ',', '')) <> '') AS sized
     FROM orders o JOIN packages p ON p.id = o.package_id`;
 
   // A phone's clock can be off; never accept a scan time more than a few minutes in the future.
@@ -30,7 +34,9 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
     if (Number.isNaN(d.getTime()) || d.getTime() > Date.now() + 5 * 60 * 1000) return new Date();
     return d;
   };
-  const REPLAY = { ENTRY: 'ADMIT', OVERRIDE: 'ADMIT', UNDO: 'UNDONE', DUPLICATE: 'ALREADY' };
+  const KINDS = ['ENTRY', 'OVERRIDE', 'UNDO', 'PICKUP', 'PICKUP_UNDO'];
+  const REPLAY = { ENTRY: 'ADMIT', OVERRIDE: 'ADMIT', UNDO: 'UNDONE', DUPLICATE: 'ALREADY',
+    PICKUP: 'HANDED', PICKUP_DUP: 'PICKED_ALREADY', PICKUP_UNDO: 'PICKUP_UNDONE' };
 
   const record = (orderId, kind, clientId, device, at) => pool.query(
     `INSERT INTO checkins (order_id, kind, client_id, device, scanned_at) VALUES ($1, $2, $3, $4, $5)
@@ -39,7 +45,7 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
   // Applies one scan. Safe to repeat: a scan with the same client_id is only ever counted once,
   // so a phone can resend its offline queue without double counting.
   async function applyScan(ev) {
-    const kind = ['ENTRY', 'OVERRIDE', 'UNDO'].includes(ev?.kind) ? ev.kind : 'ENTRY';
+    const kind = KINDS.includes(ev?.kind) ? ev.kind : 'ENTRY';
     const ref = String(ev?.ref || '').trim().toUpperCase().slice(0, 32);
     const email = String(ev?.email || '').trim().toLowerCase();
     const clientId = ev?.client_id ? String(ev.client_id).slice(0, 64) : null;
@@ -62,8 +68,27 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
       await record(pass.id, 'UNDO', clientId, device, at);
       return { result: 'UNDONE', pass: { ...pass, checked_in_at: null, checked_in_by: null } };
     }
+    if (kind === 'PICKUP_UNDO') {
+      await pool.query('UPDATE orders SET picked_up_at = NULL, picked_up_by = NULL WHERE id = $1', [pass.id]);
+      await record(pass.id, 'PICKUP_UNDO', clientId, device, at);
+      return { result: 'PICKUP_UNDONE', pass: { ...pass, picked_up_at: null, picked_up_by: null } };
+    }
     if (pass.status === 'RESERVED') return { result: 'UNPAID', pass };
     if (pass.status !== 'PAID') return { result: 'CANCELLED', pass };
+    if (kind === 'PICKUP') {
+      // One package per order, even if two phones scan the same pass at the same moment.
+      const got = await pool.query(
+        `UPDATE orders SET picked_up_at = $2, picked_up_by = $3 WHERE id = $1 AND picked_up_at IS NULL
+         RETURNING picked_up_at, picked_up_by`, [pass.id, at, device]);
+      if (got.rowCount) {
+        await record(pass.id, 'PICKUP', clientId, device, at);
+        return { result: 'HANDED', pass: { ...pass, ...got.rows[0] } };
+      }
+      // Already handed out (maybe a moment ago by another phone, so read who and when again). Logged as a blocked repeat.
+      const now = await pool.query('SELECT picked_up_at, picked_up_by FROM orders WHERE id = $1', [pass.id]);
+      await record(pass.id, 'PICKUP_DUP', clientId, device, at);
+      return { result: 'PICKED_ALREADY', pass: { ...pass, ...now.rows[0] } };
+    }
     if (kind === 'OVERRIDE') {
       await record(pass.id, 'OVERRIDE', clientId, device, at);
       return { result: 'ADMIT', override: true, pass };

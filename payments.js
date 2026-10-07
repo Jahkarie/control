@@ -161,12 +161,12 @@ export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, 
     }
   });
 
-  // pay_rule, pay_weekday and pay_time are optional: left out, they keep their current values.
+  // Everything but the instructions is optional: a setting left out keeps its current value.
   app.post('/api/admin/payment-settings', requireAdmin, async (req, res) => {
     const b = req.body || {};
     const instructions = typeof b.instructions === 'string' ? b.instructions.trim().slice(0, 2000) : '';
-    const days = parseInt(b.pay_days, 10);
-    if (!(days >= 0 && days <= 30)) return res.status(400).json({ error: 'Days must be between 0 and 30.' });
+    const days = b.pay_days === undefined ? null : parseInt(b.pay_days, 10);
+    if (days !== null && !(days >= 0 && days <= 30)) return res.status(400).json({ error: 'Days must be between 0 and 30.' });
     if (b.pay_rule !== undefined && !['days', 'weekday'].includes(b.pay_rule)) {
       return res.status(400).json({ error: 'Choose how the deadline works.' });
     }
@@ -179,7 +179,7 @@ export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, 
     try {
       const cur = await getSettings();
       const rows = [
-        ['payment_instructions', instructions], ['pay_days', String(days)],
+        ['payment_instructions', instructions], ['pay_days', String(days ?? cur.payDays)],
         ['pay_rule', b.pay_rule ?? cur.payRule], ['pay_weekday', String(b.pay_weekday ?? cur.payWeekday)],
         ['pay_time', String(b.pay_time ?? cur.payTime)]
       ];
@@ -201,7 +201,7 @@ export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, 
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Anton&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-:root { --bg: #0b0a09; --surface: #141210; --surface-2: #1b1815; --line: rgba(243, 236, 226, .09); --line-strong: rgba(243, 236, 226, .2); --text: #f3ece2; --muted: #9b9389; --dim: #6c665e; --accent: #ff5b1f; --accent-ink: #120703; --good: #4fc3a1; --bad: #ff6a5c; }
+:root { --bg: #0b0a09; --surface: #141210; --surface-2: #1b1815; --line: rgba(243, 236, 226, .09); --line-strong: rgba(243, 236, 226, .2); --text: #f3ece2; --muted: #9b9389; --dim: #6c665e; --accent: #ff5b1f; --accent-ink: #120703; --good: #4fc3a1; --bad: #ff6a5c; color-scheme: dark; }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 'Inter', system-ui, -apple-system, sans-serif; -webkit-font-smoothing: antialiased; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -216,14 +216,29 @@ body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 'Int
 h1 { font-family: 'Anton', Impact, sans-serif; font-weight: 400; font-size: clamp(36px, 6vw, 52px); line-height: .95; text-transform: uppercase; margin: 0; }
 .lead { color: var(--muted); margin: 10px 0 26px; }
 .card { background: linear-gradient(180deg, var(--surface-2), var(--surface)); border: 1px solid var(--line); border-radius: 14px; padding: clamp(20px, 3vw, 28px); }
-label { display: block; font-size: 11px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); margin: 22px 0 8px; }
+label, .lbl { display: block; font-size: 11px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); margin: 22px 0 8px; }
 label:first-child { margin-top: 0; }
-textarea, input { width: 100%; font: 500 15px 'Inter', system-ui, sans-serif; color: var(--text); background: rgba(0, 0, 0, .35); border: 1px solid var(--line-strong); border-radius: 10px; padding: 13px 14px; transition: border-color .15s, box-shadow .15s; }
+textarea, input, select { width: 100%; font: 500 15px 'Inter', system-ui, sans-serif; color: var(--text); background: rgba(0, 0, 0, .35); border: 1px solid var(--line-strong); border-radius: 10px; padding: 13px 14px; transition: border-color .15s, box-shadow .15s; }
 textarea { min-height: 150px; resize: vertical; line-height: 1.55; }
 input { max-width: 160px; }
-textarea:focus, input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(255, 91, 31, .16); }
+select { width: auto; cursor: pointer; }
+textarea:focus, input:focus, select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(255, 91, 31, .16); }
 textarea::placeholder { color: var(--dim); }
 small { display: block; color: var(--dim); font-size: 13px; margin-top: 8px; }
+.rule { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 12px; padding: 12px 14px; margin-top: 10px; border: 1px solid var(--line); border-radius: 12px; transition: border-color .15s, opacity .15s; }
+.rule:not(.on) { opacity: .62; }
+.rule.on { border-color: var(--line-strong); }
+.rule label { display: inline; margin: 0; font-size: 15px; font-weight: 500; letter-spacing: 0; text-transform: none; color: var(--text); cursor: pointer; }
+.rule input[type=radio] { flex: none; width: 18px; height: 18px; margin: 0; padding: 0; accent-color: var(--accent); cursor: pointer; }
+.rule input[type=radio]:focus { box-shadow: none; }
+.rule input[type=radio]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.rule .unit { color: var(--muted); font-size: 14px; }
+#days { max-width: 90px; }
+#time { max-width: 140px; }
+.ex { margin: 14px 0 0; color: var(--muted); font-size: 14px; }
+.ex b { color: var(--text); font-weight: 600; }
+.ex:empty { display: none; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 .preview { margin-top: 26px; padding: 16px 18px; border-radius: 10px; background: rgba(243, 236, 226, .04); border: 1px solid var(--line); }
 .preview b { display: block; font-size: 11px; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; color: var(--accent); margin-bottom: 8px; }
 .preview span { white-space: pre-line; font-size: 15px; }
@@ -247,11 +262,31 @@ button:disabled { opacity: .5; cursor: progress; }
   <div class="card">
     <label for="instr">How guests pay</label>
     <textarea id="instr" maxlength="2000" placeholder="Example: Cash at Twan Headquarters, Fridays 4-5 PM. Bring your reference code."></textarea>
-    <small>Shown on the guest's order, in the order email and in the reminder email. Line breaks are kept.</small>
+    <small>Shown on the guest's order, in the order email and in the reminder email. Line breaks are kept. A package can add its own cash details (edit it in the Packages tab); guests see those under this.</small>
 
-    <label for="days">Days to pay after reserving</label>
-    <input id="days" type="number" min="0" max="30" inputmode="numeric">
-    <small>Unpaid reservations are cancelled automatically after this many days. Use 0 for no deadline. Changing this only affects new reservations; existing ones keep the deadline they were given. A reminder goes out 24 hours before the deadline (needs 2 or more days).</small>
+    <p class="lbl" id="rule-l">Payment deadline</p>
+    <div role="radiogroup" aria-labelledby="rule-l">
+      <div class="rule">
+        <input type="radio" name="rule" id="r-days" value="days">
+        <label for="r-days">A number of days after reserving</label>
+        <input id="days" type="number" min="0" max="30" inputmode="numeric" aria-label="Days to pay after reserving">
+        <span class="unit">days</span>
+      </div>
+      <div class="rule">
+        <input type="radio" name="rule" id="r-weekday" value="weekday">
+        <label for="r-weekday">The next</label>
+        <select id="wd" aria-label="Day of the week">
+          <option value="0">Sunday</option><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option>
+          <option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option>
+        </select>
+        <span class="unit">at</span>
+        <input id="time" type="time" aria-label="Time, Antigua time">
+        <span class="unit">Antigua time</span>
+      </div>
+    </div>
+    <small>Guests always get at least 24 hours. Changes only affect new reservations.</small>
+    <small>Unpaid reservations are cancelled automatically at the deadline; 0 days means no deadline. A reminder goes out 24 hours before the deadline when the guest had 2 or more days to pay.</small>
+    <p id="ex" class="ex" aria-live="polite"></p>
 
     <div class="preview" aria-live="polite"><b>Guest preview: How to pay</b><span id="pv"></span></div>
 
@@ -281,18 +316,59 @@ fetch('/api/admin/paypal').then(function (r) { return r.json(); }).then(function
   $('pp').innerHTML = t;
 }).catch(function () { $('pp').textContent = 'Could not check PayPal.'; });
 function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+var DAY = 864e5, AST = 4 * 36e5; // Antigua is UTC-4 all year
+function rule() { return $('r-weekday').checked ? 'weekday' : 'days'; }
+// The deadline someone reserving right now would get (the same rule as deadlineFor() in payments.js).
+// null = no deadline, undefined = not filled in yet.
+function dueNow() {
+  var now = Date.now();
+  if (rule() === 'days') {
+    var n = parseInt($('days').value, 10);
+    return n >= 0 && n <= 30 ? (n ? new Date(now + n * DAY) : null) : undefined;
+  }
+  var t = $('time').value.split(':');
+  if (t.length < 2) return undefined;
+  var earliest = now + DAY, l = new Date(earliest - AST); // Antigua's clock, read with the UTC getters
+  var due = Date.UTC(l.getUTCFullYear(), l.getUTCMonth(), l.getUTCDate() + (Number($('wd').value) - l.getUTCDay() + 7) % 7, Number(t[0]), Number(t[1])) + AST;
+  if (due < earliest) due += 7 * DAY;
+  return new Date(due);
+}
+function example() {
+  document.querySelectorAll('.rule').forEach(function (row) { row.classList.toggle('on', row.querySelector('[type=radio]').checked); });
+  var d = dueNow(), ex = $('ex');
+  ex.textContent = '';
+  if (d === null) ex.textContent = 'No deadline: reservations stay held until they are paid or cancelled.';
+  if (!d) return;
+  var b = document.createElement('b');
+  b.textContent = d.toLocaleString('en-US', { dateStyle: 'full', timeStyle: 'short', timeZone: 'America/Antigua' });
+  ex.append('Someone reserving now would have until ', b, ' Antigua time.');
+}
+// Clicking in a row, or changing one of its fields, picks that row.
+document.querySelectorAll('.rule').forEach(function (row) {
+  function pick() { row.querySelector('[type=radio]').checked = true; example(); }
+  row.addEventListener('pointerdown', pick);
+  row.addEventListener('input', pick);
+  row.addEventListener('change', pick);
+});
 fetch('/api/admin/payment-settings').then(function (r) { return r.json(); }).then(function (d) {
   $('instr').value = d.instructions || '';
   $('days').value = d.pay_days;
+  $(d.pay_rule === 'weekday' ? 'r-weekday' : 'r-days').checked = true;
+  $('wd').value = String(d.pay_weekday == null ? 5 : d.pay_weekday);
+  $('time').value = d.pay_time || '18:00';
   preview();
+  example();
 }).catch(function () { $('msg').textContent = 'Could not load settings.'; $('msg').className = 'err'; });
 $('save').addEventListener('click', function () {
   var b = $('save'); b.disabled = true;
   $('msg').textContent = ''; $('msg').className = '';
+  // The rule not in use may be left blank: the server then keeps what it had.
+  var w = rule() === 'weekday', days = $('days').value.trim(), time = $('time').value;
   fetch('/api/admin/payment-settings', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ instructions: $('instr').value, pay_days: $('days').value })
+    body: JSON.stringify({ instructions: $('instr').value, pay_rule: rule(), pay_weekday: $('wd').value,
+      pay_days: w && !days ? undefined : days, pay_time: !w && !time ? undefined : time })
   }).then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); }).then(function (x) {
     $('msg').textContent = x.ok ? 'Saved.' : (x.d.error || 'Could not save.');
     $('msg').className = x.ok ? 'ok' : 'err';
@@ -303,6 +379,6 @@ $('save').addEventListener('click', function () {
 
   app.get('/admin/payments', requireAdmin, (req, res) => res.type('html').send(PAGE));
 
-  // Shared with server.js so every order email uses the same look.
-  return { getSettings, payBy, fmt, send };
+  // Shared with server.js so every order email uses the same look and new orders get the same deadline.
+  return { getSettings, deadlineFor, payBy, fmt, send, howToPay };
 }
