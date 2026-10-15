@@ -8,6 +8,8 @@
 //
 // PayPal doesn't take XCD, so XCD prices are charged in USD at the fixed rate of 2.70 XCD to 1 USD.
 
+import { dueSql } from './payments.js';
+
 const CLIENT_ID = process.env.PAYPAL_CLIENT_ID || '';
 const SECRET = process.env.PAYPAL_CLIENT_SECRET || '';
 const LIVE = process.env.PAYPAL_ENV === 'live';
@@ -53,8 +55,9 @@ export function registerPayPal({ app, pool, requireAuth, requireAdmin, rateLimit
   const captureOf = (ppOrder) => ppOrder?.purchase_units?.[0]?.payments?.captures?.[0] || null;
   const orderPath = (id) => `/v2/checkout/orders/${encodeURIComponent(id)}`;
 
+  // price_cents and currency are what this order owes (its tier price less any code), not the package's price today.
   const ORDER_SQL = `SELECT o.id, o.guest_email, o.status, o.reference_code, o.paypal_order_id, o.paypal_status, o.paypal_amount,
-      p.name AS package_name, p.price_cents, p.currency
+      p.name AS package_name, COALESCE(o.amount_cents, p.price_cents) AS price_cents, COALESCE(o.currency, p.currency) AS currency
     FROM orders o JOIN packages p ON p.id = o.package_id`;
 
   // Records what PayPal says about a payment on our (locked) order: paid if PayPal has exactly the amount we asked
@@ -227,13 +230,12 @@ export function registerPayPal({ app, pool, requireAuth, requireAdmin, rateLimit
   }
 
   // Run by the payments job before it cancels unpaid orders. Confirms PayPal payments that went through without
-  // reaching us, and keeps checking ones PayPal is still holding.
+  // reaching us, and keeps checking ones PayPal is still holding. payDays is the current pay_days setting.
   async function syncDue(payDays) {
     if (!CONFIGURED) return;
     const due = await pool.query(
       `${ORDER_SQL} WHERE o.status = 'RESERVED' AND o.paypal_order_id IS NOT NULL
-         AND (o.paypal_status = 'PENDING' OR (COALESCE(o.pay_days, $1::int) > 0
-              AND o.created_at + make_interval(days => COALESCE(o.pay_days, $1::int)) < NOW()))
+         AND (o.paypal_status = 'PENDING' OR ${dueSql('$1')} < NOW())
        ORDER BY o.id LIMIT 50`, [payDays]);
     for (const row of due.rows) {
       const client = await pool.connect();

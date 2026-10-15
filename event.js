@@ -184,6 +184,7 @@ td { padding: 10px 8px 10px 0; border-bottom: 1px solid var(--line); vertical-al
 td.num { white-space: nowrap; }
 td .bad { color: var(--bad); }
 .empty { color: var(--dim); font-style: italic; margin-top: 14px; }
+@media (max-width: 560px) { .brand .sub { display: none; } }
 </style></head><body>
 <header class="top">
   <div class="brand"><b>ON D<span>'</span> ROAD</b><span class="sub">Command Center</span></div>

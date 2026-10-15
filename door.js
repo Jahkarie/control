@@ -2,6 +2,8 @@
 // Staff open /door on their phones and sign in with DOOR_KEY (the admin key also works).
 // Each phone keeps a copy of the guest list, so scanning still works with no signal;
 // check-ins made offline sync to the server as soon as the phone is back online.
+// The same scanner has a Pickup mode for handing out packages: a scan marks the package collected
+// (once per order) and shows the guest's size. Pickup can also be marked from /admin/pickup (pickup.js).
 
 export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLimit, requireAdmin }) {
   const DOOR_KEY = process.env.DOOR_KEY || '';
@@ -19,9 +21,11 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
     res.status(401).json({ error: 'Wrong staff password.' });
   };
 
+  // sized: the package has sizes, so an order without one shows "No size picked" at pickup.
   const PASS_SQL = `SELECT o.id, o.reference_code AS ref, LOWER(o.guest_email) AS email, o.status,
       o.checked_in_at, o.checked_in_by, (o.cancel_requested_at IS NOT NULL) AS refund_requested,
-      p.name AS package, p.requires_compliance AS costume
+      o.size, o.picked_up_at, o.picked_up_by,
+      p.name AS package, p.requires_compliance AS costume, (TRIM(REPLACE(p.sizes, ',', '')) <> '') AS sized
     FROM orders o JOIN packages p ON p.id = o.package_id`;
 
   // A phone's clock can be off; never accept a scan time more than a few minutes in the future.
@@ -30,7 +34,9 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
     if (Number.isNaN(d.getTime()) || d.getTime() > Date.now() + 5 * 60 * 1000) return new Date();
     return d;
   };
-  const REPLAY = { ENTRY: 'ADMIT', OVERRIDE: 'ADMIT', UNDO: 'UNDONE', DUPLICATE: 'ALREADY' };
+  const KINDS = ['ENTRY', 'OVERRIDE', 'UNDO', 'PICKUP', 'PICKUP_UNDO'];
+  const REPLAY = { ENTRY: 'ADMIT', OVERRIDE: 'ADMIT', UNDO: 'UNDONE', DUPLICATE: 'ALREADY',
+    PICKUP: 'HANDED', PICKUP_DUP: 'PICKED_ALREADY', PICKUP_UNDO: 'PICKUP_UNDONE' };
 
   const record = (orderId, kind, clientId, device, at) => pool.query(
     `INSERT INTO checkins (order_id, kind, client_id, device, scanned_at) VALUES ($1, $2, $3, $4, $5)
@@ -39,7 +45,7 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
   // Applies one scan. Safe to repeat: a scan with the same client_id is only ever counted once,
   // so a phone can resend its offline queue without double counting.
   async function applyScan(ev) {
-    const kind = ['ENTRY', 'OVERRIDE', 'UNDO'].includes(ev?.kind) ? ev.kind : 'ENTRY';
+    const kind = KINDS.includes(ev?.kind) ? ev.kind : 'ENTRY';
     const ref = String(ev?.ref || '').trim().toUpperCase().slice(0, 32);
     const email = String(ev?.email || '').trim().toLowerCase();
     const clientId = ev?.client_id ? String(ev.client_id).slice(0, 64) : null;
@@ -62,21 +68,45 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
       await record(pass.id, 'UNDO', clientId, device, at);
       return { result: 'UNDONE', pass: { ...pass, checked_in_at: null, checked_in_by: null } };
     }
+    if (kind === 'PICKUP_UNDO') {
+      await pool.query('UPDATE orders SET picked_up_at = NULL, picked_up_by = NULL WHERE id = $1', [pass.id]);
+      await record(pass.id, 'PICKUP_UNDO', clientId, device, at);
+      return { result: 'PICKUP_UNDONE', pass: { ...pass, picked_up_at: null, picked_up_by: null } };
+    }
     if (pass.status === 'RESERVED') return { result: 'UNPAID', pass };
     if (pass.status !== 'PAID') return { result: 'CANCELLED', pass };
+    if (kind === 'PICKUP') {
+      // One package per order, even if two phones scan the same pass at the same moment. Still PAID when it's
+      // saved, so an order refunded since the read above isn't handed out.
+      const got = await pool.query(
+        `UPDATE orders SET picked_up_at = $2, picked_up_by = $3 WHERE id = $1 AND picked_up_at IS NULL AND status = 'PAID'
+         RETURNING picked_up_at, picked_up_by`, [pass.id, at, device]);
+      if (got.rowCount) {
+        await record(pass.id, 'PICKUP', clientId, device, at);
+        return { result: 'HANDED', pass: { ...pass, ...got.rows[0] } };
+      }
+      // Cancelled meanwhile, or already handed out (maybe a moment ago by another phone, so read who and when again).
+      // A repeat is logged as blocked.
+      const now = (await pool.query('SELECT status, picked_up_at, picked_up_by FROM orders WHERE id = $1', [pass.id])).rows[0];
+      if (!now || now.status !== 'PAID') return { result: 'CANCELLED', pass: { ...pass, ...now } };
+      await record(pass.id, 'PICKUP_DUP', clientId, device, at);
+      return { result: 'PICKED_ALREADY', pass: { ...pass, ...now } };
+    }
     if (kind === 'OVERRIDE') {
       await record(pass.id, 'OVERRIDE', clientId, device, at);
       return { result: 'ADMIT', override: true, pass };
     }
 
-    // Only one phone can win the first check-in, even if two scan at the same moment.
+    // Only one phone can win the first check-in, even if two scan at the same moment (and only while still PAID).
     const won = await pool.query(
-      `UPDATE orders SET checked_in_at = $2, checked_in_by = $3 WHERE id = $1 AND checked_in_at IS NULL
+      `UPDATE orders SET checked_in_at = $2, checked_in_by = $3 WHERE id = $1 AND checked_in_at IS NULL AND status = 'PAID'
        RETURNING checked_in_at, checked_in_by`, [pass.id, at, device]);
     if (won.rowCount) {
       await record(pass.id, 'ENTRY', clientId, device, at);
       return { result: 'ADMIT', pass: { ...pass, ...won.rows[0] } };
     }
+    const cur = (await pool.query('SELECT status FROM orders WHERE id = $1', [pass.id])).rows[0];
+    if (!cur || cur.status !== 'PAID') return { result: 'CANCELLED', pass: { ...pass, ...cur } };
     // A second scan of a pass that's already in. Logged so the admin can see attempted reuse.
     await record(pass.id, 'DUPLICATE', clientId, device, at);
     return { result: 'ALREADY', pass };
@@ -165,7 +195,9 @@ const PAGE = `<!DOCTYPE html>
   --text: #f3ece2; --muted: #9b9389; --dim: #6c665e;
   --accent: #ff5b1f; --accent-ink: #120703; --good: #4fc3a1; --warn: #f0b43c; --bad: #ff6a5c;
   --display: 'Anton', Impact, 'Arial Narrow', sans-serif; --body: 'Inter', system-ui, -apple-system, sans-serif; --mono: 'JetBrains Mono', ui-monospace, monospace;
+  --mode: var(--accent);
 }
+body.pickup { --mode: var(--good); }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { height: 100%; }
 body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 var(--body); -webkit-font-smoothing: antialiased; overscroll-behavior: none; }
@@ -206,21 +238,29 @@ input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px 
 .count b#in-count { font-family: var(--display); font-weight: 400; font-size: 56px; line-height: 1; color: var(--text); }
 .count span b { color: var(--text); font-weight: 600; }
 
+/* Entry / Pickup switch. Pickup tints the scan frame so staff can tell the modes apart at a glance. */
+.mode { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 4px; margin: 0 0 14px; border: 1px solid var(--line-strong); border-radius: 14px; background: var(--surface); }
+.mode label { position: relative; display: block; cursor: pointer; }
+.mode input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; padding: 0; opacity: 0; cursor: pointer; }
+.mode span { display: block; padding: 13px 10px; border-radius: 10px; text-align: center; font-size: 14px; font-weight: 700; letter-spacing: .06em; color: var(--muted); transition: background .15s, color .15s; }
+.mode input:checked + span { background: var(--mode); color: var(--accent-ink); }
+.mode input:focus-visible + span { outline: 2px solid var(--text); outline-offset: 2px; }
+
 .cam { position: relative; aspect-ratio: 1; border-radius: 20px; overflow: hidden; background: #000; border: 1px solid var(--line); }
 .cam video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: 0; transition: opacity .3s; }
 .cam.on video { opacity: 1; }
 .frame { position: absolute; inset: 17%; border-radius: 18px; pointer-events: none; opacity: 0; transition: opacity .3s;
   background:
-    linear-gradient(var(--accent), var(--accent)) top left / 34px 3px no-repeat,
-    linear-gradient(var(--accent), var(--accent)) top left / 3px 34px no-repeat,
-    linear-gradient(var(--accent), var(--accent)) top right / 34px 3px no-repeat,
-    linear-gradient(var(--accent), var(--accent)) top right / 3px 34px no-repeat,
-    linear-gradient(var(--accent), var(--accent)) bottom left / 34px 3px no-repeat,
-    linear-gradient(var(--accent), var(--accent)) bottom left / 3px 34px no-repeat,
-    linear-gradient(var(--accent), var(--accent)) bottom right / 34px 3px no-repeat,
-    linear-gradient(var(--accent), var(--accent)) bottom right / 3px 34px no-repeat; }
+    linear-gradient(var(--mode), var(--mode)) top left / 34px 3px no-repeat,
+    linear-gradient(var(--mode), var(--mode)) top left / 3px 34px no-repeat,
+    linear-gradient(var(--mode), var(--mode)) top right / 34px 3px no-repeat,
+    linear-gradient(var(--mode), var(--mode)) top right / 3px 34px no-repeat,
+    linear-gradient(var(--mode), var(--mode)) bottom left / 34px 3px no-repeat,
+    linear-gradient(var(--mode), var(--mode)) bottom left / 3px 34px no-repeat,
+    linear-gradient(var(--mode), var(--mode)) bottom right / 34px 3px no-repeat,
+    linear-gradient(var(--mode), var(--mode)) bottom right / 3px 34px no-repeat; }
 .cam.on .frame { opacity: 1; }
-.frame::after { content: ''; position: absolute; left: 8%; right: 8%; top: 50%; height: 2px; background: var(--accent); box-shadow: 0 0 14px var(--accent); opacity: .8; animation: sweep 2.4s ease-in-out infinite; }
+.frame::after { content: ''; position: absolute; left: 8%; right: 8%; top: 50%; height: 2px; background: var(--mode); box-shadow: 0 0 14px var(--mode); opacity: .8; animation: sweep 2.4s ease-in-out infinite; }
 @keyframes sweep { 0%, 100% { top: 12%; } 50% { top: 88%; } }
 .cam-idle { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; padding: 24px; text-align: center; background: radial-gradient(80% 80% at 50% 40%, rgba(255, 91, 31, .14), transparent 70%); }
 .cam.on .cam-idle { display: none; }
@@ -265,6 +305,9 @@ h2 { font-size: 11px; font-weight: 600; letter-spacing: .16em; text-transform: u
 .r-label { margin: 0; font-size: 13px; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; opacity: .8; }
 .result h1 { font-family: var(--display); font-weight: 400; text-transform: uppercase; font-size: clamp(64px, 21vw, 132px); line-height: .9; margin: 10px 0 18px; overflow-wrap: normal; word-break: keep-all; hyphens: none; }
 .r-pkg { margin: 0; font-size: 24px; font-weight: 700; line-height: 1.2; }
+.r-size { margin: 14px 0 0; font-family: var(--display); font-weight: 400; font-size: clamp(44px, 14vw, 80px); line-height: 1; text-transform: uppercase; overflow-wrap: anywhere; }
+.r-size:empty { display: none; }
+.r-size.warn { display: inline-block; padding: 10px 14px; border-radius: 10px; background: #1a1204; color: var(--warn); font: 800 20px/1.2 var(--body); letter-spacing: .04em; text-transform: none; }
 .r-email { margin: 6px 0 0; font-family: var(--mono); font-size: 14px; opacity: .85; overflow-wrap: anywhere; }
 .r-note { margin: 18px 0 0; padding: 14px 16px; border-radius: 12px; background: rgba(0, 0, 0, .14); font-size: 16px; font-weight: 600; line-height: 1.45; }
 .r-note:empty { display: none; }
@@ -300,7 +343,11 @@ h2 { font-size: 11px; font-weight: 600; letter-spacing: .16em; text-transform: u
     <div class="brand">ON D<span>'</span> ROAD<em id="device-name">Door</em></div>
     <div class="net ok" id="net"><i></i><span id="net-text">Online</span></div>
   </header>
-  <div class="count"><b id="in-count">0</b><span>of <b id="paid-count">0</b> paid guests checked in</span></div>
+  <div class="mode" role="radiogroup" aria-label="Scanner mode">
+    <label><input type="radio" name="mode" value="entry"><span>Entry</span></label>
+    <label><input type="radio" name="mode" value="pickup"><span>Pickup</span></label>
+  </div>
+  <div class="count"><b id="in-count">0</b><span>of <b id="paid-count">0</b> <span id="count-what">paid guests checked in</span></span></div>
 
   <div class="cam" id="cam">
     <video id="video" playsinline muted autoplay></video>
@@ -310,7 +357,7 @@ h2 { font-size: 11px; font-weight: 600; letter-spacing: .16em; text-transform: u
       <p id="cam-msg">Point the camera at the QR code on the guest's pass.</p>
     </div>
     <button class="btn ghost small cam-stop" id="cam-stop" type="button">Stop</button>
-    <p class="cam-hint">Hold the pass inside the frame</p>
+    <p class="cam-hint" id="cam-hint">Hold the pass inside the frame</p>
   </div>
 
   <form class="search" id="search-form" autocomplete="off">
@@ -333,6 +380,7 @@ h2 { font-size: 11px; font-weight: 600; letter-spacing: .16em; text-transform: u
     <p class="r-label" id="r-label"></p>
     <h1 id="r-title"></h1>
     <p class="r-pkg" id="r-pkg"></p>
+    <p class="r-size" id="r-size"></p>
     <p class="r-email" id="r-email"></p>
     <p class="r-note" id="r-note"></p>
     <div class="r-timer" id="r-timer"><i></i></div>
@@ -356,11 +404,15 @@ var passes = store.get('door_passes', []);
 var queue = store.get('door_queue', []);
 var recent = store.get('door_recent', []);
 var syncedAt = store.get('door_synced_at', null);
+// 'entry' checks guests in at the gate; 'pickup' hands out packages (and never checks anyone in).
+var MODE = store.get('door_mode', 'entry') === 'pickup' ? 'pickup' : 'entry';
 var online = navigator.onLine !== false;
 var syncing = false, busy = false, autoTimer = null;
 
 function el(tag, text, cls) { var e = document.createElement(tag); if (text !== undefined && text !== null) e.textContent = text; if (cls) e.className = cls; return e; }
 function fmtTime(iso) { return iso ? new Date(iso).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'America/Antigua' }) : ''; }
+// Pickup runs over several days, so pickup times show the date too.
+function fmtWhen(iso) { return iso ? new Date(iso).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'America/Antigua' }) : ''; }
 function newId() { return (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 12); }
 function savePasses() { store.set('door_passes', passes); }
 function saveQueue() { store.set('door_queue', queue); }
@@ -416,14 +468,18 @@ function reapplyQueue() {
     if (!p) return;
     if (ev.kind === 'ENTRY' && !p.checked_in_at) { p.checked_in_at = ev.scanned_at; p.checked_in_by = ev.device; }
     if (ev.kind === 'UNDO') { p.checked_in_at = null; p.checked_in_by = null; }
+    if (ev.kind === 'PICKUP' && !p.picked_up_at) { p.picked_up_at = ev.scanned_at; p.picked_up_by = ev.device; }
+    if (ev.kind === 'PICKUP_UNDO') { p.picked_up_at = null; p.picked_up_by = null; }
   });
 }
 function decide(p, target, kind) {
   if (!p) return { result: 'NOT_FOUND' };
   if (target.ref && target.email && target.email !== p.email) return { result: 'MISMATCH', pass: p };
   if (kind === 'UNDO') return { result: 'UNDONE', pass: p };
+  if (kind === 'PICKUP_UNDO') return { result: 'PICKUP_UNDONE', pass: p };
   if (p.status === 'RESERVED') return { result: 'UNPAID', pass: p };
   if (p.status !== 'PAID') return { result: 'CANCELLED', pass: p };
+  if (kind === 'PICKUP') return { result: p.picked_up_at ? 'PICKED_ALREADY' : 'HANDED', pass: p };
   if (kind === 'OVERRIDE') return { result: 'ADMIT', override: true, pass: p };
   if (p.checked_in_at) return { result: 'ALREADY', pass: p };
   return { result: 'ADMIT', pass: p };
@@ -445,26 +501,29 @@ function parse(text) {
 // ---------- Scanning a pass ----------
 function handle(target, kind) {
   kind = kind || 'ENTRY';
-  if (!target) { show({ result: 'INVALID' }, false); return Promise.resolve(); }
+  var pickup = kind === 'PICKUP' || kind === 'PICKUP_UNDO';
+  if (!target) { show({ result: 'INVALID' }, false, pickup); return Promise.resolve(); }
   var local = findPass(target);
   var ref = target.ref || (local && local.ref) || '';
-  if (!ref) { show(decide(null, target, kind), !online); return Promise.resolve(); }
+  if (!ref) { show(decide(null, target, kind), !online, pickup); return Promise.resolve(); }
   var ev = { client_id: newId(), ref: ref, email: target.ref ? (target.email || '') : '', kind: kind, scanned_at: new Date().toISOString(), device: DEVICE };
   showChecking();
   return api('/api/door/checkin', ev).then(function (r) {
     if (r.pass) mergePass(r.pass);
-    show(r, false);
+    show(r, false, pickup);
   }, function (err) {
     if (err.auth) { hideResult(); signOut(err.message); return; }
     // No signal (or the server hiccuped): decide from the list saved on this phone.
     var d = decide(local, target, kind);
-    if (d.result === 'ADMIT' || d.result === 'UNDONE') {
+    if (d.result === 'ADMIT' || d.result === 'UNDONE' || d.result === 'HANDED' || d.result === 'PICKUP_UNDONE') {
       queue.push(ev); saveQueue();
       if (d.result === 'ADMIT' && !d.override) { local.checked_in_at = ev.scanned_at; local.checked_in_by = DEVICE; }
       if (d.result === 'UNDONE') { local.checked_in_at = null; local.checked_in_by = null; }
+      if (d.result === 'HANDED') { local.picked_up_at = ev.scanned_at; local.picked_up_by = DEVICE; }
+      if (d.result === 'PICKUP_UNDONE') { local.picked_up_at = null; local.picked_up_by = null; }
       savePasses();
     }
-    show(d, true);
+    show(d, true, pickup);
   }).then(function () { renderNet(); renderCounts(); });
 }
 
@@ -476,8 +535,12 @@ var RESULTS = {
   NOT_FOUND: { cls: 'bad', label: 'Unknown code', title: 'Not on list', tone: 'bad' },
   MISMATCH: { cls: 'bad', label: 'Wrong guest', title: 'No match', tone: 'bad' },
   INVALID: { cls: 'bad', label: 'Not a pass', title: 'Not a pass', tone: 'bad' },
-  UNDONE: { cls: 'neutral', label: 'Check-in removed', title: 'Undone', tone: 'neutral' }
+  UNDONE: { cls: 'neutral', label: 'Check-in removed', title: 'Undone', tone: 'neutral' },
+  HANDED: { cls: 'ok', label: 'Package collected', title: 'Hand over', tone: 'ok' },
+  PICKED_ALREADY: { cls: 'bad', label: 'Package already handed out', title: 'Already collected', tone: 'bad' },
+  PICKUP_UNDONE: { cls: 'neutral', label: 'Pickup removed', title: 'Undone', tone: 'neutral' }
 };
+var PICKUP_RESULTS = { HANDED: 1, PICKED_ALREADY: 1, PICKUP_UNDONE: 1 };
 
 function showChecking() {
   busy = true;
@@ -485,23 +548,33 @@ function showChecking() {
   $('result').className = 'result checking';
   $('r-label').textContent = 'Checking';
   $('r-title').textContent = '...';
-  ['r-pkg', 'r-email', 'r-note'].forEach(function (id) { $(id).textContent = ''; });
+  ['r-pkg', 'r-size', 'r-email', 'r-note'].forEach(function (id) { $(id).textContent = ''; });
+  $('r-size').className = 'r-size';
   $('r-timer').className = 'r-timer hidden';
   $('r-primary').classList.add('hidden');
   $('r-secondary').classList.add('hidden');
 }
 
-function show(r, offline) {
+// pickup: the scan was made in Pickup mode, so shared results (not paid, wrong guest...) use pickup wording.
+function show(r, offline, pickup) {
   busy = true;
   clearTimeout(autoTimer);
   var cfg = RESULTS[r.result] || RESULTS.INVALID;
   var p = r.pass || null;
   $('result').className = 'result ' + cfg.cls;
-  $('r-label').textContent = (r.override ? 'Override · ' : '') + cfg.label + (offline ? ' · saved offline' : '');
+  $('r-label').textContent = (pickup && !PICKUP_RESULTS[r.result] ? 'Pickup · ' : '') + (r.override ? 'Override · ' : '') + cfg.label + (offline ? ' · saved offline' : '');
   $('r-title').textContent = cfg.title;
   fitTitle();
   $('r-pkg').textContent = p ? p.package : '';
   $('r-email').textContent = p ? p.email : '';
+  // The size to hand over, big enough to read from the stock shelf.
+  var size = $('r-size');
+  size.textContent = '';
+  size.className = 'r-size';
+  if (r.result === 'HANDED' && p) {
+    if (p.size) size.textContent = 'Size ' + p.size;
+    else if (p.sized) { size.textContent = 'No size picked'; size.className = 'r-size warn'; }
+  }
   var note = '';
   if (r.result === 'ADMIT') {
     if (r.override) note = 'Let in again by staff override. This is logged.';
@@ -509,8 +582,15 @@ function show(r, offline) {
     if (p && p.refund_requested) note += (note ? ' ' : '') + 'They asked for a refund. Tell the organizer.';
   }
   if (r.result === 'ALREADY' && p) note = 'Checked in at ' + fmtTime(p.checked_in_at) + (p.checked_in_by ? ' by ' + p.checked_in_by : '') + '. Only let them in if you know it is a re-entry.';
-  if (r.result === 'UNPAID') note = 'Their reservation was never paid, so this pass does not get them in.';
-  if (r.result === 'CANCELLED') note = 'This order was cancelled or refunded. The pass no longer works.';
+  if (r.result === 'UNPAID') note = pickup ? 'Their reservation was never paid. No package until they pay.' : 'Their reservation was never paid, so this pass does not get them in.';
+  if (r.result === 'CANCELLED') note = pickup ? 'This order was cancelled or refunded. No package for this pass.' : 'This order was cancelled or refunded. The pass no longer works.';
+  if (r.result === 'HANDED' && p) {
+    note = 'Check their photo ID matches ' + p.email + '. Packages only go to the guest themselves.';
+    if (p.sized && !p.size) note += ' Ask which size they need and tell the organizer.';
+    if (p.refund_requested) note += " They asked for a refund. Check with the organizer first, and tap Undo if you don't hand it over.";
+  }
+  if (r.result === 'PICKED_ALREADY' && p) note = (p.picked_up_at ? 'Handed out ' + fmtWhen(p.picked_up_at) + (p.picked_up_by ? ' by ' + p.picked_up_by : '') + '. ' : '') + 'One package per pass. If they say they never got it, contact the organizer.';
+  if (r.result === 'PICKUP_UNDONE') note = 'Their package is no longer marked as collected.';
   if (r.result === 'NOT_FOUND') note = offline ? 'Not in the list saved on this phone. If they paid recently, get signal, tap Sync now and scan again.' : 'No order has this code. Try searching their email.';
   if (r.result === 'MISMATCH') note = 'This code belongs to a different guest. Check their ID.';
   if (r.result === 'INVALID') note = "That QR code is not an On D' Road pass. Ask them to open the pass in their account.";
@@ -532,16 +612,24 @@ function show(r, offline) {
     secondary.classList.remove('hidden');
     secondary.onclick = function () { handle({ ref: p.ref }, 'OVERRIDE'); };
   }
+  if (r.result === 'HANDED' && p) {
+    secondary.textContent = 'Undo';
+    secondary.classList.remove('hidden');
+    secondary.onclick = function () { handle({ ref: p.ref }, 'PICKUP_UNDO'); };
+  }
+  // A handed-out package stays on screen until staff tap Next guest, so the size is there while they fetch it.
   var timer = $('r-timer');
   timer.className = 'r-timer hidden';
-  if (r.result === 'ADMIT' || r.result === 'UNDONE') {
+  if (r.result === 'ADMIT' || r.result === 'UNDONE' || r.result === 'PICKUP_UNDONE') {
     timer.className = 'r-timer';
     void timer.offsetWidth;
     timer.className = 'r-timer run';
     autoTimer = setTimeout(hideResult, 3500);
   }
   feedback(cfg.tone);
-  addRecent({ t: new Date().toISOString(), result: r.result, override: !!r.override, offline: !!offline, email: p ? p.email : '', ref: p ? p.ref : '' });
+  var item = { t: new Date().toISOString(), result: r.result, override: !!r.override, offline: !!offline, email: p ? p.email : '', ref: p ? p.ref : '' };
+  if (pickup) { item.pickup = true; if (r.result === 'HANDED' && p && p.size) item.note = 'Size ' + p.size; }
+  addRecent(item);
   primary.focus();
 }
 
@@ -583,8 +671,11 @@ function unlockAudio() {
 }
 
 // ---------- Recent ----------
-var LABELS = { ADMIT: 'Admitted', ALREADY: 'Blocked: already in', UNPAID: 'Blocked: not paid', CANCELLED: 'Blocked: cancelled', NOT_FOUND: 'Not on list', MISMATCH: 'Blocked: wrong guest', INVALID: 'Not a pass', UNDONE: 'Check-in undone', CONFLICT: 'Admitted twice' };
-var DOTS = { ADMIT: 'ok', UNDONE: 'neutral', UNPAID: 'warn', CONFLICT: 'warn' };
+var LABELS = { ADMIT: 'Admitted', ALREADY: 'Blocked: already in', UNPAID: 'Blocked: not paid', CANCELLED: 'Blocked: cancelled', NOT_FOUND: 'Not on list', MISMATCH: 'Blocked: wrong guest', INVALID: 'Not a pass', UNDONE: 'Check-in undone', CONFLICT: 'Admitted twice',
+  HANDED: 'Package handed over', PICKED_ALREADY: 'Blocked: package already collected', PICKUP_UNDONE: 'Pickup undone', PICKUP_CONFLICT: 'Handed out twice', PICKUP_VOID: 'Handed out, but the order was cancelled' };
+// Pickup-mode scans that ended like an entry scan.
+var PICKUP_LABELS = { UNPAID: 'No package: not paid', CANCELLED: 'No package: cancelled', MISMATCH: 'No package: wrong guest' };
+var DOTS = { ADMIT: 'ok', UNDONE: 'neutral', UNPAID: 'warn', CONFLICT: 'warn', HANDED: 'ok', PICKUP_UNDONE: 'neutral', PICKUP_CONFLICT: 'warn' };
 function addRecent(item) {
   recent.unshift(item);
   recent = recent.slice(0, 30);
@@ -599,7 +690,7 @@ function renderRecent() {
     li.appendChild(el('i', undefined, 'dot ' + (DOTS[it.result] || 'bad')));
     li.appendChild(el('span', it.email || it.ref || 'Unknown code', 'who'));
     li.appendChild(el('span', fmtTime(it.t), 'when'));
-    var what = (it.override ? 'Admitted by override' : LABELS[it.result] || it.result) + (it.offline ? ' · offline' : '') + (it.note ? ' · ' + it.note : '');
+    var what = (it.override ? 'Admitted by override' : (it.pickup && PICKUP_LABELS[it.result]) || LABELS[it.result] || it.result) + (it.offline ? ' · offline' : '') + (it.note ? ' · ' + it.note : '');
     li.appendChild(el('span', what, 'what'));
     ul.appendChild(li);
   });
@@ -612,10 +703,11 @@ function renderNet() {
   $('net-text').textContent = online ? (pending ? pending + ' to sync' : 'Online') : 'Offline' + (pending ? ' · ' + pending + ' to sync' : '');
 }
 function renderCounts() {
-  var paid = 0, inn = 0;
-  passes.forEach(function (p) { if (p.status === 'PAID') { paid++; if (p.checked_in_at) inn++; } });
+  var paid = 0, inn = 0, pickup = MODE === 'pickup';
+  passes.forEach(function (p) { if (p.status === 'PAID') { paid++; if (pickup ? p.picked_up_at : p.checked_in_at) inn++; } });
   $('in-count').textContent = inn;
   $('paid-count').textContent = paid;
+  $('count-what').textContent = pickup ? 'paid packages collected' : 'paid guests checked in';
   $('sync-text').textContent = syncedAt ? 'Guest list updated ' + fmtTime(syncedAt) : 'Guest list not downloaded yet';
 }
 
@@ -630,6 +722,14 @@ function pushQueue() {
       // Admitted offline here, but another phone had already checked them in.
       if (ev && ev.kind === 'ENTRY' && r.result === 'ALREADY' && !r.replay && r.pass) {
         recent.unshift({ t: new Date().toISOString(), result: 'CONFLICT', email: r.pass.email, ref: r.pass.ref, note: 'first in at ' + fmtTime(r.pass.checked_in_at) + (r.pass.checked_in_by ? ' (' + r.pass.checked_in_by + ')' : '') });
+      }
+      // Handed out offline here, but the package had already gone (another phone, or marked in admin).
+      if (ev && ev.kind === 'PICKUP' && r.result === 'PICKED_ALREADY' && !r.replay && r.pass) {
+        recent.unshift({ t: new Date().toISOString(), result: 'PICKUP_CONFLICT', pickup: true, email: r.pass.email, ref: r.pass.ref, note: 'first handed out ' + fmtWhen(r.pass.picked_up_at) + (r.pass.picked_up_by ? ' (' + r.pass.picked_up_by + ')' : '') });
+      }
+      // Handed out offline here, but the order was refunded before this phone synced. Not recorded on the server.
+      if (ev && ev.kind === 'PICKUP' && (r.result === 'CANCELLED' || r.result === 'UNPAID') && r.pass) {
+        recent.unshift({ t: new Date().toISOString(), result: 'PICKUP_VOID', pickup: true, email: r.pass.email, ref: r.pass.ref, note: 'tell the organizer' });
       }
     });
     var done = {};
@@ -663,6 +763,7 @@ $('sync-btn').addEventListener('click', function () { syncNow(true); });
 
 // ---------- Manual search ----------
 function statusOf(p) {
+  if (p.status === 'PAID' && MODE === 'pickup') return p.picked_up_at ? ['Collected', 'st-in'] : ['To collect', 'st-ok'];
   if (p.status === 'PAID') return p.checked_in_at ? ['In ' + fmtTime(p.checked_in_at), 'st-in'] : ['Paid', 'st-ok'];
   if (p.status === 'RESERVED') return ['Not paid', 'st-warn'];
   return ['Cancelled', 'st-bad'];
@@ -680,8 +781,8 @@ function renderMatches() {
     var st = statusOf(p);
     b.appendChild(el('span', p.email, 'm-email'));
     b.appendChild(el('span', st[0], 'm-status ' + st[1]));
-    b.appendChild(el('span', p.package + ' · ' + p.ref, 'm-sub'));
-    b.addEventListener('click', function () { unlockAudio(); $('q').value = ''; box.replaceChildren(); $('q').blur(); handle({ ref: p.ref }, 'ENTRY'); });
+    b.appendChild(el('span', p.package + (MODE === 'pickup' && p.size ? ' · Size ' + p.size : '') + ' · ' + p.ref, 'm-sub'));
+    b.addEventListener('click', function () { unlockAudio(); $('q').value = ''; box.replaceChildren(); $('q').blur(); handle({ ref: p.ref }, scanKind()); });
     box.appendChild(b);
   });
 }
@@ -716,7 +817,7 @@ function stopCamera() {
   if (stream) stream.getTracks().forEach(function (t) { t.stop(); });
   stream = null;
   $('cam').classList.remove('on');
-  $('cam-msg').textContent = "Point the camera at the QR code on the guest's pass.";
+  $('cam-msg').textContent = camText();
   if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; }
 }
 function loop() {
@@ -746,7 +847,7 @@ function onCode(text) {
   if (busy || !text) return;
   if (text === lastText && Date.now() - lastAt < 5000) return;
   lastText = text; lastAt = Date.now();
-  handle(parse(text), 'ENTRY');
+  handle(parse(text), scanKind());
 }
 function keepAwake() {
   try { if (navigator.wakeLock && !wakeLock) navigator.wakeLock.request('screen').then(function (l) { wakeLock = l; l.addEventListener('release', function () { wakeLock = null; }); }, function () {}); } catch (e) {}
@@ -761,6 +862,25 @@ document.addEventListener('visibilitychange', function () {
 });
 $('cam-btn').addEventListener('click', startCamera);
 $('cam-stop').addEventListener('click', stopCamera);
+
+// ---------- Entry / Pickup ----------
+// Pickup is for handing out packages before the event: a scan marks the package collected and shows the size.
+// It never checks anyone in, so a phone left in Pickup mode can't use up a guest's entry.
+var modeInputs = Array.prototype.slice.call(document.querySelectorAll('input[name=mode]'));
+function scanKind() { return MODE === 'pickup' ? 'PICKUP' : 'ENTRY'; }
+function camText() {
+  return MODE === 'pickup' ? "Point the camera at the guest's pass to hand out their package. This does not check them in." : "Point the camera at the QR code on the guest's pass.";
+}
+function setMode(m) {
+  MODE = m === 'pickup' ? 'pickup' : 'entry';
+  store.set('door_mode', MODE);
+  document.body.classList.toggle('pickup', MODE === 'pickup');
+  modeInputs.forEach(function (i) { i.checked = i.value === MODE; });
+  $('cam-msg').textContent = camText();
+  $('cam-hint').textContent = MODE === 'pickup' ? 'Pickup · hold the pass inside the frame' : 'Hold the pass inside the frame';
+  renderCounts(); renderMatches();
+}
+modeInputs.forEach(function (i) { i.addEventListener('change', function () { if (i.checked) setMode(i.value); }); });
 
 // ---------- Sign in / out ----------
 function showMain() {
@@ -782,7 +902,8 @@ function signOut(msg) {
   showSignin(msg || '');
 }
 $('signout').addEventListener('click', function () {
-  if (queue.length && !window.confirm(queue.length + ' check-ins have not synced yet. They stay on this phone and sync after you sign back in. Sign out anyway?')) return;
+  var what = queue.some(function (e) { return e.kind === 'PICKUP' || e.kind === 'PICKUP_UNDO'; }) ? ' scans' : ' check-ins';
+  if (queue.length && !window.confirm(queue.length + what + ' have not synced yet. They stay on this phone and sync after you sign back in. Sign out anyway?')) return;
   passes = queue.length ? passes : [];
   if (!queue.length) { savePasses(); store.del('door_synced_at'); syncedAt = null; recent = []; store.set('door_recent', recent); }
   signOut('Signed out.');
@@ -815,6 +936,7 @@ setInterval(function () { if (KEY && !busy) syncNow(); }, 20000);
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/door-sw.js', { scope: '/door' }).catch(function () {});
 
+setMode(MODE);
 if (KEY && DEVICE) { showMain(); syncNow(); } else { showSignin(); }
 </script>
 </body>
