@@ -12,6 +12,7 @@ import { registerPayPal } from './paypal.js';
 import { registerPricing, loadTiers, priceOf, checkPromo, discountFor, withStates, cleanCode,
   tooManyWrongCodes, countWrongCode, WRONG_CODES } from './pricing.js';
 import { registerPickup, getSizeLock, isSizeLocked } from './pickup.js';
+import { registerReset } from './reset.js';
 import QRCode from 'qrcode';
 
 const { Pool } = pkg;
@@ -168,6 +169,8 @@ registerPricing({ app, pool, requireAuth, requireAdmin, rateLimit, perUser,
   onComp: (o) => sendPaidEmail(o.guest_email, o.package_name, o.reference_code, { free: true }) });
 // Size lock and package pickup tracking (see pickup.js).
 registerPickup({ app, pool, requireAdmin });
+// Clearing guest data (or everything) to start over (see reset.js). A full reset also clears the email footer's contact details.
+registerReset({ app, pool, requireAdmin, rateLimit, afterReset: () => site.refresh() });
 const ADMIN_EMAIL = normalizeEmail(process.env.ADMIN_EMAIL); // optional: gets a copy of refund requests
 
 // Creates the packages/orders/settings tables and any missing columns on startup,
@@ -1335,6 +1338,9 @@ td.num .subtext { margin-left: auto; }
   tbody tr:hover { background: transparent; }
 }
 
+/* Reset link at the bottom of the page */
+.danger-zone { display: flex; align-items: center; justify-content: flex-end; gap: 12px; flex-wrap: wrap; margin-top: 40px; padding-top: 18px; border-top: 1px solid var(--line); font-size: 13px; color: var(--dim); }
+
 /* Create-package form */
 .create { padding: 18px; border-bottom: 1px solid var(--line); background: rgba(243, 236, 226, .015); }
 .create h3 { margin: 0 0 14px; font-size: 14px; font-weight: 600; }
@@ -1477,6 +1483,11 @@ dialog p { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
     </div>
     <div class="scroll"><table class="cards"><thead><tr><th>Guest</th><th>Event</th><th>Package</th><th>Time</th><th>Phone</th><th>Reference</th></tr></thead><tbody id="doorlist"></tbody></table></div>
   </section>
+
+  <footer class="danger-zone">
+    <span>Starting over after testing?</span>
+    <a class="btn small danger" id="reset-link" href="/admin/reset">Reset data&hellip;</a>
+  </footer>
 </main>
 
 <dialog id="dlg" aria-labelledby="dlg-title">
