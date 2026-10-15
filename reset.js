@@ -118,6 +118,7 @@ ul.counts li { background: var(--surface); padding: 14px 16px; }
 ul.counts b { display: block; font-size: 26px; font-weight: 600; letter-spacing: -.02em; }
 ul.counts span { color: var(--muted); font-size: 13px; }
 .keep { margin: 14px 0 0; color: var(--muted); font-size: 14px; }
+.keep b { color: var(--text); font-weight: 600; }
 .scopes { margin-top: 14px; display: grid; gap: 10px; }
 label.scope { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; align-items: start; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; cursor: pointer; opacity: .62; transition: border-color .15s, opacity .15s; margin: 0; font-size: 15px; letter-spacing: 0; text-transform: none; color: var(--text); }
 label.scope.on { opacity: 1; border-color: var(--line-strong); }
@@ -160,6 +161,7 @@ button:disabled { opacity: .5; cursor: not-allowed; filter: none; }
     <ul class="counts" id="counts" aria-live="polite"><li><b>&hellip;</b><span>Loading</span></li></ul>
     <div id="money" class="warn hidden" role="status"></div>
     <p class="keep">Guests who are logged in are logged out. Door phones drop the old list at their next sync.</p>
+    <p class="keep"><b>This includes your own guest account.</b> Login links only go to people on the list, so afterwards add yourself back with Add to roster in the Command Center (or send yourself an invite) before you log in to the guest site.</p>
     <div class="foot"><button class="ghost" id="backup" type="button">Download a copy first</button><span id="b-msg" class="msg" role="status"></span></div>
   </section>
 
@@ -253,7 +255,8 @@ $('go').addEventListener('click', function () {
   call('/api/admin/reset', { scope: scope(), code: $('typed').value }).then(function (d) {
     var x = d.deleted;
     say('msg', 'Done. Deleted ' + x.guests + ' ' + plural(x.guests, 'guest', 'guests') + ', ' + x.invites + ' ' + plural(x.invites, 'invite', 'invites') + ' and ' + x.orders + ' ' + plural(x.orders, 'order', 'orders') +
-      (d.scope === 'everything' ? ', plus ' + x.packages + ' ' + plural(x.packages, 'package', 'packages') + ' and all settings.' : '.'), true);
+      (d.scope === 'everything' ? ', plus ' + x.packages + ' ' + plural(x.packages, 'package', 'packages') + ' and all settings.' : '.') +
+      ' Add yourself back with Add to roster before you log in.', true);
   }).catch(function (e) { say('msg', e.message); }).then(function () { forgetNumber(); load(); });
 });
 load();
