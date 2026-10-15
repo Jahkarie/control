@@ -64,7 +64,7 @@ On D' Road is an invite-only, 18+ Antigua Carnival band. Guests join through an 
 - Rate limiting is in memory: `rateLimit(max, windowMs, keyOf)`, per IP by default. Use `perUser` after `requireAuth` for logged-in actions, since guests on mobile data share IPs. `/api/login` is also limited per email address.
 - `express.json({ limit: '10kb' })` applies to every route registered after it. Routes that need bigger bodies (door sync, terms) are registered before it with their own parser.
 - Errors are `{ error: '<short plain message>' }`. Guest-facing text is plain, friendly and short.
-- Admin and door pages are HTML strings inside the JS files, with no framework.
+- Admin and door pages are HTML strings inside the JS files, with no framework. They share the guest site's "Paint & Powder" look: each page's `:root` has the palette (`--accent` hot pink `#ff2e93`, `--warn` yellow, `--good` lime, `--bad` red, cyan), Archivo for headings and body, Space Mono for codes, and the ON D' ROAD wordmark with a yellow apostrophe. Emails use the same colours with email-safe fonts; the QR stays black on white.
 - CORS allows `FRONTEND_URL`, `https://ondroad.xyz`, `https://www.ondroad.xyz` and `EXTRA_ORIGINS`.
 - The frontend and backend deploy separately. When a backend change needs a frontend change, deploy the frontend first.
 
