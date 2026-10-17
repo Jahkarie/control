@@ -22,7 +22,7 @@ const TIMEOUT_MS = 20 * 1000; // a stuck PayPal call mustn't hold the order (and
 export const usdCents = (cents, currency) => (currency === 'USD' ? cents : Math.ceil((cents * 10) / 27));
 const usd = (cents) => (cents / 100).toFixed(2);
 
-export function registerPayPal({ app, pool, requireAuth, requireAdmin, rateLimit, perUser, onPaid }) {
+export function registerPayPal({ app, pool, requireAuth, requireApproved, requireAdmin, rateLimit, perUser, onPaid }) {
   const enabledFor = (email) => CONFIGURED && (LIVE || TESTERS.includes(email));
   const fail = (res, err) => { console.error('PayPal error:', err); res.status(500).json({ error: 'Server error.' }); };
 
@@ -105,8 +105,8 @@ export function registerPayPal({ app, pool, requireAuth, requireAdmin, rateLimit
     } catch (err) { fail(res, err); }
   });
 
-  // Step 1, when the guest taps a PayPal button: create the PayPal order for their reservation.
-  app.post('/api/paypal/create-order', requireAuth, rateLimit(30, 60 * 60 * 1000, perUser), async (req, res) => {
+  // Step 1, when the guest taps a PayPal button: create the PayPal order for their reservation. Approved guests only.
+  app.post('/api/paypal/create-order', requireAuth, rateLimit(30, 60 * 60 * 1000, perUser), requireApproved, async (req, res) => {
     if (!enabledFor(req.userEmail)) return res.status(400).json({ error: "PayPal isn't available." });
     let client;
     try {

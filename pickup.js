@@ -48,10 +48,14 @@ export function registerPickup({ app, pool, requireAdmin }) {
                   COUNT(*) FILTER (WHERE status = 'RESERVED')::int AS reserved,
                   COUNT(*) FILTER (WHERE status = 'PAID' AND picked_up_at IS NOT NULL)::int AS collected
            FROM orders WHERE status IN ('PAID', 'RESERVED') GROUP BY 1, 2`),
+        // full_name: the guest's name as on their ID (null when they haven't given it), joined on a lowercased
+        // email with one row per email, so an order is never listed twice.
         pool.query(
           `SELECT o.id, o.reference_code, o.guest_email, o.package_id, p.name AS package_name, o.size, o.status,
-                  o.picked_up_at, o.picked_up_by
+                  o.picked_up_at, o.picked_up_by, NULLIF(TRIM(g.full_name), '') AS full_name
            FROM orders o JOIN packages p ON p.id = o.package_id
+           LEFT JOIN (SELECT DISTINCT ON (LOWER(email)) LOWER(email) AS email, full_name FROM guests ORDER BY LOWER(email), id) g
+             ON g.email = LOWER(o.guest_email)
            WHERE o.status = 'PAID' ORDER BY o.id DESC`)
       ]);
 
@@ -250,6 +254,9 @@ td.warn, td .warn { color: var(--warn); }
 .tools input { flex: 1 1 240px; min-width: 0; }
 .tools select { flex: 0 1 auto; }
 td.who { overflow-wrap: anywhere; min-width: 180px; }
+td.who .name { display: block; font-size: 15.5px; font-weight: 800; line-height: 1.3; }
+td.who .email { display: block; }
+td.who .name + .email { color: var(--muted); font-size: 14px; }
 td .mono { display: block; font-family: var(--mono); font-size: 12px; color: var(--muted); }
 td select { padding: 7px 30px 7px 10px; font-size: 14px; border-radius: 8px; background-position: calc(100% - 15px) 50%, calc(100% - 10px) 50%; }
 .pill { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 10.5px; font-weight: 700; letter-spacing: .06em; line-height: 1.3; text-transform: uppercase; padding: 4px 10px 3px; border-radius: 999px; white-space: nowrap; border: 1px solid var(--line-strong); }
@@ -320,7 +327,7 @@ td.act { text-align: right; white-space: nowrap; }
       <ul class="per" id="pu-per"></ul>
     </div>
     <div class="tools">
-      <input id="q" type="search" placeholder="Search email, reference, package or size" aria-label="Search the pickup list" autocomplete="off">
+      <input id="q" type="search" placeholder="Search name, email, package or size" aria-label="Search the pickup list" autocomplete="off">
       <select id="f" aria-label="Show">
         <option value="">All paid orders</option>
         <option value="todo">Not collected yet</option>
@@ -346,6 +353,24 @@ var data = { size_lock: 'open', packages: [], orders: [] };
 var MAX_ROWS = 400;
 
 function el(tag, text, cls) { var e = document.createElement(tag); if (text !== undefined && text !== null) e.textContent = text; if (cls) e.className = cls; return e; }
+// Search fold, the same as the door scanner's: lowercase, no accents, ' . , dropped and - read as a space.
+// Built with String.fromCharCode because this page sits inside a template literal (no backslash escapes).
+var MARKS = new RegExp('[' + String.fromCharCode(0x300) + '-' + String.fromCharCode(0x36f) + ']', 'g');
+var FOLD_DROP = "'.," + String.fromCharCode(0x2019, 0x2018, 0x2bc, 0xb4, 0x60);
+var FOLD_SPACE = '-' + String.fromCharCode(0x2010, 0x2011, 0x2013, 0x2014, 0x2212, 0xa0, 9, 10, 13);
+function fold(s) {
+  s = String(s || '').toLowerCase();
+  if (s.normalize) s = s.normalize('NFD');
+  s = s.replace(MARKS, '');
+  var out = '';
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charAt(i);
+    if (FOLD_DROP.indexOf(c) >= 0) continue;
+    out += FOLD_SPACE.indexOf(c) >= 0 ? ' ' : c;
+  }
+  return out;
+}
+function nameOf(o) { return String(o.full_name || '').trim(); }
 function say(id, text, ok) { $(id).textContent = text; $(id).className = 'msg ' + (ok ? 'ok' : 'err'); }
 function fmt(iso) { return iso ? new Date(iso).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'America/Antigua' }) : ''; }
 function post(url, body) {
@@ -439,17 +464,19 @@ function renderPickup() {
   renderRows();
 }
 
-function matches(o, q, f) {
+// words: the folded search words. Each must be in the guest's name, email, reference, package or size, in any order.
+function matches(o, words, f) {
   if (f === 'todo' && o.picked_up_at) return false;
   if (f === 'done' && !o.picked_up_at) return false;
   if (f === 'nosize' && (o.size || !sizesOf(o).length)) return false;
-  if (!q) return true;
-  return [o.guest_email, o.reference_code, o.package_name, o.size || ''].join(' ').toLowerCase().indexOf(q) >= 0;
+  if (!words.length) return true;
+  var hay = fold([nameOf(o), o.guest_email, o.reference_code, o.package_name, o.size || ''].join(' '));
+  return words.every(function (w) { return hay.indexOf(w) >= 0; });
 }
 
 function renderRows() {
-  var q = $('q').value.trim().toLowerCase(), f = $('f').value;
-  var list = data.orders.filter(function (o) { return matches(o, q, f); });
+  var words = fold($('q').value).split(' ').filter(Boolean), f = $('f').value;
+  var list = data.orders.filter(function (o) { return matches(o, words, f); });
   var tb = $('rows'); tb.replaceChildren();
   var empty = $('rows-empty');
   empty.classList.toggle('hidden', list.length > 0);
@@ -463,13 +490,17 @@ function renderRows() {
 
 function row(o) {
   var tr = el('tr');
-  var who = cell(tr, o.guest_email, 'who'); who.appendChild(el('span', o.reference_code, 'mono'));
+  // The name as on their ID above the email, when the guest has given it.
+  var who = cell(tr, '', 'who'), name = nameOf(o);
+  if (name) who.appendChild(el('span', name, 'name'));
+  who.appendChild(el('span', o.guest_email, 'email'));
+  who.appendChild(el('span', o.reference_code, 'mono'));
   cell(tr, o.package_name);
   var sz = cell(tr, ''), sizes = sizesOf(o);
   if (sizes.length) {
     // The admin can change a size even when sizes are locked for guests.
     var sel = el('select');
-    sel.setAttribute('aria-label', 'Size for ' + o.guest_email);
+    sel.setAttribute('aria-label', 'Size for ' + (name || o.guest_email));
     if (!o.size || sizes.indexOf(o.size) < 0) { var cur = el('option', o.size || 'Pick a size'); cur.value = ''; cur.disabled = true; sel.appendChild(cur); }
     sizes.forEach(function (s) { var opt = el('option', s); opt.value = s; sel.appendChild(opt); });
     sel.value = o.size && sizes.indexOf(o.size) >= 0 ? o.size : '';
@@ -541,7 +572,8 @@ function downloadCsv(filename, rows) {
     return '"' + s.split('"').join('""') + '"';
   };
   var a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([rows.map(function (r) { return r.map(q).join(','); }).join(NL)], { type: 'text/csv' }));
+  // The byte-order mark makes Excel read the file as UTF-8, so accented names come out right.
+  a.href = URL.createObjectURL(new Blob([String.fromCharCode(0xFEFF) + rows.map(function (r) { return r.map(q).join(','); }).join(NL)], { type: 'text/csv;charset=utf-8' }));
   a.download = filename; a.click();
 }
 $('sizes-csv').addEventListener('click', function () {
@@ -552,13 +584,14 @@ $('sizes-csv').addEventListener('click', function () {
   });
   downloadCsv('ondroad-size-counts.csv', rows);
 });
-// Sorted by package, then email, so it works as a printed list at the pickup table.
+// Sorted by package, then name (email for guests without one), so it works as a printed list at the pickup table.
 $('list-csv').addEventListener('click', function () {
+  var key = function (o) { return nameOf(o) || o.guest_email; };
   var list = data.orders.slice().sort(function (a, b) {
-    return a.package_name.localeCompare(b.package_name) || a.guest_email.localeCompare(b.guest_email);
+    return a.package_name.localeCompare(b.package_name) || key(a).localeCompare(key(b), 'en', { sensitivity: 'base' }) || a.guest_email.localeCompare(b.guest_email);
   });
-  downloadCsv('ondroad-pickup-list.csv', [['reference', 'email', 'package', 'size', 'collected', 'collected_at', 'collected_by']].concat(list.map(function (o) {
-    return [o.reference_code, o.guest_email, o.package_name, o.size || '', o.picked_up_at ? 'yes' : 'no', fmt(o.picked_up_at), o.picked_up_by || ''];
+  downloadCsv('ondroad-pickup-list.csv', [['reference', 'name', 'email', 'package', 'size', 'collected', 'collected_at', 'collected_by']].concat(list.map(function (o) {
+    return [o.reference_code, nameOf(o), o.guest_email, o.package_name, o.size || '', o.picked_up_at ? 'yes' : 'no', fmt(o.picked_up_at), o.picked_up_by || ''];
   })));
 });
 

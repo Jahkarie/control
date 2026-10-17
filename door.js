@@ -4,6 +4,9 @@
 // check-ins made offline sync to the server as soon as the phone is back online.
 // The same scanner has a Pickup mode for handing out packages: a scan marks the package collected
 // (once per order) and shows the guest's size. Pickup can also be marked from /admin/pickup (pickup.js).
+// Pickup mode also searches guests by name (as on their ID), and a package found that way goes through a Check ID
+// screen before it's handed over. On a laptop (900px+) Pickup mode turns into a desk: search and list beside the camera.
+// Names are only shown in Pickup mode, and never saved in the recent-scans list.
 
 export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLimit, requireAdmin }) {
   const DOOR_KEY = process.env.DOOR_KEY || '';
@@ -22,11 +25,19 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
   };
 
   // sized: the package has sizes, so an order without one shows "No size picked" at pickup.
+  // full_name is the guest's name as on their ID, for the Pickup desk's name search and Check ID screen (Entry never
+  // shows it). Cancelled orders don't carry it, so door phones only hold names of guests who still have a pass.
+  // The guest join is on a lowercased email, one row per email, so a pass is never listed twice.
   const PASS_SQL = `SELECT o.id, o.reference_code AS ref, LOWER(o.guest_email) AS email, o.status,
       o.checked_in_at, o.checked_in_by, (o.cancel_requested_at IS NOT NULL) AS refund_requested,
       o.size, o.picked_up_at, o.picked_up_by,
-      p.name AS package, p.requires_compliance AS costume, (TRIM(REPLACE(p.sizes, ',', '')) <> '') AS sized
-    FROM orders o JOIN packages p ON p.id = o.package_id`;
+      p.name AS package, p.requires_compliance AS costume, (TRIM(REPLACE(p.sizes, ',', '')) <> '') AS sized,
+      CASE WHEN o.status <> 'CANCELLED' THEN NULLIF(TRIM(g.full_name), '') END AS full_name
+    FROM orders o JOIN packages p ON p.id = o.package_id
+    LEFT JOIN (SELECT DISTINCT ON (LOWER(email)) LOWER(email) AS email, full_name FROM guests ORDER BY LOWER(email), id) g
+      ON g.email = LOWER(o.guest_email)`;
+  // A pass re-read after the first lookup: one that was cancelled meanwhile drops the name, as PASS_SQL would.
+  const restate = (pass, now) => ({ ...pass, ...now, ...(now && now.status === 'CANCELLED' ? { full_name: null } : {}) });
 
   // A phone's clock can be off; never accept a scan time more than a few minutes in the future.
   const scanTime = (v) => {
@@ -88,9 +99,9 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
       // Cancelled meanwhile, or already handed out (maybe a moment ago by another phone, so read who and when again).
       // A repeat is logged as blocked.
       const now = (await pool.query('SELECT status, picked_up_at, picked_up_by FROM orders WHERE id = $1', [pass.id])).rows[0];
-      if (!now || now.status !== 'PAID') return { result: 'CANCELLED', pass: { ...pass, ...now } };
+      if (!now || now.status !== 'PAID') return { result: 'CANCELLED', pass: restate(pass, now) };
       await record(pass.id, 'PICKUP_DUP', clientId, device, at);
-      return { result: 'PICKED_ALREADY', pass: { ...pass, ...now } };
+      return { result: 'PICKED_ALREADY', pass: restate(pass, now) };
     }
     if (kind === 'OVERRIDE') {
       await record(pass.id, 'OVERRIDE', clientId, device, at);
@@ -106,7 +117,7 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
       return { result: 'ADMIT', pass: { ...pass, ...won.rows[0] } };
     }
     const cur = (await pool.query('SELECT status FROM orders WHERE id = $1', [pass.id])).rows[0];
-    if (!cur || cur.status !== 'PAID') return { result: 'CANCELLED', pass: { ...pass, ...cur } };
+    if (!cur || cur.status !== 'PAID') return { result: 'CANCELLED', pass: restate(pass, cur) };
     // A second scan of a pass that's already in. Logged so the admin can see attempted reuse.
     await record(pass.id, 'DUPLICATE', clientId, device, at);
     return { result: 'ALREADY', pass };
@@ -346,6 +357,15 @@ input:focus { outline: none; border-color: var(--cyan); box-shadow: 0 0 0 4px rg
 .match .m-status { grid-column: 2; grid-row: 1 / span 2; font-family: var(--mono); font-size: 11px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
 .st-ok { color: var(--good); } .st-in { color: var(--muted); } .st-warn { color: var(--warn); } .st-bad { color: var(--bad); }
 .empty { color: var(--muted); font-size: 14px; margin: 4px 2px; }
+/* Pickup search: the guest's name leads, their email sits under it. */
+.match.pick .m-status { grid-row: 1 / span 3; }
+.match .m-name { font-weight: 800; font-size: 17px; line-height: 1.25; overflow-wrap: anywhere; }
+.match .m-mail { grid-column: 1; font-size: 13.5px; color: var(--text); opacity: .86; overflow-wrap: anywhere; }
+.match .m-mail.none { color: var(--dim); opacity: 1; font-style: italic; }
+.match .m-ref { white-space: nowrap; }
+@media (hover: hover) { .match:hover { border-color: var(--line-strong); } body.pickup .match:hover { border-color: var(--mode); } }
+.empty.more { font-family: var(--mono); font-size: 12px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.desk-h, .matches .idle { display: none; }
 
 /* Section label: a strip of torn tape */
 h2 {
@@ -366,6 +386,40 @@ h2 {
 
 .foot { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 26px; padding-top: 18px; border-top: 2px dashed var(--line); }
 .foot .sync-text { flex: 1; min-width: 150px; font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+
+/* Pickup desk on a laptop: camera, count and recent scans on the left; a big name search and a longer list on
+   the right. Entry mode keeps the phone layout at every width. */
+@media (min-width: 900px) {
+  body.pickup #main {
+    max-width: 1180px; padding-left: 28px; padding-right: 28px;
+    display: grid; grid-template-columns: minmax(300px, 400px) minmax(0, 1fr); column-gap: 44px; align-items: start;
+    grid-template-rows: auto auto auto auto auto 1fr auto;
+    grid-template-areas: "bar bar" "mode desk" "count desk" "cam desk" "rh desk" "recent desk" "foot foot";
+  }
+  body.pickup #main > .bar { grid-area: bar; }
+  body.pickup #main > .mode { grid-area: mode; }
+  body.pickup #main > .count { grid-area: count; }
+  body.pickup #main > .cam { grid-area: cam; }
+  body.pickup #main > h2 { grid-area: rh; }
+  body.pickup #main > .recent { grid-area: recent; }
+  body.pickup #main > .foot { grid-area: foot; }
+  body.pickup .desk { grid-area: desk; position: relative; isolation: isolate; min-width: 0; padding: 22px 24px 26px; border: 2px solid var(--line-strong); border-radius: 18px; background: var(--surface); }
+  /* A cyan splat over the desk's top corner (kept inside the right edge, so the page never scrolls sideways) */
+  body.pickup .desk::before {
+    content: ''; position: absolute; z-index: -1; right: 6px; top: -46px; width: 190px; height: 190px; opacity: .16; pointer-events: none;
+    background: var(--mode); -webkit-mask: var(--m-splat) center / contain no-repeat; mask: var(--m-splat) center / contain no-repeat; transform: rotate(-12deg);
+  }
+  body.pickup .desk-h { display: block; margin: 0 0 16px; background: var(--mode); }
+  body.pickup .search { margin-top: 0; }
+  body.pickup .search input { padding: 18px 20px; font-size: 21px; font-weight: 600; border-color: var(--line-strong); }
+  body.pickup .matches { margin-top: 14px; gap: 10px; }
+  body.pickup .match { padding: 15px 18px; }
+  body.pickup .match .m-name { font-size: 21px; }
+  body.pickup .match .m-mail { font-size: 14.5px; }
+  body.pickup .match .m-sub { font-size: 12.5px; }
+  body.pickup .match .m-status { font-size: 12px; }
+  body.pickup .matches .idle { display: block; margin-top: 4px; }
+}
 
 /* ---------- Full-screen result ----------
    Flat, loud colour first; the paint (an ink splat and a drip off the top edge) stays in the background.
@@ -409,6 +463,27 @@ h2 {
   overflow-wrap: normal; word-break: keep-all; hyphens: none; text-shadow: .035em .035em 0 var(--pop);
 }
 .result.checking h1 { text-shadow: none; color: var(--muted); }
+/* Check ID (Pickup, from a name search): a flat cyan screen, the guest's name as the headline, to hold up against
+   their photo ID before anything is recorded. */
+.result.idcheck { background: var(--cyan); color: var(--ink); --rc: var(--cyan); --pop: var(--pink); }
+.result.idcheck .r-label::before { content: '?'; content: '?' / ''; }
+/* Names get more line height than the result words: an accent on a capital (É) would touch the line above. */
+.result h1.name { font-size: clamp(56px, 19vw, 128px); line-height: 1; }
+.result h1.quiet { font-size: clamp(42px, 12.5vw, 76px); line-height: .92; text-shadow: none; }
+/* The guest's name on Hand over, under the big result word */
+.r-name {
+  margin: -4px 0 16px; font-family: var(--display); font-weight: 900; font-stretch: 62%; text-transform: uppercase;
+  font-size: clamp(40px, 12.5vw, 76px); line-height: 1; letter-spacing: .01em; overflow-wrap: normal; word-break: keep-all; hyphens: none;
+}
+.r-name:empty { display: none; }
+/* Two guests share this name: an ink sticker that can't be missed */
+.r-warn {
+  display: flex; align-items: flex-start; gap: 10px; margin: 18px 0 0; padding: 13px 15px; border-radius: 10px;
+  font-size: 17px; font-weight: 800; line-height: 1.35; color: var(--yellow); background: var(--ink); box-shadow: 5px 5px 0 var(--pop); transform: rotate(-.6deg);
+}
+.r-warn::before { content: '!'; content: '!' / ''; flex: none; display: inline-grid; place-items: center; width: 24px; height: 24px; margin-top: -1px; border-radius: 50%; font-size: 15px; font-weight: 900; color: var(--ink); background: var(--yellow); }
+.r-warn:empty { display: none; }
+.r-email.hl { display: inline-block; max-width: 100%; padding: 7px 11px 6px; border-radius: 8px; font-size: 16px; color: var(--cyan); background: var(--ink); }
 .r-pkg { margin: 0; font-size: 24px; font-weight: 800; line-height: 1.2; }
 /* The size to hand over: a big ink sticker, readable from the stock shelf */
 .r-size {
@@ -477,10 +552,13 @@ h2 {
     <p class="cam-hint" id="cam-hint">Hold the pass inside the frame</p>
   </div>
 
-  <form class="search" id="search-form" autocomplete="off">
-    <input id="q" placeholder="No QR? Search email or reference" type="search" enterkeyhint="search">
-  </form>
-  <div id="matches" class="matches"></div>
+  <div class="desk" id="desk">
+    <h2 class="desk-h" aria-hidden="true">Find a guest</h2>
+    <form class="search" id="search-form" autocomplete="off" role="search">
+      <input id="q" placeholder="No QR? Search email or reference" aria-label="No QR? Search email or reference" type="search" enterkeyhint="search">
+    </form>
+    <div id="matches" class="matches"></div>
+  </div>
 
   <h2>Recent scans</h2>
   <ul id="recent" class="recent"></ul>
@@ -496,9 +574,11 @@ h2 {
   <div class="r-inner">
     <p class="r-label" id="r-label"></p>
     <h1 id="r-title"></h1>
+    <p class="r-name" id="r-name"></p>
     <p class="r-pkg" id="r-pkg"></p>
     <p class="r-size" id="r-size"></p>
     <p class="r-email" id="r-email"></p>
+    <p class="r-warn" id="r-warn"></p>
     <p class="r-note" id="r-note"></p>
     <div class="r-timer" id="r-timer"><i></i></div>
     <div class="r-actions">
@@ -525,8 +605,34 @@ var syncedAt = store.get('door_synced_at', null);
 var MODE = store.get('door_mode', 'entry') === 'pickup' ? 'pickup' : 'entry';
 var online = navigator.onLine !== false;
 var syncing = false, busy = false, autoTimer = null;
+// True while a Pickup-mode name search is being dealt with (Check ID, then Hand over), so Next guest clears the search.
+var searchFlow = false;
+// Laptop width: the Pickup desk layout, a longer match list, and the cursor goes back to the search after each guest.
+var wideMq = window.matchMedia ? window.matchMedia('(min-width: 900px)') : null;
+function wide() { return !!(wideMq && wideMq.matches); }
 
 function el(tag, text, cls) { var e = document.createElement(tag); if (text !== undefined && text !== null) e.textContent = text; if (cls) e.className = cls; return e; }
+// Search fold: lowercase, no accents, ' . , dropped and - read as a space, so "Mary-Ann O'Neil" is found by
+// "mary ann oneil". Phones type curly apostrophes and long dashes, so those count too. Built with String.fromCharCode
+// because this page sits inside a template literal, where backslash escapes don't survive.
+var MARKS = new RegExp('[' + String.fromCharCode(0x300) + '-' + String.fromCharCode(0x36f) + ']', 'g');
+var FOLD_DROP = "'.," + String.fromCharCode(0x2019, 0x2018, 0x2bc, 0xb4, 0x60);
+var FOLD_SPACE = '-' + String.fromCharCode(0x2010, 0x2011, 0x2013, 0x2014, 0x2212, 0xa0, 9, 10, 13);
+function fold(s) {
+  s = String(s || '').toLowerCase();
+  if (s.normalize) s = s.normalize('NFD');
+  s = s.replace(MARKS, '');
+  var out = '';
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charAt(i);
+    if (FOLD_DROP.indexOf(c) >= 0) continue;
+    out += FOLD_SPACE.indexOf(c) >= 0 ? ' ' : c;
+  }
+  return out;
+}
+function foldWords(s) { return fold(s).split(' ').filter(Boolean); }
+// The guest's name as on their ID. Lists saved before names existed have none, so this is '' for them.
+function nameOf(p) { return String((p && p.full_name) || '').trim(); }
 function fmtTime(iso) { return iso ? new Date(iso).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'America/Antigua' }) : ''; }
 // Pickup runs over several days, so pickup times show the date too.
 function fmtWhen(iso) { return iso ? new Date(iso).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'America/Antigua' }) : ''; }
@@ -663,21 +769,93 @@ function showChecking() {
   busy = true;
   clearTimeout(autoTimer);
   $('result').className = 'result checking';
+  $('main').inert = true;
   $('r-label').textContent = 'Checking';
   $('r-title').textContent = '...';
-  ['r-pkg', 'r-size', 'r-email', 'r-note'].forEach(function (id) { $(id).textContent = ''; });
+  $('r-title').className = '';
+  ['r-name', 'r-pkg', 'r-size', 'r-email', 'r-warn', 'r-note'].forEach(function (id) { $(id).textContent = ''; });
   $('r-size').className = 'r-size';
+  $('r-email').className = 'r-email';
   $('r-timer').className = 'r-timer hidden';
   $('r-primary').classList.add('hidden');
   $('r-secondary').classList.add('hidden');
+  $('r-primary').onclick = null;
+  $('r-secondary').onclick = null;
+}
+
+// How many guests with a pass that isn't cancelled have this name (accents, case and ' . , - aside).
+function sameName(p) {
+  var key = foldWords(nameOf(p)).join(' ');
+  if (!key) return 0;
+  var seen = {}, n = 0;
+  passes.forEach(function (x) {
+    if (x.status === 'CANCELLED' || seen[x.email] || foldWords(nameOf(x)).join(' ') !== key) return;
+    seen[x.email] = true;
+    n++;
+  });
+  return n;
+}
+
+// Closes a result. After a Pickup name search it also clears the search for the next guest, and puts the cursor
+// back in it on a laptop (on a phone that would pop the keyboard up over the list).
+function nextGuest() {
+  hideResult();
+  if (!searchFlow) return;
+  searchFlow = false;
+  $('q').value = '';
+  renderMatches();
+  if (wide()) $('q').focus();
 }
 
 // pickup: the scan was made in Pickup mode, so shared results (not paid, wrong guest...) use pickup wording.
+// Each screen sets its own buttons here.
 function show(r, offline, pickup) {
   busy = true;
   clearTimeout(autoTimer);
-  var cfg = RESULTS[r.result] || RESULTS.INVALID;
+  // The scanner behind the full-screen result can't be reached by Tab or tapped while it's open.
+  $('main').inert = true;
   var p = r.pass || null;
+  var primary = $('r-primary'), secondary = $('r-secondary'), size = $('r-size'), timer = $('r-timer');
+  $('r-title').className = '';
+  $('r-name').textContent = '';
+  $('r-warn').textContent = '';
+  $('r-email').className = 'r-email';
+
+  // Check ID: a package found by a Pickup name search, before it's handed over. Nothing is recorded or logged
+  // until Hand over, which saves the pickup exactly like scanning the pass. Back keeps the search and its list.
+  if (r.result === 'CHECK_ID' && p) {
+    var who = nameOf(p);
+    $('result').className = 'result idcheck';
+    $('r-label').textContent = 'Pickup · Check ID';
+    $('r-title').textContent = who || 'No name on file';
+    $('r-title').className = who ? 'name' : 'quiet';
+    fitTitle();
+    $('r-pkg').textContent = p.package;
+    size.textContent = '';
+    size.className = 'r-size';
+    if (p.size) size.textContent = 'Size ' + p.size;
+    else if (p.sized) { size.textContent = 'No size picked'; size.className = 'r-size warn'; }
+    $('r-email').textContent = p.email;
+    var twins = sameName(p);
+    if (twins > 1) {
+      $('r-warn').textContent = twins + ' guests with this name: confirm their email';
+      $('r-email').className = 'r-email hl';
+    }
+    var idNote = who ? 'Ask for their photo ID. Hand over only if the name matches.' : 'Ask for their email and check their photo ID.';
+    if (p.refund_requested) idNote += ' They asked for a refund. Check with the organizer first.';
+    $('r-note').textContent = idNote;
+    timer.className = 'r-timer hidden';
+    primary.classList.remove('hidden');
+    primary.textContent = 'Hand over';
+    primary.onclick = function () { handle({ ref: p.ref }, 'PICKUP'); };
+    secondary.textContent = 'Back';
+    secondary.classList.remove('hidden');
+    secondary.onclick = function () { searchFlow = false; hideResult(); backToMatch(p.ref); };
+    primary.focus();
+    return;
+  }
+
+  var cfg = RESULTS[r.result] || RESULTS.INVALID;
   $('result').className = 'result ' + cfg.cls;
   $('r-label').textContent = (pickup && !PICKUP_RESULTS[r.result] ? 'Pickup · ' : '') + (r.override ? 'Override · ' : '') + cfg.label + (offline ? ' · saved offline' : '');
   $('r-title').textContent = cfg.title;
@@ -685,7 +863,6 @@ function show(r, offline, pickup) {
   $('r-pkg').textContent = p ? p.package : '';
   $('r-email').textContent = p ? p.email : '';
   // The size to hand over, big enough to read from the stock shelf.
-  var size = $('r-size');
   size.textContent = '';
   size.className = 'r-size';
   if (r.result === 'HANDED' && p) {
@@ -702,7 +879,11 @@ function show(r, offline, pickup) {
   if (r.result === 'UNPAID') note = pickup ? 'Their reservation was never paid. No package until they pay.' : 'Their reservation was never paid, so this pass does not get them in.';
   if (r.result === 'CANCELLED') note = pickup ? 'This order was cancelled or refunded. No package for this pass.' : 'This order was cancelled or refunded. The pass no longer works.';
   if (r.result === 'HANDED' && p) {
-    note = 'Check their photo ID matches ' + p.email + '. Packages only go to the guest themselves.';
+    // The name big, so staff can hold the screen next to the photo ID.
+    var name = nameOf(p);
+    $('r-name').textContent = name;
+    fitText($('r-name'), 26);
+    note = name ? 'Check their photo ID says ' + name + '. Packages only go to the guest themselves.' : 'No name on file. Ask for their email and check their photo ID.';
     if (p.sized && !p.size) note += ' Ask which size they need and tell the organizer.';
     if (p.refund_requested) note += " They asked for a refund. Check with the organizer first, and tap Undo if you don't hand it over.";
   }
@@ -714,9 +895,9 @@ function show(r, offline, pickup) {
   if (r.result === 'UNDONE') note = 'They are no longer marked as checked in.';
   $('r-note').textContent = note;
 
-  var primary = $('r-primary'), secondary = $('r-secondary');
   primary.classList.remove('hidden');
   primary.textContent = 'Next guest';
+  primary.onclick = nextGuest;
   secondary.classList.add('hidden');
   secondary.onclick = null;
   if (r.result === 'ADMIT' && !r.override && p) {
@@ -735,13 +916,12 @@ function show(r, offline, pickup) {
     secondary.onclick = function () { handle({ ref: p.ref }, 'PICKUP_UNDO'); };
   }
   // A handed-out package stays on screen until staff tap Next guest, so the size is there while they fetch it.
-  var timer = $('r-timer');
   timer.className = 'r-timer hidden';
   if (r.result === 'ADMIT' || r.result === 'UNDONE' || r.result === 'PICKUP_UNDONE') {
     timer.className = 'r-timer';
     void timer.offsetWidth;
     timer.className = 'r-timer run';
-    autoTimer = setTimeout(hideResult, 3500);
+    autoTimer = setTimeout(nextGuest, 3500);
   }
   feedback(cfg.tone);
   var item = { t: new Date().toISOString(), result: r.result, override: !!r.override, offline: !!offline, email: p ? p.email : '', ref: p ? p.ref : '' };
@@ -751,21 +931,46 @@ function show(r, offline, pickup) {
 }
 
 // Shrinks the big headline until every word fits on the screen, whatever font loaded.
-function fitTitle() {
-  var h = $('r-title');
+function fitTitle() { fitText($('r-title'), 32); }
+function fitText(h, min) {
   h.style.fontSize = '';
   var size = parseFloat(window.getComputedStyle(h).fontSize) || 96, guard = 0;
-  while (h.scrollWidth > h.clientWidth + 1 && size > 32 && guard++ < 60) { size -= 3; h.style.fontSize = size + 'px'; }
+  while (h.scrollWidth > h.clientWidth + 1 && size > min && guard++ < 60) { size -= 3; h.style.fontSize = size + 'px'; }
 }
 
 function hideResult() {
   clearTimeout(autoTimer);
   $('result').className = 'result hidden';
+  $('main').inert = false;
   busy = false;
   // The same pass is usually still in front of the camera: ignore it for a few seconds.
   lastAt = Date.now();
 }
-$('r-primary').addEventListener('click', hideResult);
+
+// Keyboard on a result (the pickup desk on a laptop): Escape goes Back from Check ID and closes the others like
+// Next guest; Tab stays on the result's own buttons.
+document.addEventListener('keydown', function (e) {
+  if ($('result').classList.contains('hidden')) return;
+  var btns = ['r-primary', 'r-secondary'].map($).filter(function (b) { return !b.classList.contains('hidden'); });
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    if (!btns.length) return;
+    if ($('result').classList.contains('idcheck')) $('r-secondary').click();
+    else nextGuest();
+    return;
+  }
+  if (e.key !== 'Tab') return;
+  e.preventDefault();
+  if (!btns.length) return;
+  var at = btns.indexOf(document.activeElement);
+  btns[(at + (e.shiftKey ? btns.length - 1 : 1)) % btns.length].focus();
+});
+
+// Back from Check ID: the search and its list are still there; focus returns to the guest that was tapped.
+function backToMatch(ref) {
+  var hit = Array.prototype.filter.call($('matches').children, function (c) { return c.getAttribute('data-ref') === ref; })[0];
+  if (hit) hit.focus(); else if (wide()) $('q').focus();
+}
 
 // Buzz and beep so staff notice without staring at the screen.
 var audioCtx = null;
@@ -888,6 +1093,7 @@ function statusOf(p) {
 function renderMatches() {
   var q = $('q').value.trim().toLowerCase();
   var box = $('matches'); box.replaceChildren();
+  if (MODE === 'pickup') { renderPickupMatches(q, box); return; }
   if (q.length < 2) return;
   var list = passes.filter(function (p) { return p.ref.toLowerCase().indexOf(q) >= 0 || p.email.indexOf(q) >= 0; });
   list.sort(function (a, b) { return (RANK[b.status] || 0) - (RANK[a.status] || 0); });
@@ -903,7 +1109,48 @@ function renderMatches() {
     box.appendChild(b);
   });
 }
+// Pickup: every word typed must be in the guest's name, email or reference, in any order, so "oneil mary" finds
+// Mary-Ann O'Neil. The name leads each row, with the email under it.
+function renderPickupMatches(q, box) {
+  var words = q.length < 2 ? [] : foldWords(q);
+  if (!words.length) { box.appendChild(el('p', 'Type their name, email or pass reference.', 'empty idle')); return; }
+  var list = passes.filter(function (p) {
+    var hay = fold(nameOf(p) + ' ' + p.email + ' ' + p.ref);
+    return words.every(function (w) { return hay.indexOf(w) >= 0; });
+  });
+  list.sort(function (a, b) { return (RANK[b.status] || 0) - (RANK[a.status] || 0); });
+  if (!list.length) { box.appendChild(el('p', 'No match on this phone. Try their email, or tap Sync now.', 'empty')); return; }
+  var max = wide() ? 12 : 8;
+  list.slice(0, max).forEach(function (p) {
+    var b = el('button', undefined, 'match pick'), who = nameOf(p), st = statusOf(p);
+    b.type = 'button';
+    b.setAttribute('data-ref', p.ref);
+    b.appendChild(el('span', who || p.email, who ? 'm-name' : 'm-email'));
+    b.appendChild(el('span', st[0], 'm-status ' + st[1]));
+    b.appendChild(el('span', who ? p.email : 'No name on file', who ? 'm-mail' : 'm-mail none'));
+    var sub = el('span', p.package + (p.size ? ' · Size ' + p.size : '') + ' · ', 'm-sub');
+    sub.appendChild(el('span', p.ref, 'm-ref'));
+    b.appendChild(sub);
+    b.addEventListener('click', function () { pickFromSearch(p.ref); });
+    box.appendChild(b);
+  });
+  if (list.length > max) box.appendChild(el('p', (list.length - max) + ' more, keep typing', 'empty more'));
+}
+// A package that's ready to hand over goes to Check ID first. Anything else (not paid, cancelled, already
+// collected) goes straight to its usual screen. The search stays until Next guest.
+function pickFromSearch(ref) {
+  unlockAudio();
+  $('q').blur();
+  searchFlow = true;
+  var p = findPass({ ref: ref });
+  if (p && decide(p, { ref: ref }, 'PICKUP').result === 'HANDED') { show({ result: 'CHECK_ID', pass: p }, false, true); return; }
+  handle({ ref: ref }, 'PICKUP');
+}
 $('q').addEventListener('input', renderMatches);
+if (wideMq) {
+  var onWide = function () { if (MODE === 'pickup') renderMatches(); };
+  if (wideMq.addEventListener) wideMq.addEventListener('change', onWide); else if (wideMq.addListener) wideMq.addListener(onWide);
+}
 $('search-form').addEventListener('submit', function (e) { e.preventDefault(); renderMatches(); });
 
 // ---------- Camera ----------
@@ -964,6 +1211,8 @@ function onCode(text) {
   if (busy || !text) return;
   if (text === lastText && Date.now() - lastAt < 5000) return;
   lastText = text; lastAt = Date.now();
+  // A scanned pass identifies the guest by itself, so it never goes through Check ID.
+  searchFlow = false;
   handle(parse(text), scanKind());
 }
 function keepAwake() {
@@ -995,6 +1244,9 @@ function setMode(m) {
   modeInputs.forEach(function (i) { i.checked = i.value === MODE; });
   $('cam-msg').textContent = camText();
   $('cam-hint').textContent = MODE === 'pickup' ? 'Pickup · hold the pass inside the frame' : 'Hold the pass inside the frame';
+  var ph = MODE === 'pickup' ? 'Search name, email or reference' : 'No QR? Search email or reference';
+  $('q').placeholder = ph;
+  $('q').setAttribute('aria-label', ph);
   renderCounts(); renderMatches();
 }
 modeInputs.forEach(function (i) { i.addEventListener('change', function () { if (i.checked) setMode(i.value); }); });

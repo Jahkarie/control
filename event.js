@@ -1,24 +1,38 @@
 // event.js: event details guests see in their account, and email updates to groups of guests.
-// "When" and the general details show to every logged-in guest. The paid-only details
-// (meetup spot, pickup info) are only sent to guests whose order is paid.
+// "When", the general details and the poster show to every approved guest. The paid-only details
+// (meetup spot, pickup info) and the location are only sent to guests whose order is paid.
+// Guests still waiting for approval, or declined, get nothing.
 import { renderEmail } from './emails.js';
+
+// The poster is an https:// link, or an image in the guest site repo like "art/poster.jpg": the same checks site.js
+// uses for sponsor logos, so the guest site can load it the same way.
+const POSTER_PATH = /^[A-Za-z0-9_-]+(\/[A-Za-z0-9_-]+)*\.(png|jpe?g|svg|webp|gif)$/;
+function isHttpsUrl(v) {
+  if (v.length > 500 || !/^https:\/\/[^\s"'<>\\]+$/.test(v)) return false;
+  try { return new URL(v).protocol === 'https:'; } catch { return false; }
+}
+const isPoster = (v) => isHttpsUrl(v) || POSTER_PATH.test(v);
 
 // Who each group email goes to.
 const AUDIENCES = {
   paid: "SELECT DISTINCT LOWER(guest_email) AS email FROM orders WHERE status = 'PAID'",
   reserved: "SELECT DISTINCT LOWER(guest_email) AS email FROM orders WHERE status = 'RESERVED'",
-  all: 'SELECT DISTINCT LOWER(email) AS email FROM guests'
+  // Approved guests only: people still waiting for approval, or declined, get no group emails (they'd carry the
+  // event details that /api/event keeps from them, and a declined request gets no email at all).
+  all: "SELECT DISTINCT LOWER(email) AS email FROM guests WHERE approval = 'APPROVED'"
 };
 const BATCH = 100; // Resend's batch limit
 
 export function registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, requireAuth, requireAdmin, mail }) {
-  const KEYS = { when: 'event_when', info: 'event_info', paid_info: 'event_paid_info' };
-  const LIMITS = { when: 120, info: 3000, paid_info: 3000 };
+  const KEYS = { when: 'event_when', info: 'event_info', paid_info: 'event_paid_info', location: 'event_location', poster: 'event_poster' };
+  const LIMITS = { when: 120, info: 3000, paid_info: 3000, location: 300, poster: 500 };
 
   async function getEvent() {
     const r = await pool.query('SELECT key, value FROM settings WHERE key = ANY($1)', [Object.values(KEYS)]);
     const s = Object.fromEntries(r.rows.map((x) => [x.key, x.value]));
-    return { when: s.event_when || '', info: s.event_info || '', paid_info: s.event_paid_info || '' };
+    const poster = s.event_poster || '';
+    return { when: s.event_when || '', info: s.event_info || '', paid_info: s.event_paid_info || '',
+      location: s.event_location || '', poster: isPoster(poster) ? poster : '' };
   }
 
   // Builds an organizer update. withPaid adds the paid-only details (paid audience and tests only).
@@ -27,6 +41,8 @@ export function registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, req
     return renderEmail({
       tone: 'accent', tag: 'From the organizers', title: subject,
       lines: message.split(/\r?\n/).map((l) => l.trim()).filter(Boolean),
+      // The location stays out of emails: paid guests see it in their account, and the organizers reveal it
+      // by group email (in the message itself) when they choose.
       details: ev && ev.when ? [['When', ev.when]] : [],
       callout: details ? { label: 'Event details', text: details } : null,
       cta: { text: 'Open my account', url: FRONTEND_URL }
@@ -34,15 +50,22 @@ export function registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, req
   }
 
   // ---------- Guest ----------
+  const NOTHING = { when: '', info: '', paid: false, paid_info: '', has_paid_info: false, location: '', poster: '' };
   app.get('/api/event', requireAuth, async (req, res) => {
     try {
+      // Only approved guests see the event. Pending and declined requests (and removed guests) get empty details.
+      const g = await pool.query('SELECT approval FROM guests WHERE LOWER(email) = $1 ORDER BY id LIMIT 1', [req.userEmail]);
+      if (!g.rowCount || (g.rows[0].approval && g.rows[0].approval !== 'APPROVED')) return res.json(NOTHING);
       const ev = await getEvent();
       const paid = await pool.query("SELECT 1 FROM orders WHERE LOWER(guest_email) = $1 AND status = 'PAID' LIMIT 1", [req.userEmail]);
       res.json({
         when: ev.when, info: ev.info,
         paid: !!paid.rowCount,
         paid_info: paid.rowCount ? ev.paid_info : '',
-        has_paid_info: !!ev.paid_info
+        has_paid_info: !!ev.paid_info,
+        // Like paid_info: only once the guest's order is paid.
+        location: paid.rowCount ? ev.location : '',
+        poster: ev.poster
       });
     } catch (err) {
       console.error(err);
@@ -60,12 +83,21 @@ export function registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, req
     }
   });
 
+  // Saves the fields sent. One left out keeps its value, so an older copy of the page can't wipe the newer ones.
   app.post('/api/admin/event', requireAdmin, async (req, res) => {
+    const b = req.body || {};
+    const vals = {};
+    for (const field of Object.keys(KEYS)) {
+      if (b[field] === undefined || b[field] === null) continue;
+      vals[field] = typeof b[field] === 'string' ? b[field].trim().slice(0, LIMITS[field]) : '';
+    }
+    if (vals.poster && !isPoster(vals.poster)) {
+      return res.status(400).json({ error: 'The poster needs to be an https:// image link, or a file in the guest site like art/poster.jpg.' });
+    }
     try {
-      for (const [field, key] of Object.entries(KEYS)) {
-        const v = typeof req.body?.[field] === 'string' ? req.body[field].trim().slice(0, LIMITS[field]) : '';
+      for (const [field, v] of Object.entries(vals)) {
         await pool.query(
-          'INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value', [key, v]);
+          'INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value', [KEYS[field], v]);
       }
       res.json({ success: true });
     } catch (err) {
@@ -202,6 +234,12 @@ tbody tr:last-child td { border-bottom: 0; }
 td.num { white-space: nowrap; font-variant-numeric: tabular-nums; }
 td .bad { color: var(--bad); }
 .empty { color: var(--dim); font-style: italic; margin-top: 14px; }
+/* Poster preview: the image as guests will load it, on the dark canvas */
+.poster { display: flex; align-items: center; gap: 14px; margin-top: 12px; }
+.poster .frame { flex: none; width: 96px; height: 96px; border-radius: 10px; border: 1px dashed var(--line-strong); background: var(--well); display: grid; place-items: center; overflow: hidden; }
+.poster img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.poster .frame span { font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: var(--dim); text-align: center; padding: 6px; }
+.poster p { margin: 0; color: var(--muted); font-size: 13px; }
 </style></head><body>
 <header class="top">
   <div class="brand"><svg class="mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><path fill="currentColor" d="M29.1 16.4C28.6 17 25.8 17.4 24.9 17.9C24 18.3 24 18.6 23.9 19.1C23.7 19.5 23.6 19.9 23.7 20.5C23.7 21.1 24.2 22 24.2 22.6C24.2 23.3 24.2 24.2 23.8 24.6C23.3 24.9 22.3 24.7 21.6 24.6C20.9 24.6 20.1 24.2 19.5 24.1C18.9 24 18.5 23.7 18.1 24.2C17.7 24.6 17.7 25.9 17.2 26.7C16.8 27.5 16.1 29.2 15.6 28.9C15.1 28.6 14.7 25.8 14.2 25C13.8 24.1 13.6 24.1 13.1 24C12.7 23.8 12.3 23.9 11.7 24C11.2 24.1 10.5 24.3 9.7 24.5C8.9 24.7 7.5 25.4 6.8 25.2C6 25.1 5.4 24.5 5.4 23.8C5.4 23.1 6.4 21.7 6.7 21C7 20.2 7.6 19.6 7.2 19.1C6.7 18.7 4.6 18.7 4 18.2C3.4 17.8 3 16.9 3.6 16.4C4.2 15.9 6.6 15.5 7.4 15.1C8.1 14.7 8 14.4 8 13.9C8.1 13.5 8 13 7.9 12.5C7.7 11.9 7.4 11.1 7.3 10.4C7.3 9.7 7.2 8.7 7.5 8.3C7.9 7.9 8.7 7.8 9.4 7.8C10 7.8 10.9 8.3 11.4 8.2C12 8.1 12.2 8 12.6 7.1C12.9 6.2 13 3.5 13.5 3C14 2.5 15 3.2 15.6 3.9C16.2 4.6 16.6 6.5 17 7.3C17.5 8 17.8 8 18.2 8.3C18.6 8.7 18.9 9 19.3 9.2C19.7 9.4 19.9 9.6 20.6 9.5C21.3 9.5 22.6 8.7 23.2 8.8C23.9 8.8 24.5 9.3 24.6 9.9C24.6 10.5 23.7 11.7 23.5 12.4C23.4 13 23.1 13.4 23.9 13.7C24.7 14 27.4 13.9 28.2 14.4C29.1 14.8 29.7 15.8 29.1 16.4ZM12.7 3.8a1.5 1.5 0 1 1 3.1 0a1.5 1.5 0 1 1 -3.1 0ZM23 9a1.4 1.4 0 1 1 2.9 0a1.4 1.4 0 1 1 -2.9 0ZM27.1 15.5a1.6 1.6 0 1 1 3.1 0a1.6 1.6 0 1 1 -3.1 0ZM14.5 28.9a1.5 1.5 0 1 1 3 0a1.5 1.5 0 1 1 -3 0ZM5.5 23.7a1.4 1.4 0 1 1 2.8 0a1.4 1.4 0 1 1 -2.8 0ZM1.4 17.3a1.5 1.5 0 1 1 3.1 0a1.5 1.5 0 1 1 -3.1 0ZM27.4 5.4a1.2 1.2 0 1 1 2.4 0a1.2 1.2 0 1 1 -2.4 0ZM2.6 27a1 1 0 1 1 2 0a1 1 0 1 1 -2 0ZM26.6 28.2a0.8 0.8 0 1 1 1.6 0a0.8 0.8 0 1 1 -1.6 0Z"/></svg><b>ON D<span>'</span> ROAD</b><span class="sub">Command Center</span></div>
@@ -213,15 +251,22 @@ td .bad { color: var(--bad); }
 
   <section class="card" aria-labelledby="ev-h">
     <h2 id="ev-h">Event details</h2>
-    <p>Shown in every guest's account. Leave everything empty to hide the section.</p>
+    <p>Shown in every approved guest's account. Guests still waiting for approval see none of it. Leave everything empty to hide the section.</p>
     <label for="when">When</label>
     <input id="when" maxlength="120" placeholder="Example: Carnival Tuesday, August 4 · 9:00 AM">
     <label for="info">Details for everyone</label>
     <textarea id="info" maxlength="3000" placeholder="Example: Wear your package gear. Bring water and ID."></textarea>
-    <small>Every guest who is logged in can see this, paid or not.</small>
+    <small>Every approved guest can see this, paid or not.</small>
     <label for="paid">Details for paid guests only</label>
     <textarea id="paid" maxlength="3000" placeholder="Example: Meet at Twan Headquarters, 3:30 AM. Package pickup Saturday 2-6 PM, bring your reference code."></textarea>
     <small>Meetup spot, pickup times and anything else only paying guests should know. Unpaid guests see that more details unlock once they pay.</small>
+    <label for="loc">Location, for paid guests only</label>
+    <input id="loc" maxlength="300" placeholder="Example: Meet at the Botanical Gardens gate, St. John's">
+    <small>Until they pay, guests see "Secret location, revealed once you've paid". Paid guests see this, or "Details coming soon" while it's empty.</small>
+    <label for="poster">Poster image</label>
+    <input id="poster" maxlength="500" inputmode="url" placeholder="art/poster.jpg or https://..." aria-describedby="poster-help">
+    <div class="poster"><div class="frame" id="poster-frame"><span>Our art</span></div><p id="poster-cap">Empty: guests see the site's own paint art.</p></div>
+    <small id="poster-help">The cover at the top of each approved guest's account. Add the file to the guest site repo and enter its path, like <code>art/poster.jpg</code>, or paste any https:// image link. PNG, JPG, SVG, WebP or GIF; a wide image works best.</small>
     <div class="foot"><button id="ev-save" type="button">Save details</button><span id="ev-msg" class="msg" role="status"></span></div>
   </section>
 
@@ -232,7 +277,7 @@ td .bad { color: var(--bad); }
     <select id="aud">
       <option value="paid">Paid guests</option>
       <option value="reserved">Reserved, not paid</option>
-      <option value="all">Everyone on the list</option>
+      <option value="all">Everyone approved</option>
     </select>
     <label for="subj">Subject</label>
     <input id="subj" maxlength="120" placeholder="Example: Final details for Monday">
@@ -256,7 +301,7 @@ td .bad { color: var(--bad); }
 <script>
 var $ = function (id) { return document.getElementById(id); };
 var counts = {};
-var LABELS = { paid: 'Paid guests', reserved: 'Reserved, not paid', all: 'Everyone on the list' };
+var LABELS = { paid: 'Paid guests', reserved: 'Reserved, not paid', all: 'Everyone approved' };
 function say(id, text, ok) { $(id).textContent = text; $(id).className = 'msg ' + (ok ? 'ok' : 'err'); }
 function post(url, body) {
   return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
@@ -264,8 +309,37 @@ function post(url, body) {
 }
 function fmt(iso) { return new Date(iso).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'America/Antigua' }); }
 
+// Where the guest site loads the poster from, or '' when it would skip it (same rule as the server's check).
+var SITE = ${JSON.stringify(FRONTEND_URL.replace(/\/$/, ''))};
+var PATH_CHARS = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-';
+function posterSrc(v) {
+  if (!v) return '';
+  if (v.indexOf('https://') === 0) return v.indexOf(' ') < 0 && v.indexOf('"') < 0 && v.indexOf('<') < 0 ? v : '';
+  var dot = v.lastIndexOf('.'), ext = v.slice(dot + 1);
+  if (dot < 1 || ['png', 'jpg', 'jpeg', 'svg', 'webp', 'gif'].indexOf(ext) < 0) return '';
+  var parts = v.slice(0, dot).split('/');
+  var ok = parts.every(function (p) { return p.length > 0 && p.split('').every(function (c) { return PATH_CHARS.indexOf(c) >= 0; }); });
+  return ok ? SITE + '/' + v : '';
+}
+function showPoster() {
+  var v = $('poster').value.trim(), src = posterSrc(v), frame = $('poster-frame');
+  frame.replaceChildren();
+  if (!src) {
+    var s = document.createElement('span'); s.textContent = v ? 'Not valid' : 'Our art'; frame.appendChild(s);
+    $('poster-cap').textContent = v ? 'Use an https:// link or a path like art/poster.jpg.' : "Empty: guests see the site's own paint art.";
+    return;
+  }
+  var img = document.createElement('img'); img.alt = 'Poster preview'; img.src = src;
+  img.onerror = function () { frame.replaceChildren(); var s = document.createElement('span'); s.textContent = 'Not found'; frame.appendChild(s); $('poster-cap').textContent = v.indexOf('https://') === 0 ? "Can't load this image." : 'Not found on the guest site yet. Add the file to the repo first.'; };
+  frame.appendChild(img);
+  $('poster-cap').textContent = 'Shown as the cover of the event page.';
+}
+$('poster').addEventListener('input', showPoster);
+
 fetch('/api/admin/event').then(function (r) { return r.json(); }).then(function (d) {
   $('when').value = d.when || ''; $('info').value = d.info || ''; $('paid').value = d.paid_info || '';
+  $('loc').value = d.location || ''; $('poster').value = d.poster || '';
+  showPoster();
 }).catch(function () { say('ev-msg', 'Could not load details.'); });
 
 function loadLog() {
@@ -291,7 +365,7 @@ loadLog();
 
 $('ev-save').addEventListener('click', function () {
   var b = this; b.disabled = true; $('ev-msg').textContent = '';
-  post('/api/admin/event', { when: $('when').value, info: $('info').value, paid_info: $('paid').value })
+  post('/api/admin/event', { when: $('when').value, info: $('info').value, paid_info: $('paid').value, location: $('loc').value, poster: $('poster').value.trim() })
     .then(function (x) { say('ev-msg', x.ok ? 'Saved. Guests see it now.' : (x.d.error || 'Could not save.'), x.ok); })
     .catch(function () { say('ev-msg', 'Could not save.'); })
     .then(function () { b.disabled = false; });

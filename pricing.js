@@ -183,7 +183,7 @@ function promoEdits(b) {
 
 // Routes. onComp(order) is called after a code makes an existing reservation free (the order is then PAID);
 // order has { guest_email, package_name, reference_code }.
-export function registerPricing({ app, pool, requireAuth, requireAdmin, rateLimit, perUser, onComp }) {
+export function registerPricing({ app, pool, requireAuth, requireApproved, requireAdmin, rateLimit, perUser, onComp }) {
   const fail = (res, err) => { console.error(err); res.status(500).json({ error: 'Server error.' }); };
   const invalid = (res, error) => res.status(400).json({ error, code: 'PROMO_INVALID' });
 
@@ -196,9 +196,13 @@ export function registerPricing({ app, pool, requireAuth, requireAdmin, rateLimi
     if (!code) return invalid(res, 'Enter a code.');
     if (tooManyWrongCodes(req)) return res.status(429).json(WRONG_CODES);
     try {
-      // Sessions last a week, so someone taken off the roster could otherwise keep trying codes.
-      const g = await pool.query('SELECT 1 FROM guests WHERE LOWER(email) = $1', [req.userEmail]);
+      // Sessions last a week, so someone taken off the roster could otherwise keep trying codes. Sign-up requests
+      // still waiting for approval (or declined) can't reserve, so they can't try codes either.
+      const g = await pool.query('SELECT approval FROM guests WHERE LOWER(email) = $1 ORDER BY id LIMIT 1', [req.userEmail]);
       if (!g.rowCount) return res.status(403).json({ error: 'That account is no longer on the roster.' });
+      if (g.rows[0].approval && g.rows[0].approval !== 'APPROVED') {
+        return res.status(403).json({ error: "You're not approved yet. We'll email you when you are.", code: 'NOT_APPROVED' });
+      }
       const pkg = packageId
         ? await pool.query('SELECT id, price_cents, currency, active FROM packages WHERE id = $1', [packageId]) : { rows: [] };
       const p = pkg.rows[0];
@@ -216,8 +220,8 @@ export function registerPricing({ app, pool, requireAuth, requireAdmin, rateLimi
   });
 
   // Adds a code to the guest's unpaid reservation, or takes it off (empty code). The order's list price stays the
-  // one it was reserved at. A code that brings it to 0 confirms it as a free pass.
-  app.post('/api/orders/promo', requireAuth, rateLimit(10, HOUR_MS, perUser), async (req, res) => {
+  // one it was reserved at. A code that brings it to 0 confirms it as a free pass. Approved guests only.
+  app.post('/api/orders/promo', requireAuth, rateLimit(10, HOUR_MS, perUser), requireApproved, async (req, res) => {
     const code = cleanCode(req.body?.code);
     if (code && tooManyWrongCodes(req)) return res.status(429).json(WRONG_CODES);
     let client;

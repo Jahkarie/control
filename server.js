@@ -16,6 +16,9 @@ import { registerReset } from './reset.js';
 import QRCode from 'qrcode';
 
 const { Pool } = pkg;
+// DATE columns (guests.birth_date) come back as their 'YYYY-MM-DD' text. pg would otherwise turn them into a JS Date
+// at local midnight, which shifts the day when sent as JSON from a server that isn't on UTC.
+pkg.types.setTypeParser(1082, (v) => v);
 
 // ---------- Config ----------
 const { TOKEN_SECRET, ADMIN_KEY } = process.env;
@@ -69,6 +72,111 @@ const serverError = (res, err, msg = 'Server error.') => {
   console.error(err);
   res.status(500).json({ error: msg });
 };
+
+// ---------- Sign-up profile: name as on their ID, date of birth, Instagram ----------
+// The name as typed, tidied: curly apostrophes and dashes made plain, invisible characters dropped, spaces collapsed.
+// NFKC turns styled letters copied from a bio (\uD835\uDC09\uD835\uDC28\uD835\uDC21\uD835\uDC27, \uFF2A\uFF4F\uFF48\uFF4E) into plain ones, so staff can search and read them.
+// The acute accent \u00B4 becomes ' before that, since NFKC would turn it into a space and an accent.
+// Invisible characters include the Hangul fillers, which count as letters but show as blank.
+// 2-80 characters of letters (any alphabet), accents and ' . , - starting with a letter, else null.
+function cleanName(v) {
+  if (typeof v !== 'string') return null;
+  const s = v.replace(/[\u2019\u2018\u02BC\u00B4]/g, "'").normalize('NFKC')
+    .replace(/[\u2019\u2018\u02BC\u00B4]/g, "'")
+    .replace(/[\u2010\u2011\u2013\u2014\u2212]/g, '-')
+    .replace(/[\t\n\r\v\f\p{Zs}\u2028\u2029]/gu, ' ')
+    .replace(/[\p{Cf}\p{Cc}\p{Default_Ignorable_Code_Point}]/gu, '')
+    .normalize('NFC')
+    .replace(/ {2,}/g, ' ').trim();
+  const n = [...s].length;
+  return n >= 2 && n <= 80 && /^\p{L}[\p{L}\p{M}' .,-]*$/u.test(s) ? s : null;
+}
+// Today's date in Antigua as 'YYYY-MM-DD'.
+function antiguaToday() {
+  const p = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: 'America/Antigua', year: 'numeric', month: '2-digit', day: '2-digit' })
+    .formatToParts(new Date()).map((x) => [x.type, x.value]));
+  return `${p.year}-${p.month}-${p.day}`;
+}
+// Whole years between two 'YYYY-MM-DD' dates. Someone born on Feb 29 has a birthday on Mar 1 in other years.
+function ageOn(birth, today = antiguaToday()) {
+  const [by, bm, bd] = birth.split('-').map(Number), [ty, tm, td] = today.split('-').map(Number);
+  return ty - by - (tm < bm || (tm === bm && td < bd) ? 1 : 0);
+}
+// 'YYYY-MM-DD', a real date, for someone 18 to 100 today in Antigua (turning 18 today counts).
+// Returns { value, age } or { error: 'UNDER_18' | 'BAD_DATE' }.
+function cleanBirthDate(v) {
+  const m = typeof v === 'string' ? /^(\d{4})-(\d{2})-(\d{2})$/.exec(v.trim()) : null;
+  if (!m) return { error: 'BAD_DATE' };
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo - 1 || dt.getUTCDate() !== d) return { error: 'BAD_DATE' };
+  const age = ageOn(m[0]);
+  if (age < 0 || age > 100) return { error: 'BAD_DATE' };
+  if (age < 18) return { error: 'UNDER_18' };
+  return { value: m[0], age };
+}
+// "@Name", "instagram.com/name" or "https://www.instagram.com/name/?hl=en" -> "name". Instagram's own rules:
+// up to 30 of a-z 0-9 . _ with no dot at either end and no two dots in a row. Else null.
+// A link must be a profile link: a post, reel or story link (instagram.com/p/..., /reel/..., /stories/...) is refused
+// rather than saved as "p" or "reel".
+const IG_LINK = /^(https?:\/\/)?(www\.|m\.)?instagram\.com\//i;
+const IG_NOT_PROFILES = new Set(['p', 'reel', 'reels', 'stories', 'explore', 'tv', 'accounts']);
+function cleanInstagram(v) {
+  if (typeof v !== 'string') return null;
+  let s = v.trim().replace(/^@/, '');
+  if (IG_LINK.test(s)) {
+    s = s.replace(IG_LINK, '').replace(/[?#].*$/, '').replace(/\/$/, '');
+    if (s.includes('/') || IG_NOT_PROFILES.has(s.toLowerCase())) return null;
+  }
+  s = s.replace(/^@/, '').toLowerCase();
+  return /^[a-z0-9._]{1,30}$/.test(s) && !s.startsWith('.') && !s.endsWith('.') && !s.includes('..') ? s : null;
+}
+const PROFILE_FIELDS = ['full_name', 'birth_date', 'instagram'];
+const PROFILE_MSG = {
+  full_name: { PROFILE_REQUIRED: 'Enter your full name as it shows on your ID.', NAME_INVALID: 'Enter your full name as it shows on your ID, in letters.' },
+  birth_date: { PROFILE_REQUIRED: 'Enter your date of birth.', BAD_DATE: 'Check your date of birth.', UNDER_18: "On D' Road is 18+ only." },
+  instagram: { PROFILE_REQUIRED: 'Enter your Instagram handle.', INSTAGRAM_INVALID: 'Check your Instagram handle, like @yourname.' }
+};
+const ADMIN_PROFILE_MSG = { NAME_INVALID: 'Enter their full name as it shows on their ID, in letters.', BAD_DATE: 'Check the date of birth.',
+  UNDER_18: "That date of birth is under 18. On D' Road is 18+ only.", INSTAGRAM_INVALID: 'Check the Instagram handle, like @name.' };
+// Checks the profile fields in body b. mode 'all': all three required (accepting an invite). 'some': only the ones
+// sent, none of them blank (a guest's own edit). 'admin': only the ones sent; '' or null clears a field.
+// Returns { fields } (cleaned values, null = clear) or { error: { error, code, field } } for a 400.
+function profileInput(b, mode) {
+  const fields = {};
+  const fail = (field, why) => ({ error: { error: (mode === 'admin' && ADMIN_PROFILE_MSG[why]) || PROFILE_MSG[field][why],
+    code: why === 'BAD_DATE' ? 'PROFILE_REQUIRED' : why, field } });
+  for (const k of PROFILE_FIELDS) {
+    const v = b?.[k];
+    if (v === undefined) {
+      if (mode === 'all') return fail(k, 'PROFILE_REQUIRED');
+      continue;
+    }
+    if (v === null || (typeof v === 'string' && !v.trim())) {
+      if (mode !== 'admin') return fail(k, 'PROFILE_REQUIRED');
+      fields[k] = null;
+      continue;
+    }
+    if (k === 'full_name') {
+      fields[k] = cleanName(v);
+      if (!fields[k]) return fail(k, 'NAME_INVALID');
+    } else if (k === 'birth_date') {
+      const d = cleanBirthDate(v);
+      if (d.error) return fail(k, d.error);
+      fields[k] = d.value;
+    } else {
+      fields[k] = cleanInstagram(v);
+      if (!fields[k]) return fail(k, 'INSTAGRAM_INVALID');
+    }
+  }
+  return { fields };
+}
+// Who invited each guest: their ACCEPTED invite's inviter ('CONTROL' for the admin), with the inviter's name when they
+// have one, and the invite's note. Use with "FROM guests g".
+const INVITED_BY_SQL = `
+  LEFT JOIN LATERAL (SELECT i.inviter_email, i.note FROM invites i WHERE i.invitee_email = LOWER(g.email) AND i.status = 'ACCEPTED'
+                     ORDER BY i.accepted_at DESC NULLS LAST, i.id DESC LIMIT 1) inv ON TRUE
+  LEFT JOIN LATERAL (SELECT x.full_name FROM guests x WHERE LOWER(x.email) = LOWER(inv.inviter_email) LIMIT 1) inviter ON TRUE`;
 
 // ---------- Signed session tokens (no extra dependency) ----------
 const TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -125,6 +233,23 @@ const requireAdmin = (req, res, next) => {
   res.status(401).json({ error: 'Unauthorized' });
 };
 
+// The answer to a sign-up request that's still waiting for approval, or was declined.
+const notApproved = (approval) => ({
+  error: approval === 'DECLINED' ? "Your request to join wasn't approved." : "You're not approved yet. We'll email you when you are.",
+  code: 'NOT_APPROVED'
+});
+// After requireAuth: only approved guests still on the roster get through.
+const requireApproved = async (req, res, next) => {
+  try {
+    const g = await pool.query('SELECT approval FROM guests WHERE LOWER(email) = $1 ORDER BY id LIMIT 1', [req.userEmail]);
+    if (!g.rowCount) return res.status(403).json({ error: 'That account is no longer on the roster.' });
+    if (g.rows[0].approval !== 'APPROVED') return res.status(403).json(notApproved(g.rows[0].approval));
+    next();
+  } catch (err) {
+    serverError(res, err);
+  }
+};
+
 // Simple in-memory fixed-window rate limiter, per IP by default. Pass perUser (after requireAuth) to count per
 // account instead: guests on mobile data often share one IP, so per-IP limits would block real people.
 const perUser = (req) => 'u:' + req.userEmail;
@@ -162,16 +287,20 @@ const mail = registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, req
 // Event details in guests' accounts and email updates to groups of guests (see event.js).
 registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, requireAuth, requireAdmin, mail });
 // Paying online with PayPal (see paypal.js). Off until the PAYPAL_* settings are added.
-const paypal = registerPayPal({ app, pool, requireAuth, requireAdmin, rateLimit, perUser,
+const paypal = registerPayPal({ app, pool, requireAuth, requireApproved, requireAdmin, rateLimit, perUser,
   onPaid: (o) => sendPaidEmail(o.guest_email, o.package_name, o.reference_code) });
 // Price tiers and promo codes (see pricing.js). A code that makes an unpaid reservation free confirms it straight away.
-registerPricing({ app, pool, requireAuth, requireAdmin, rateLimit, perUser,
+registerPricing({ app, pool, requireAuth, requireApproved, requireAdmin, rateLimit, perUser,
   onComp: (o) => sendPaidEmail(o.guest_email, o.package_name, o.reference_code, { free: true }) });
 // Size lock and package pickup tracking (see pickup.js).
 registerPickup({ app, pool, requireAdmin });
 // Clearing guest data (or everything) to start over (see reset.js). A full reset also clears the email footer's contact details.
 registerReset({ app, pool, requireAdmin, rateLimit, afterReset: () => site.refresh() });
-const ADMIN_EMAIL = normalizeEmail(process.env.ADMIN_EMAIL); // optional: gets a copy of refund requests
+const ADMIN_EMAIL = normalizeEmail(process.env.ADMIN_EMAIL); // optional: gets refund requests and new sign-up requests
+// The backend's own address, for links in emails (pass images, the admin's "Review requests" button). '' if unknown.
+const PUBLIC_URL = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
+// Where the "You're approved" email sends guests.
+const SITE_URL = process.env.FRONTEND_URL ? FRONTEND_URL : 'https://ondroad.xyz';
 
 // Creates the packages/orders/settings tables and any missing columns on startup,
 // so no SQL has to be run by hand in Aiven. Safe to run every boot.
@@ -278,6 +407,12 @@ async function ensureSchema() {
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS pay_by TIMESTAMPTZ;
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS picked_up_at TIMESTAMPTZ;
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS picked_up_by TEXT;
+    ALTER TABLE guests ADD COLUMN IF NOT EXISTS full_name TEXT;
+    ALTER TABLE guests ADD COLUMN IF NOT EXISTS birth_date DATE;
+    ALTER TABLE guests ADD COLUMN IF NOT EXISTS instagram TEXT;
+    ALTER TABLE guests ADD COLUMN IF NOT EXISTS approval TEXT NOT NULL DEFAULT 'APPROVED';
+    ALTER TABLE guests ADD COLUMN IF NOT EXISTS applied_at TIMESTAMPTZ;
+    ALTER TABLE guests ADD COLUMN IF NOT EXISTS decided_at TIMESTAMPTZ;
     CREATE INDEX IF NOT EXISTS orders_tier_idx ON orders (tier_id);
     CREATE INDEX IF NOT EXISTS orders_promo_idx ON orders (promo_code);
   `);
@@ -340,14 +475,69 @@ app.post('/api/login/verify', rateLimit(60, 15 * 60 * 1000), async (req, res) =>
   }
 });
 
+// The guest's row (birth_date as 'YYYY-MM-DD') plus has_paid (a PAID order, free passes included: their name and date of
+// birth are locked and invites are open) and who invited them (email or 'CONTROL', and their name). null if not found.
+async function guestStatus(db, email) {
+  const r = await db.query(
+    `SELECT g.*, inv.inviter_email AS invited_by, inviter.full_name AS invited_by_name,
+            EXISTS (SELECT 1 FROM orders o WHERE LOWER(o.guest_email) = LOWER(g.email) AND o.status = 'PAID') AS has_paid
+     FROM guests g ${INVITED_BY_SQL}
+     WHERE LOWER(g.email) = $1 ORDER BY g.id LIMIT 1`, [email]);
+  return r.rows[0] || null;
+}
+
 // --- FETCH USER DATA ---
 app.get('/api/user-status', requireAuth, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM guests WHERE LOWER(email) = $1', [req.userEmail]);
-    if (!result.rows.length) return res.status(404).json({ error: 'Guest not found' });
-    res.json(result.rows[0]);
+    const guest = await guestStatus(pool, req.userEmail);
+    if (!guest) return res.status(404).json({ error: 'Guest not found' });
+    res.json(guest);
   } catch (err) {
     serverError(res, err);
+  }
+});
+
+// --- SAVE THE GUEST'S PROFILE ---
+// Name and date of birth can be filled in when empty, and changed until the guest has a paid order (a free pass
+// counts). After that only the admin can change them. Instagram can change any time.
+app.post('/api/profile', requireAuth, rateLimit(20, 60 * 60 * 1000, perUser), async (req, res) => {
+  const { fields, error } = profileInput(req.body || {}, 'some');
+  if (error) return res.status(400).json(error);
+  if (!Object.keys(fields).length) return res.status(400).json({ error: 'Nothing to save.', code: 'PROFILE_REQUIRED' });
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query('BEGIN');
+    // Locked like remove-guest does: no new order (a free pass is PAID at once) can slip in, and a payment going
+    // through right now finishes before we look.
+    const g = await client.query('SELECT id, full_name, birth_date, instagram FROM guests WHERE LOWER(email) = $1 ORDER BY id FOR UPDATE', [req.userEmail]);
+    if (!g.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'That account is no longer on the roster.' });
+    }
+    const cur = g.rows[0];
+    const open = await client.query(
+      "SELECT status FROM orders WHERE LOWER(guest_email) = $1 AND status <> 'CANCELLED' ORDER BY id FOR UPDATE", [req.userEmail]);
+    const paid = open.rows.some((o) => o.status === 'PAID');
+    const changes = Object.keys(fields).filter((k) => fields[k] !== cur[k]);
+    if (paid && changes.some((k) => k !== 'instagram' && cur[k] !== null)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: "Your name and date of birth are locked now that you've paid. Message us to change them.", code: 'PROFILE_LOCKED' });
+    }
+    if (changes.length) {
+      // Fixed column names from PROFILE_FIELDS, never from the request.
+      await client.query(
+        `UPDATE guests SET ${changes.map((k, n) => `${k} = $${n + 2}`).join(', ')},
+                age_confirmed_at = CASE WHEN ${changes.includes('birth_date') ? 'TRUE' : 'birth_date IS NOT NULL'} THEN COALESCE(age_confirmed_at, NOW()) ELSE age_confirmed_at END
+         WHERE id = $1`, [cur.id, ...changes.map((k) => fields[k])]);
+    }
+    await client.query('COMMIT');
+    res.json({ success: true, guest: await guestStatus(pool, req.userEmail) });
+  } catch (err) {
+    await client?.query('ROLLBACK').catch(() => {});
+    serverError(res, err);
+  } finally {
+    client?.release();
   }
 });
 
@@ -368,7 +558,13 @@ app.post('/api/update-rsvp', requireAuth, async (req, res) => {
   const rsvp_status = typeof req.body?.rsvp_status === 'string' ? req.body.rsvp_status.trim() : '';
   if (!['CONFIRMED', 'PENDING'].includes(rsvp_status)) return res.status(400).json({ error: 'Invalid RSVP status.' });
   try {
-    await pool.query('UPDATE guests SET rsvp_status = $1 WHERE LOWER(email) = $2', [rsvp_status, req.userEmail]);
+    // Only approved guests: a request still waiting (or declined) mustn't count as confirmed attendance.
+    const r = await pool.query("UPDATE guests SET rsvp_status = $1 WHERE LOWER(email) = $2 AND approval = 'APPROVED'", [rsvp_status, req.userEmail]);
+    if (!r.rowCount) {
+      const g = await pool.query('SELECT approval FROM guests WHERE LOWER(email) = $1 ORDER BY id LIMIT 1', [req.userEmail]);
+      if (!g.rowCount) return res.status(403).json({ error: 'That account is no longer on the roster.' });
+      return res.status(403).json(notApproved(g.rows[0].approval));
+    }
     res.json({ success: true, rsvp_status });
   } catch (err) {
     serverError(res, err);
@@ -420,9 +616,27 @@ app.post('/api/send-invite', requireAuth, rateLimit(20, 60 * 60 * 1000, perUser)
     client = await pool.connect();
     await client.query('BEGIN');
 
+    // Only approved guests on the roster can invite. Their row stays locked until the invite is saved.
+    const me = await client.query('SELECT approval FROM guests WHERE LOWER(email) = $1 ORDER BY id FOR UPDATE', [sender]);
+    if (!me.rowCount || me.rows[0].approval !== 'APPROVED') {
+      await client.query('ROLLBACK');
+      return res.status(403).json(me.rowCount ? notApproved(me.rows[0].approval) : { error: 'That account is no longer on the roster.' });
+    }
+
+    // Invites open once the sender has paid (a free pass counts).
+    const paid = await client.query("SELECT 1 FROM orders WHERE LOWER(guest_email) = $1 AND status = 'PAID' LIMIT 1", [sender]);
+    if (!paid.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: "Invites open once you've paid.", code: 'PAY_FIRST' });
+    }
+
+    // Someone on the roster (pending and declined requests included) or with an open invite can't be invited again.
+    // Once removed from the roster, they can be, unless they still hold an order that isn't cancelled (a guest
+    // removed while their pass was live; coming back as a new request would leave that pass working).
     const dup = await client.query(
       `SELECT 1 FROM guests WHERE LOWER(email) = $1
-       UNION SELECT 1 FROM invites WHERE invitee_email = $1 AND status <> 'REVOKED'`, [recipient]);
+       UNION SELECT 1 FROM invites WHERE invitee_email = $1 AND status = 'PENDING'
+       UNION SELECT 1 FROM orders WHERE LOWER(guest_email) = $1 AND status <> 'CANCELLED'`, [recipient]);
     if (dup.rowCount) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'That person has already been invited.' });
@@ -466,36 +680,82 @@ app.get('/api/invite/:token', rateLimit(120, 15 * 60 * 1000), async (req, res) =
   }
 });
 
+// "Jane Doe (jane@x.com)", the email alone, or "You" for the admin's own invites.
+const inviterLabel = (inviterEmail, inviterName, you = 'You') =>
+  inviterEmail === 'CONTROL' ? you : inviterName ? `${inviterName} (${inviterEmail})` : inviterEmail || 'Unknown';
+
+// Tells the admin someone is waiting for approval. Returns an error (or null). Never throws.
+async function sendRequestEmail(g) {
+  if (!ADMIN_EMAIL) return null;
+  try {
+    const by = inviterLabel(g.invited_by, g.invited_by_name);
+    return await mail.send(ADMIN_EMAIL, `New request: ${g.full_name}`, renderEmail({
+      tone: 'warn', tag: 'Waiting for you', title: 'New request',
+      preheader: `${g.full_name} wants in. Invited by ${by}.`,
+      lines: [`${g.full_name} accepted their invite and is waiting for your approval.`,
+        "Check they're someone you want on the road, then approve or decline them in the Requests tab. A declined request gets no email."],
+      details: [['Name', g.full_name], ['Age', g.birth_date ? String(ageOn(g.birth_date)) : null], ['Instagram', g.instagram ? '@' + g.instagram : null],
+        ['Email', g.email, true], ['Invited by', by]],
+      quote: g.invite_note ? { from: by, text: g.invite_note } : null,
+      cta: PUBLIC_URL ? { text: 'Review requests', url: `${PUBLIC_URL}/admin#requests` } : null
+    }));
+  } catch (err) {
+    console.error('Request email error:', err);
+    return err;
+  }
+}
+
 // --- ACCEPT AN INVITE: joins the roster with two invites and logs in ---
+// The sign-up form sends the guest's name as on their ID, date of birth and Instagram. They're checked before anything
+// is written, so a mistake never uses up the invite. A new guest waits for the admin's approval (PENDING), except on
+// the admin's own invites. Someone the admin had already added keeps their status and gets any missing details filled in.
 app.post('/api/invite/accept', rateLimit(40, 15 * 60 * 1000), async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   const bad = 'Invitation invalid, already used, or not issued to that email.';
-  if (req.body?.adult !== true) return res.status(400).json({ error: "On D' Road is 18+ only. Confirm you're 18 or older to accept." });
-  let client;
+  const b = req.body || {};
+  // A page cached from before the sign-up form sends none of the fields.
+  if (!PROFILE_FIELDS.some((k) => b[k] !== undefined)) {
+    return res.status(400).json({ error: 'Reload the page and fill in your details.', code: 'PROFILE_REQUIRED' });
+  }
+  const { fields: p, error } = profileInput(b, 'all');
+  if (error) return res.status(400).json(error);
+  let client, guest;
   try {
     client = await pool.connect();
     await client.query('BEGIN');
     const r = await client.query(
-      'SELECT id, invitee_email, status FROM invites WHERE token_hash = $1 FOR UPDATE', [hashToken(req.body?.token)]);
+      'SELECT id, invitee_email, inviter_email, note, status FROM invites WHERE token_hash = $1 FOR UPDATE', [hashToken(b.token)]);
     const inv = r.rows[0];
     if (!inv || inv.status !== 'PENDING' || inv.invitee_email !== email) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: bad });
     }
-    await client.query(
-      `INSERT INTO guests (email, rsvp_status, shirt_size, invites_left)
-       SELECT $1::text, 'PENDING', 'Unassigned', 2
-       WHERE NOT EXISTS (SELECT 1 FROM guests WHERE LOWER(email) = $1::text)`, [email]);
-    await client.query('UPDATE guests SET age_confirmed_at = NOW() WHERE LOWER(email) = $1 AND age_confirmed_at IS NULL', [email]);
+    const approval = inv.inviter_email === 'CONTROL' ? 'APPROVED' : 'PENDING';
+    const created = await client.query(
+      `INSERT INTO guests (email, rsvp_status, shirt_size, invites_left, full_name, birth_date, instagram, approval, applied_at, age_confirmed_at)
+       SELECT $1::text, 'PENDING', 'Unassigned', 2, $2, $3::date, $4, $5, NOW(), NOW()
+       WHERE NOT EXISTS (SELECT 1 FROM guests WHERE LOWER(email) = $1::text)`,
+      [email, p.full_name, p.birth_date, p.instagram, approval]);
+    if (!created.rowCount) {
+      // Already on the roster (the admin added them): only fill in what's missing.
+      await client.query(
+        `UPDATE guests SET full_name = COALESCE(full_name, $2), birth_date = COALESCE(birth_date, $3::date),
+                instagram = COALESCE(instagram, $4), age_confirmed_at = COALESCE(age_confirmed_at, NOW())
+         WHERE LOWER(email) = $1`, [email, p.full_name, p.birth_date, p.instagram]);
+    }
     await client.query("UPDATE invites SET status = 'ACCEPTED', accepted_at = NOW() WHERE id = $1", [inv.id]);
+    guest = await guestStatus(client, email);
+    if (guest) guest.invite_note = inv.note || '';
     await client.query('COMMIT');
-    res.json({ success: true, token: createToken(email), user: { email } });
   } catch (err) {
     await client?.query('ROLLBACK').catch(() => {});
-    serverError(res, err);
+    return serverError(res, err);
   } finally {
     client?.release();
   }
+  res.json({ success: true, token: createToken(email), user: { email, approval: guest?.approval || 'APPROVED' } });
+  // Sent after responding so a slow email never holds up the guest.
+  if (guest && guest.approval === 'PENDING') sendRequestEmail(guest);
 });
 
 // --- ADMIN: create an invite without using anyone's allowance; returns the link ---
@@ -505,10 +765,13 @@ app.post('/api/admin/create-invite', requireAdmin, async (req, res) => {
   if (!isValidEmail(email)) return res.status(400).json({ error: 'A valid email is required.' });
   const token = newInviteToken();
   try {
+    // As in send-invite: a removed guest whose order isn't cancelled can't come back through an invite.
     const dup = await pool.query(
       `SELECT 1 FROM guests WHERE LOWER(email) = $1
-       UNION SELECT 1 FROM invites WHERE invitee_email = $1 AND status <> 'REVOKED'`, [email]);
+       UNION SELECT 1 FROM invites WHERE invitee_email = $1 AND status = 'PENDING'`, [email]);
     if (dup.rowCount) return res.status(400).json({ error: 'That person is already on the roster or invited.' });
+    const live = await pool.query("SELECT 1 FROM orders WHERE LOWER(guest_email) = $1 AND status <> 'CANCELLED' LIMIT 1", [email]);
+    if (live.rowCount) return res.status(400).json({ error: 'They still have an order from before they were removed. Use "Add to roster" instead.' });
     await pool.query(
       "INSERT INTO invites (token_hash, inviter_email, invitee_email, note) VALUES ($1, 'CONTROL', $2, $3)",
       [hashToken(token), email, note]);
@@ -526,7 +789,7 @@ app.post('/api/admin/create-invite', requireAdmin, async (req, res) => {
 app.get('/api/packages', async (req, res) => {
   try {
     const r = await pool.query(
-      `SELECT p.id, p.name, p.price_cents, p.currency, p.includes, p.requires_compliance, p.capacity, p.sizes,
+      `SELECT p.id, p.name, p.price_cents, p.currency, p.includes, p.requires_compliance, p.capacity, p.sizes, p.pay_note,
               GREATEST(0, COALESCE(p.capacity, 2147483647) - (SELECT COUNT(*) FROM orders o WHERE o.package_id = p.id AND o.status <> 'CANCELLED'))::int AS spots_left
        FROM packages p WHERE p.active = TRUE ORDER BY p.sort_order ASC, p.id ASC`);
     const tiers = await loadTiers(pool, r.rows.map((p) => p.id));
@@ -670,18 +933,23 @@ app.post('/api/orders', requireAuth, rateLimit(10, 60 * 60 * 1000, perUser), rat
     const settings = await mail.getSettings();
     client = await pool.connect();
     await client.query('BEGIN');
-    // Guests who joined before the 18+ check (or were added by the admin) confirm here, once.
-    const guest = await client.query('SELECT age_confirmed_at FROM guests WHERE LOWER(email) = $1 FOR UPDATE', [req.userEmail]);
+    // The guest row stays locked until the order is saved, so two quick reservations can't both go through.
+    const guest = await client.query(
+      'SELECT approval, full_name, birth_date, instagram FROM guests WHERE LOWER(email) = $1 ORDER BY id FOR UPDATE', [req.userEmail]);
     if (!guest.rowCount) {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'That account is no longer on the roster.' });
     }
-    if (!guest.rows[0].age_confirmed_at) {
-      if (req.body?.adult !== true) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: "Confirm you're 18 or older to reserve a package.", code: 'AGE_REQUIRED' });
-      }
-      await client.query('UPDATE guests SET age_confirmed_at = NOW() WHERE LOWER(email) = $1', [req.userEmail]);
+    const g = guest.rows[0];
+    if (g.approval !== 'APPROVED') {
+      await client.query('ROLLBACK');
+      return res.status(403).json(notApproved(g.approval));
+    }
+    // The date of birth is the 18+ check. The profile is saved through /api/profile, never here.
+    // "Reload the page" is for a page cached from before the profile form, which can only show this message.
+    if (!g.full_name || !g.birth_date || !g.instagram) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Finish your profile first: your name, date of birth and Instagram. Reload the page to add them.', code: 'PROFILE_REQUIRED' });
     }
     const existing = await client.query("SELECT 1 FROM orders WHERE guest_email = $1 AND status <> 'CANCELLED'", [req.userEmail]);
     if (existing.rowCount) {
@@ -913,7 +1181,6 @@ const passText = (ref, email) => `ONDROAD:${ref}:${String(email).toLowerCase()}`
 const passPng = (ref, email) => QRCode.toBuffer(passText(ref, email), { width: 440, margin: 2, errorCorrectionLevel: 'M' });
 // The emailed image URL is signed so pass images can't be fetched by guessing references.
 const passSig = (ref) => sign('pass:' + ref).slice(0, 22);
-const PUBLIC_URL = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
 
 // Only paid orders have a pass: after a refund the emailed image stops loading.
 app.get('/api/pass/:ref.png', rateLimit(300, 15 * 60 * 1000), async (req, res) => {
@@ -1027,10 +1294,81 @@ app.post('/api/admin/orders/:id/approve-refund', requireAdmin, async (req, res) 
 });
 
 // ---------- Admin ----------
+// Every guest with their age today (Antigua), who invited them and the invite's note, in one query.
 app.get('/api/admin/guests', requireAdmin, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM guests ORDER BY id ASC');
+    const result = await pool.query(
+      `SELECT g.*, date_part('year', age((NOW() AT TIME ZONE 'America/Antigua')::date, g.birth_date))::int AS age,
+              inv.inviter_email AS invited_by, inviter.full_name AS invited_by_name, inv.note AS invite_note
+       FROM guests g ${INVITED_BY_SQL}
+       ORDER BY g.id ASC`);
     res.json(result.rows);
+  } catch (err) {
+    serverError(res, err);
+  }
+});
+
+// Approves a sign-up request, pending or declined, and emails the guest. A second click finds nothing left to
+// approve, so the email goes once.
+app.post('/api/admin/guests/approve', requireAdmin, async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+  if (!isValidEmail(email)) return res.status(400).json({ error: 'A valid email is required.' });
+  try {
+    const r = await pool.query(
+      `UPDATE guests SET approval = 'APPROVED', decided_at = NOW()
+       WHERE LOWER(email) = $1 AND approval IN ('PENDING', 'DECLINED') RETURNING email, full_name`, [email]);
+    if (!r.rowCount) {
+      const g = await pool.query('SELECT approval FROM guests WHERE LOWER(email) = $1', [email]);
+      if (!g.rowCount) return res.status(404).json({ error: 'That guest is not on the roster.' });
+      return res.json({ success: true, already: true, emailed: false });
+    }
+    const first = String(r.rows[0].full_name || '').split(' ')[0];
+    const emailError = await mail.send(email, "You're approved — On D' Road", renderEmail({
+      tone: 'good', tag: 'Approved', title: "You're approved",
+      preheader: 'Pick your package to hold your spot.',
+      lines: [`${first ? first + ', you' : 'You'}'re in. Pick your package.`,
+        'Log in with this email address, choose your package and reserve it to hold your spot. Your entry pass shows up once you pay.'],
+      cta: { text: 'Pick your package', url: SITE_URL }
+    }));
+    res.json({ success: true, emailed: !emailError });
+  } catch (err) {
+    serverError(res, err);
+  }
+});
+
+// Declines a pending request. Nothing is sent, the invite stays used, and the inviter doesn't get it back.
+app.post('/api/admin/guests/decline', requireAdmin, async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+  if (!isValidEmail(email)) return res.status(400).json({ error: 'A valid email is required.' });
+  try {
+    const r = await pool.query(
+      "UPDATE guests SET approval = 'DECLINED', decided_at = NOW() WHERE LOWER(email) = $1 AND approval = 'PENDING'", [email]);
+    if (!r.rowCount) {
+      const g = await pool.query('SELECT approval FROM guests WHERE LOWER(email) = $1', [email]);
+      if (!g.rowCount) return res.status(404).json({ error: 'That guest is not on the roster.' });
+      if (g.rows[0].approval === 'DECLINED') return res.json({ success: true, already: true });
+      return res.status(409).json({ error: 'Only pending requests can be declined.' });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    serverError(res, err);
+  }
+});
+
+// The admin can always change a guest's name, date of birth and Instagram, paid or not. '' clears a field.
+app.post('/api/admin/guests/profile', requireAdmin, async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+  if (!isValidEmail(email)) return res.status(400).json({ error: 'A valid email is required.' });
+  const { fields, error } = profileInput(req.body || {}, 'admin');
+  if (error) return res.status(400).json(error);
+  const cols = Object.keys(fields); // fixed names from PROFILE_FIELDS, never from the request
+  try {
+    const r = cols.length
+      ? await pool.query(`UPDATE guests SET ${cols.map((c, n) => `${c} = $${n + 2}`).join(', ')} WHERE LOWER(email) = $1`,
+        [email, ...cols.map((c) => fields[c])])
+      : await pool.query('SELECT 1 FROM guests WHERE LOWER(email) = $1', [email]);
+    if (!r.rowCount) return res.status(404).json({ error: 'That guest is not on the roster.' });
+    res.json({ success: true, guest: await guestStatus(pool, email) });
   } catch (err) {
     serverError(res, err);
   }
@@ -1335,6 +1673,10 @@ td.actions .btn + .btn { margin-left: 6px; }
 .subtext.bad { color: var(--bad); }
 td.num .subtext { margin-left: auto; }
 .empty-row td { text-align: center; color: var(--muted); padding: 40px 14px; }
+.subtext .pill { margin-top: 2px; }
+td.note { max-width: 260px; white-space: normal; color: var(--muted); font-size: 13.5px; overflow-wrap: anywhere; }
+a.ig { color: var(--cyan); font-weight: 700; text-decoration: none; overflow-wrap: anywhere; }
+a.ig:hover { text-decoration: underline; text-underline-offset: 3px; }
 
 /* Status pills: tinted, outlined, always readable */
 .pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px 3px; border-radius: 999px; font-family: var(--mono); font-size: 10.5px; font-weight: 700; letter-spacing: .06em; line-height: 1.3; text-transform: uppercase; white-space: nowrap; border: 1px solid var(--line-strong); color: var(--muted); }
@@ -1428,6 +1770,7 @@ dialog p { margin: 10px 0 0; color: var(--muted); font-size: 14px; }
   </div>
 
   <div id="alert" class="alert hidden"><span id="alert-text"></span><button class="btn small" id="alert-go" type="button">Review</button></div>
+  <div id="req-alert" class="alert hidden"><span id="req-alert-text"></span><button class="btn small" id="req-alert-go" type="button">Review</button></div>
 
   <section class="kpis" id="stats" aria-label="Key numbers"></section>
 
@@ -1455,6 +1798,7 @@ dialog p { margin: 10px 0 0; color: var(--muted); font-size: 14px; }
 
   <div class="tabs" role="tablist" aria-label="Sections">
     <button class="tab on" id="tab-g" role="tab" aria-selected="true" type="button">Guests <span class="count" id="c-g"></span></button>
+    <button class="tab" id="tab-r" role="tab" aria-selected="false" type="button">Requests <span class="count" id="c-r"></span><span class="ping hidden" id="r-ping"></span></button>
     <button class="tab" id="tab-i" role="tab" aria-selected="false" type="button">Invites <span class="count" id="c-i"></span></button>
     <button class="tab" id="tab-p" role="tab" aria-selected="false" type="button">Packages <span class="count" id="c-p"></span></button>
     <button class="tab" id="tab-o" role="tab" aria-selected="false" type="button">Orders <span class="count" id="c-o"></span><span class="ping hidden" id="o-ping"></span></button>
@@ -1463,11 +1807,19 @@ dialog p { margin: 10px 0 0; color: var(--muted); font-size: 14px; }
 
   <section class="panel" id="guests-panel" role="tabpanel">
     <div class="toolbar">
-      <input id="search" class="grow" placeholder="Search by email" type="search">
+      <input id="search" class="grow" placeholder="Search name, email or Instagram" type="search">
       <select id="filter" aria-label="Attendance filter"><option value="">All attendance</option><option value="CONFIRMED">Confirmed</option><option value="PENDING">Pending</option></select>
       <button class="btn ghost" id="csv-btn" type="button">Export CSV</button>
     </div>
-    <div class="scroll"><table class="cards"><thead><tr><th class="num">#</th><th>Email</th><th>Attendance</th><th>Package</th><th class="num">Invites left</th><th></th></tr></thead><tbody id="roster"></tbody></table></div>
+    <div class="scroll"><table class="cards"><thead><tr><th class="num">#</th><th>Guest</th><th>Attendance</th><th>Package</th><th class="num">Invites left</th><th></th></tr></thead><tbody id="roster"></tbody></table></div>
+  </section>
+
+  <section class="panel hidden" id="requests-panel" role="tabpanel">
+    <div class="toolbar">
+      <input id="req-search" class="grow" placeholder="Search name, email or Instagram" type="search">
+      <select id="req-filter" aria-label="Request filter"><option value="PENDING">Pending</option><option value="DECLINED">Declined</option></select>
+    </div>
+    <div class="scroll"><table class="cards"><thead><tr><th>Name</th><th class="num">Age</th><th>Instagram</th><th>Email</th><th>Invited by</th><th>Note</th><th>Applied</th><th></th></tr></thead><tbody id="reqlist"></tbody></table></div>
   </section>
 
   <section class="panel hidden" id="invites-panel" role="tabpanel">
@@ -1501,7 +1853,7 @@ dialog p { margin: 10px 0 0; color: var(--muted); font-size: 14px; }
 
   <section class="panel hidden" id="orders-panel" role="tabpanel">
     <div class="toolbar">
-      <input id="order-search" class="grow" placeholder="Search email or reference" type="search">
+      <input id="order-search" class="grow" placeholder="Search name, email or reference" type="search">
       <select id="order-filter" aria-label="Order status filter"><option value="">All orders</option><option value="REFUND">Refund requests</option><option value="RESERVED">Awaiting payment</option><option value="PAID">Paid</option><option value="COMP">Free passes</option><option value="COLLECTED">Package collected</option><option value="UNCOLLECTED">Paid, not collected</option><option value="CHECKED">Checked in</option><option value="CANCELLED">Cancelled</option></select>
       <button class="btn ghost" id="orders-csv-btn" type="button">Export orders CSV</button>
     </div>
@@ -1540,6 +1892,7 @@ dialog p { margin: 10px 0 0; color: var(--muted); font-size: 14px; }
 const $ = (id) => document.getElementById(id);
 const NL = String.fromCharCode(10);
 let guests = [], invites = [], products = [], orders = [], checkins = [];
+let guestByEmail = new Map();
 
 async function api(path, body) {
   const opts = body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : undefined;
@@ -1643,6 +1996,28 @@ function actionBtn(label, cls, fn) {
   return b;
 }
 
+// ---------- Search ----------
+// Lowercase, without accents or apostrophes, so "zoe oneil" finds "Zoë O'Neil". Built without regexes: this script
+// sits inside a template literal on the server, which would eat their backslashes.
+const MARKS = [768, 879]; // combining accents, U+0300 to U+036F, left over once letters are decomposed
+const APOSTROPHES = "'" + String.fromCharCode(8216, 8217, 700, 96, 180);
+const FOLD = {};
+[[248, 'o'], [216, 'o'], [322, 'l'], [321, 'l'], [223, 'ss'], [230, 'ae'], [198, 'ae'], [339, 'oe'], [338, 'oe'], [273, 'd'], [272, 'd'], [240, 'd'], [208, 'd'], [254, 'th'], [222, 'th'], [305, 'i']]
+  .forEach((p) => { FOLD[String.fromCharCode(p[0])] = p[1]; });
+function fold(v) {
+  return Array.from(String(v === null || v === undefined ? '' : v).normalize('NFD'))
+    .filter((c) => { const n = c.charCodeAt(0); return (n < MARKS[0] || n > MARKS[1]) && !APOSTROPHES.includes(c); })
+    .map((c) => FOLD[c] || c).join('').toLowerCase();
+}
+// Every word typed must appear somewhere in the fields, in any order.
+function matches(q, fields) {
+  const words = fold(q).split(' ').filter(Boolean);
+  if (!words.length) return true;
+  const hay = fold(fields.join(' '));
+  return words.every((w) => hay.includes(w));
+}
+const nameOf = (email) => { const g = guestByEmail.get(String(email).toLowerCase()); return (g && g.full_name) || ''; };
+
 // ---------- Derived data ----------
 const isRefundRequest = (o) => o.status === 'PAID' && !!o.cancel_requested_at;
 const amountOf = (o) => Number(o.amount_cents ?? o.price_cents);
@@ -1657,6 +2032,30 @@ function totals(list) {
   const keys = Object.keys(t);
   return keys.length ? keys.map((c) => money(t[c], c)).join(' + ') : money(0, 'XCD');
 }
+// Sign-up approval: pending and declined requests get a pill; approved guests don't.
+function approvalPill(g) {
+  if (g.approval === 'PENDING') return pill('Pending approval', 'warn');
+  if (g.approval === 'DECLINED') return pill('Declined', 'bad');
+  return null;
+}
+// Who invited them, for the admin: the admin's own invites are "You".
+function invitedBy(g) { return !g.invited_by ? '' : g.invited_by === 'CONTROL' ? 'You' : (g.invited_by_name || g.invited_by); }
+function igLink(handle) {
+  const a = el('a', '@' + handle, 'ig');
+  a.href = 'https://instagram.com/' + encodeURIComponent(handle);
+  a.target = '_blank'; a.rel = 'noopener noreferrer';
+  return a;
+}
+const hasPaid = (email) => orders.some((o) => String(o.guest_email).toLowerCase() === String(email).toLowerCase() && o.status === 'PAID');
+const profileMissing = (g) => !g.full_name || !g.birth_date || !g.instagram;
+async function approve(g) {
+  const who = g.full_name || g.email;
+  const v = await ask({ title: 'Approve ' + who + '?', text: (g.approval === 'DECLINED' ? 'You declined them before. ' : '') + "They get an email saying they're in, and can pick a package.", ok: 'Approve' });
+  if (!v) return false;
+  const r = await api('/api/admin/guests/approve', { email: g.email });
+  return r.already ? who + ' was already approved.' : r.emailed ? 'Approved. ' + who + ' has been emailed.' : 'Approved, but the email failed to send.';
+}
+
 function orderPill(o) {
   if (!o) return pill('None', 'neutral');
   if (isRefundRequest(o)) return pill(isFree(o) ? 'Cancel requested' : 'Refund requested', 'warn');
@@ -1694,6 +2093,9 @@ function renderStats() {
   const refunds = orders.filter(isRefundRequest).length;
   $('alert').classList.toggle('hidden', !refunds);
   $('alert-text').textContent = plural(refunds, 'refund request is', 'refund requests are') + ' waiting for your approval.';
+  const waiting = guests.filter((g) => g.approval === 'PENDING').length;
+  $('req-alert').classList.toggle('hidden', !waiting);
+  $('req-alert-text').textContent = plural(waiting, 'person', 'people') + ' waiting for approval';
 }
 
 function showTip(e, value, label) {
@@ -1747,18 +2149,39 @@ function renderSales() {
 }
 
 function renderGuests() {
-  const q = $('search').value.trim().toLowerCase(), f = $('filter').value;
+  const q = $('search').value.trim(), f = $('filter').value;
   const tbody = $('roster'); tbody.replaceChildren();
-  const list = guests.filter((g) => g.email.toLowerCase().includes(q) && (!f || (g.rsvp_status || 'PENDING') === f));
+  const list = guests.filter((g) => matches(q, [g.full_name, g.email, g.instagram]) && (!f || (g.rsvp_status || 'PENDING') === f));
   if (!list.length) return emptyRow(tbody, 6, guests.length ? 'No guests match.' : 'No guests yet. Add someone above.');
   list.forEach((g, i) => {
     const tr = el('tr');
     td(tr, i + 1, 'num mono idx');
-    td(tr, g.email, 'strong');
+    // The name as on their ID, the email under it, then their profile and a Pending/Declined pill.
+    const who = td(tr, g.full_name || g.email, 'strong');
+    if (g.full_name) who.appendChild(el('span', g.email, 'subtext'));
+    const facts = [];
+    if (g.age !== null && g.age !== undefined) facts.push('Age ' + g.age);
+    if (g.instagram) facts.push('@' + g.instagram);
+    if (facts.length) who.appendChild(el('span', facts.join(' · '), 'subtext'));
+    else if (profileMissing(g)) who.appendChild(el('span', 'Profile not filled in yet', 'subtext'));
+    const ap = approvalPill(g);
+    if (ap) { const w = el('span', undefined, 'subtext'); w.appendChild(ap); who.appendChild(w); }
     td(tr, '').appendChild(g.rsvp_status === 'CONFIRMED' ? pill('Confirmed', 'good') : pill('Pending', 'neutral'));
     td(tr, '').appendChild(orderPill(latestOrderFor(g.email)));
     td(tr, g.invites_left, 'num');
     const act = td(tr, '', 'actions');
+    if (g.approval === 'PENDING' || g.approval === 'DECLINED') act.appendChild(actionBtn('Approve', 'good', () => approve(g)));
+    act.appendChild(actionBtn('Edit profile', 'ghost', async () => {
+      const paidNote = hasPaid(g.email) ? ' They have paid, so only you can change their name and date of birth now.' : '';
+      const v = await ask({ title: 'Edit profile', text: g.email + '.' + paidNote + ' An empty field is cleared.', ok: 'Save profile', fields: [
+        { name: 'full_name', label: 'Full name (as on their ID)', value: g.full_name || '' },
+        { name: 'birth_date', label: 'Date of birth', type: 'date', value: g.birth_date || '', min: '1900-01-01' },
+        { name: 'instagram', label: 'Instagram', value: g.instagram ? '@' + g.instagram : '', placeholder: '@handle' }
+      ] });
+      if (!v) return false;
+      await api('/api/admin/guests/profile', { email: g.email, full_name: v.full_name, birth_date: v.birth_date, instagram: v.instagram });
+      return 'Profile saved.';
+    }));
     act.appendChild(actionBtn('Set invites', 'ghost', async () => {
       const v = await ask({ title: 'Set invites', text: 'How many invites ' + g.email + ' can still send.', ok: 'Save', fields: [{ name: 'count', label: 'Invites (0 to 20)', type: 'number', min: 0, max: 20, value: g.invites_left, required: true }] });
       if (!v) return false;
@@ -1770,6 +2193,43 @@ function renderGuests() {
       if (!v) return false;
       const r = await api('/api/admin/remove-guest', { email: g.email });
       return r.cancelled ? 'Guest removed and their reservation cancelled.' : 'Guest removed.';
+    }));
+    tbody.appendChild(tr);
+  });
+  labelCells(tbody);
+}
+
+// Sign-up requests: people who accepted an invite and are waiting for approval, or were declined.
+function renderRequests() {
+  const f = $('req-filter').value || 'PENDING', q = $('req-search').value.trim();
+  const tbody = $('reqlist'); tbody.replaceChildren();
+  const all = guests.filter((g) => g.approval === f);
+  // Oldest first, so whoever has waited longest is at the top.
+  const list = all.filter((g) => matches(q, [g.full_name, g.email, g.instagram]))
+    .sort((a, b) => String(a.applied_at || '').localeCompare(String(b.applied_at || '')) || a.id - b.id);
+  if (!list.length) return emptyRow(tbody, 8, all.length ? 'No requests match.' : f === 'PENDING' ? 'Nobody is waiting for approval.' : 'No declined requests.');
+  list.forEach((g) => {
+    const tr = el('tr');
+    const name = td(tr, g.full_name || g.email, 'strong');
+    if (!g.full_name) name.appendChild(el('span', 'No name given', 'subtext'));
+    td(tr, g.age === null || g.age === undefined ? '' : g.age, 'num');
+    const ig = td(tr, '');
+    if (g.instagram) ig.appendChild(igLink(g.instagram));
+    td(tr, g.email);
+    const by = td(tr, invitedBy(g));
+    if (g.invited_by && g.invited_by !== 'CONTROL' && g.invited_by_name) by.appendChild(el('span', g.invited_by, 'subtext'));
+    td(tr, g.invite_note || '', 'note');
+    const when = td(tr, shortDate(g.applied_at), 'mono'); when.title = longDate(g.applied_at);
+    if (g.approval === 'DECLINED' && g.decided_at) when.appendChild(el('span', 'Declined ' + shortDate(g.decided_at), 'subtext'));
+    const act = td(tr, '', 'actions');
+    act.appendChild(actionBtn('Approve', 'good', () => approve(g)));
+    if (g.approval === 'PENDING') act.appendChild(actionBtn('Decline', 'danger', async () => {
+      const who = g.full_name || g.email;
+      const inviter = g.invited_by === 'CONTROL' ? 'you' : (g.invited_by_name || g.invited_by || 'whoever invited them');
+      const v = await ask({ title: 'Decline ' + who + '?', text: "They won't get an email. Their invite stays used, and " + inviter + " doesn't get it back. You can still approve them later from Declined.", ok: 'Decline', danger: true });
+      if (!v) return false;
+      await api('/api/admin/guests/decline', { email: g.email });
+      return 'Request declined.';
     }));
     tbody.appendChild(tr);
   });
@@ -1880,14 +2340,16 @@ const ORDER_FILTERS = {
   UNCOLLECTED: (o) => o.status === 'PAID' && !o.picked_up_at
 };
 function renderOrders() {
-  const f = $('order-filter').value, q = $('order-search').value.trim().toLowerCase();
+  const f = $('order-filter').value, q = $('order-search').value.trim();
   const tbody = $('orderlist'); tbody.replaceChildren();
   const list = orders.filter((o) => (!f || (ORDER_FILTERS[f] ? ORDER_FILTERS[f](o) : o.status === f)) &&
-    (String(o.guest_email).toLowerCase().includes(q) || String(o.reference_code).toLowerCase().includes(q)));
+    matches(q, [nameOf(o.guest_email), o.guest_email, o.reference_code]));
   if (!list.length) return emptyRow(tbody, 7, orders.length ? 'No orders match.' : 'No orders yet.');
   list.forEach((o) => {
     const tr = el('tr');
-    td(tr, o.guest_email, 'strong');
+    const name = nameOf(o.guest_email);
+    const who = td(tr, name || o.guest_email, 'strong');
+    if (name) who.appendChild(el('span', o.guest_email, 'subtext'));
     const pk = td(tr, o.package_name);
     if (o.size) pk.appendChild(el('span', 'Size ' + o.size, 'subtext'));
     // What this guest owes or paid: the tier price at reservation, less any code.
@@ -1982,6 +2444,9 @@ function renderDoor() {
 
 function renderCounts() {
   $('c-g').textContent = guests.length;
+  const waiting = guests.filter((g) => g.approval === 'PENDING').length;
+  $('c-r').textContent = waiting;
+  $('r-ping').classList.toggle('hidden', !waiting);
   $('c-i').textContent = invites.length;
   $('c-p').textContent = products.length;
   $('c-o').textContent = orders.length;
@@ -1994,29 +2459,39 @@ function labelCells(tbody) {
   const heads = Array.from(tbody.closest('table').querySelectorAll('thead th')).map((th) => th.textContent.trim());
   Array.from(tbody.rows).forEach((tr) => Array.from(tr.cells).forEach((c, i) => c.setAttribute('data-label', tr.classList.contains('empty-row') ? '' : (heads[i] || ''))));
 }
-function renderAll() { renderStats(); renderSales(); renderGuests(); renderInvites(); renderProducts(); renderOrders(); renderDoor(); renderCounts(); }
+function renderAll() { renderStats(); renderSales(); renderGuests(); renderRequests(); renderInvites(); renderProducts(); renderOrders(); renderDoor(); renderCounts(); }
 
 async function refresh() {
   try {
     const r = await Promise.all([api('/api/admin/guests'), api('/api/admin/invites'), api('/api/admin/packages'), api('/api/admin/orders'), api('/api/admin/checkins')]);
     guests = r[0]; invites = r[1]; products = r[2]; orders = r[3]; checkins = Array.isArray(r[4]) ? r[4] : [];
+    guestByEmail = new Map(guests.map((g) => [String(g.email).toLowerCase(), g]));
   } catch (e) { toast(e.message, true); return; }
   renderAll();
   $('updated').textContent = 'Updated ' + new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'America/Antigua' }) + ' Antigua time';
 }
 
 // ---------- Tabs ----------
-const panels = ['guests-panel', 'invites-panel', 'products-panel', 'orders-panel', 'door-panel'];
-const tabs = ['tab-g', 'tab-i', 'tab-p', 'tab-o', 'tab-d'];
+const panels = ['guests-panel', 'requests-panel', 'invites-panel', 'products-panel', 'orders-panel', 'door-panel'];
+const tabs = ['tab-g', 'tab-r', 'tab-i', 'tab-p', 'tab-o', 'tab-d'];
 function showTab(which) {
   panels.forEach((p, i) => $(p).classList.toggle('hidden', tabs[i] !== which));
   tabs.forEach((t) => { $(t).classList.toggle('on', t === which); $(t).setAttribute('aria-selected', t === which ? 'true' : 'false'); });
+  // /admin#requests (the link in the "New request" email) opens the Requests tab, and stays on it after a reload.
+  if (which === 'tab-r' && location.hash !== '#requests') history.replaceState(null, '', '#requests');
+  else if (which !== 'tab-r' && location.hash === '#requests') history.replaceState(null, '', location.pathname + location.search);
 }
 tabs.forEach((t) => $(t).addEventListener('click', () => showTab(t)));
 $('alert-go').addEventListener('click', () => { $('order-filter').value = 'REFUND'; renderOrders(); showTab('tab-o'); $('orders-panel').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+$('req-alert-go').addEventListener('click', () => { $('req-filter').value = 'PENDING'; renderRequests(); showTab('tab-r'); $('requests-panel').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+function tabFromHash() { if (location.hash === '#requests') showTab('tab-r'); }
+window.addEventListener('hashchange', tabFromHash);
+tabFromHash();
 
 // ---------- Filters ----------
 $('search').addEventListener('input', renderGuests);
+$('req-search').addEventListener('input', renderRequests);
+$('req-filter').addEventListener('change', renderRequests);
 $('filter').addEventListener('change', renderGuests);
 $('inv-search').addEventListener('input', renderInvites);
 $('inv-filter').addEventListener('change', renderInvites);
@@ -2079,20 +2554,22 @@ function downloadCsv(filename, rows) {
     return '"' + s.split('"').join('""') + '"';
   };
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([rows.map((r) => r.map(q).join(',')).join(NL)], { type: 'text/csv' }));
+  // The byte-order mark makes Excel read the file as UTF-8, so accented names come out right.
+  a.href = URL.createObjectURL(new Blob([String.fromCharCode(0xFEFF) + rows.map((r) => r.map(q).join(',')).join(NL)], { type: 'text/csv;charset=utf-8' }));
   a.download = filename; a.click();
 }
 $('csv-btn').addEventListener('click', () => {
-  downloadCsv('ondroad-guests.csv', [['email', 'attendance', 'invites_left', 'package', 'size', 'order_status', 'reference', 'checked_in_at']].concat(guests.map((g) => {
+  downloadCsv('ondroad-guests.csv', [['email', 'name', 'birth_date', 'age', 'instagram', 'invited_by', 'approval', 'attendance', 'invites_left', 'package', 'size', 'order_status', 'reference', 'checked_in_at']].concat(guests.map((g) => {
     const o = latestOrderFor(g.email);
-    return [g.email, g.rsvp_status || 'PENDING', g.invites_left, o ? o.package_name : '', o && o.size ? o.size : '', o ? (isRefundRequest(o) ? 'REFUND_REQUESTED' : o.status) : '', o ? o.reference_code : '', o && o.checked_in_at ? o.checked_in_at : ''];
+    return [g.email, g.full_name, g.birth_date, g.age, g.instagram, g.invited_by === 'CONTROL' ? "On D' Road" : g.invited_by, g.approval || 'APPROVED',
+      g.rsvp_status || 'PENDING', g.invites_left, o ? o.package_name : '', o && o.size ? o.size : '', o ? (isRefundRequest(o) ? 'REFUND_REQUESTED' : o.status) : '', o ? o.reference_code : '', o && o.checked_in_at ? o.checked_in_at : ''];
   })));
 });
 // Every order, newest first. Amounts are in the order's currency, e.g. 250.00.
 $('orders-csv-btn').addEventListener('click', () => {
   const amount = (c) => (c === null || c === undefined ? '' : (Number(c) / 100).toFixed(2));
-  downloadCsv('ondroad-orders.csv', [['reference', 'email', 'package', 'tier', 'size', 'list', 'discount', 'code', 'amount', 'currency', 'status', 'paid_via', 'reserved_at', 'paid_at', 'picked_up_at', 'checked_in_at']].concat(
-    orders.slice().sort((a, b) => b.id - a.id).map((o) => [o.reference_code, o.guest_email, o.package_name, o.tier_name, o.size, amount(o.list_cents ?? o.price_cents),
+  downloadCsv('ondroad-orders.csv', [['reference', 'email', 'name', 'package', 'tier', 'size', 'list', 'discount', 'code', 'amount', 'currency', 'status', 'paid_via', 'reserved_at', 'paid_at', 'picked_up_at', 'checked_in_at']].concat(
+    orders.slice().sort((a, b) => b.id - a.id).map((o) => [o.reference_code, o.guest_email, nameOf(o.guest_email), o.package_name, o.tier_name, o.size, amount(o.list_cents ?? o.price_cents),
       amount(o.discount_cents || 0), o.promo_code, amount(amountOf(o)), o.currency, isRefundRequest(o) ? 'REFUND_REQUESTED' : o.status, o.paid_via,
       o.created_at, o.paid_at, o.picked_up_at, o.checked_in_at])));
 });
