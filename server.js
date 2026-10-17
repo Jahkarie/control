@@ -554,18 +554,29 @@ app.post('/api/update-shirt', requireAuth, async (req, res) => {
 });
 
 // --- UPDATE RSVP ---
+// Attendance can only be confirmed once the guest has paid (a free pass counts), and it's locked once confirmed:
+// pulling out goes through a refund request, whose approval sets it back to PENDING.
 app.post('/api/update-rsvp', requireAuth, async (req, res) => {
   const rsvp_status = typeof req.body?.rsvp_status === 'string' ? req.body.rsvp_status.trim() : '';
   if (!['CONFIRMED', 'PENDING'].includes(rsvp_status)) return res.status(400).json({ error: 'Invalid RSVP status.' });
   try {
+    const g = await pool.query(
+      `SELECT g.approval, g.rsvp_status,
+              EXISTS (SELECT 1 FROM orders o WHERE LOWER(o.guest_email) = LOWER(g.email) AND o.status = 'PAID') AS has_paid
+       FROM guests g WHERE LOWER(g.email) = $1 ORDER BY g.id LIMIT 1`, [req.userEmail]);
+    if (!g.rowCount) return res.status(403).json({ error: 'That account is no longer on the roster.' });
+    const guest = g.rows[0];
     // Only approved guests: a request still waiting (or declined) mustn't count as confirmed attendance.
-    const r = await pool.query("UPDATE guests SET rsvp_status = $1 WHERE LOWER(email) = $2 AND approval = 'APPROVED'", [rsvp_status, req.userEmail]);
-    if (!r.rowCount) {
-      const g = await pool.query('SELECT approval FROM guests WHERE LOWER(email) = $1 ORDER BY id LIMIT 1', [req.userEmail]);
-      if (!g.rowCount) return res.status(403).json({ error: 'That account is no longer on the roster.' });
-      return res.status(403).json(notApproved(g.rows[0].approval));
+    if (guest.approval !== 'APPROVED') return res.status(403).json(notApproved(guest.approval));
+    if (rsvp_status === 'PENDING') {
+      if (guest.rsvp_status === 'CONFIRMED') {
+        return res.status(403).json({ error: "You've confirmed, so it's locked. Can't make it? Request a refund instead.", code: 'RSVP_LOCKED' });
+      }
+      return res.json({ success: true, rsvp_status: 'PENDING' });
     }
-    res.json({ success: true, rsvp_status });
+    if (!guest.has_paid) return res.status(403).json({ error: "You can confirm once you've paid.", code: 'PAY_FIRST' });
+    await pool.query("UPDATE guests SET rsvp_status = 'CONFIRMED' WHERE LOWER(email) = $1 AND approval = 'APPROVED'", [req.userEmail]);
+    res.json({ success: true, rsvp_status: 'CONFIRMED' });
   } catch (err) {
     serverError(res, err);
   }
@@ -1273,6 +1284,10 @@ app.post('/api/admin/orders/:id/approve-refund', requireAdmin, async (req, res) 
                  COALESCE(o.amount_cents, p.price_cents) AS amount_cents, COALESCE(o.currency, p.currency) AS currency`, [id, refundId]);
     if (!r.rowCount) return res.status(400).json({ error: 'Order not found or not paid.' });
     const o = r.rows[0];
+    // No pass, no attendance: confirmed attendance goes back to pending (it's locked only while they hold a pass).
+    await pool.query(
+      `UPDATE guests SET rsvp_status = 'PENDING' WHERE LOWER(email) = LOWER($1) AND rsvp_status = 'CONFIRMED'
+         AND NOT EXISTS (SELECT 1 FROM orders WHERE LOWER(guest_email) = LOWER($1) AND status = 'PAID')`, [o.guest_email]);
     // A free pass has nothing to refund, so the guest just hears it's cancelled.
     const emailError = o.amount_cents === 0 && !pp ? await mail.send(o.guest_email, "Free pass cancelled — On D' Road", renderEmail({
       tone: 'bad', tag: 'Pass cancelled', title: 'Cancelled',
