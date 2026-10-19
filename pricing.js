@@ -22,7 +22,7 @@ const money = (cents, cur) => (cur || 'XCD') + ' ' + (cents / 100).toFixed(2);
 // '2026-10-10T18:00' or a full ISO date -> Date. A date without a time zone is Antigua time (UTC-4 all year).
 // Returns null for blank, undefined for anything that isn't a real date.
 const WHEN_RE = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,3})?)?)?(Z|[+-]\d{2}:\d{2})?$/;
-function parseWhen(v) {
+export function parseWhen(v) {
   if (blank(v)) return null;
   const m = typeof v === 'string' && WHEN_RE.exec(v.trim());
   if (!m) return undefined;

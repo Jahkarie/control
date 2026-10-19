@@ -13,6 +13,7 @@ import { registerPricing, loadTiers, priceOf, checkPromo, discountFor, withState
   tooManyWrongCodes, countWrongCode, WRONG_CODES } from './pricing.js';
 import { registerPickup, getSizeLock, isSizeLocked } from './pickup.js';
 import { registerReset } from './reset.js';
+import { createLock } from './lock.js';
 import QRCode from 'qrcode';
 
 const { Pool } = pkg;
@@ -272,13 +273,20 @@ app.set('trust proxy', 1); // Render sits behind a proxy
 // Accept the configured frontend plus the production domain (and any extras, comma-separated).
 const ALLOWED_ORIGINS = [FRONTEND_URL, 'https://ondroad.xyz', 'https://www.ondroad.xyz',
   ...(process.env.EXTRA_ORIGINS || '').split(',').map((o) => o.trim().replace(/\/$/, '')).filter(Boolean)];
+// cors() reflects the request's Access-Control-Request-Headers, so the guest site's x-preview header (site lock) passes.
 app.use(cors({ origin: ALLOWED_ORIGINS }));
+// The site lock (see lock.js): while it's on, every guest API answers 423 SITE_LOCKED unless the owner's preview header
+// comes with it. Before every route, so nothing a guest calls slips past it.
+const lock = createLock({ pool, TOKEN_SECRET, safeEqual, SITE_URL: process.env.FRONTEND_URL ? FRONTEND_URL : 'https://ondroad.xyz' });
+app.use(lock.guard);
 // Door check-in (staff scanner at /door). Registered before the 10kb body limit because
 // a phone coming back online can upload a batch of offline check-ins at once.
 registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLimit, requireAdmin });
 // Contact details and terms (see site.js). Also before the 10kb limit: the terms can be longer than that.
-const site = registerSite({ app, pool, express, requireAdmin });
+const site = registerSite({ app, pool, express, requireAdmin, lock });
 app.use(express.json({ limit: '10kb' }));
+// The site lock's admin routes: GET/POST /api/admin/site-lock and POST /api/admin/site-lock/preview-reset.
+lock.register({ app, requireAdmin });
 
 // Payment instructions, pay-by deadline, auto-expiry and reminders (see payments.js).
 // Registered before the other routes on purpose: it replaces /api/my-order below.
@@ -294,8 +302,9 @@ registerPricing({ app, pool, requireAuth, requireApproved, requireAdmin, rateLim
   onComp: (o) => sendPaidEmail(o.guest_email, o.package_name, o.reference_code, { free: true }) });
 // Size lock and package pickup tracking (see pickup.js).
 registerPickup({ app, pool, requireAdmin });
-// Clearing guest data (or everything) to start over (see reset.js). A full reset also clears the email footer's contact details.
-registerReset({ app, pool, requireAdmin, rateLimit, afterReset: () => site.refresh() });
+// Clearing guest data (or everything) to start over (see reset.js). A full reset also clears the email footer's contact
+// details, and deletes the site lock settings, so the site is locked again (the lock's cache is cleared too).
+registerReset({ app, pool, requireAdmin, rateLimit, afterReset: () => { lock.forget(); return site.refresh(); } });
 const ADMIN_EMAIL = normalizeEmail(process.env.ADMIN_EMAIL); // optional: gets refund requests and new sign-up requests
 // The backend's own address, for links in emails (pass images, the admin's "Review requests" button). '' if unknown.
 const PUBLIC_URL = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
@@ -1573,6 +1582,11 @@ a { color: inherit; }
 .alert .btn { margin-left: auto; }
 .alert > span { flex: 1 1 220px; min-width: 0; }
 .alert::before { content: '!'; display: inline-grid; place-items: center; flex: none; width: 22px; height: 22px; background: var(--warn); color: var(--accent-ink); font: 700 13px/1 var(--mono); }
+/* The site lock's status line: slimmer, in orange, while the site is locked */
+.alert.lock-line { padding: 6px 8px 6px 14px; background: rgba(255, 90, 31, .06); border-color: rgba(255, 90, 31, .3); border-left-color: var(--accent); font-family: var(--mono); font-size: 13px; font-weight: 400; letter-spacing: .02em; }
+.alert.lock-line::before { content: ''; width: 9px; height: 9px; background: var(--accent); }
+.alert.lock-line b { font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
+.alert.lock-line span span { color: var(--muted); }
 
 /* ---------- KPI row: hairline cells with registration ticks ---------- */
 .kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); margin-bottom: 18px; }
@@ -1792,7 +1806,7 @@ dialog .btn.danger-solid:hover { background: #941c15; border-color: #941c15; }
     <a class="top-link" href="/admin/pricing">Prices &amp; codes</a>
     <a class="top-link" href="/admin/pickup">Sizes &amp; pickup</a>
     <a class="top-link" href="/admin/event">Event &amp; messages</a>
-    <a class="top-link" href="/admin/site">Contact, terms &amp; FAQ</a>
+    <a class="top-link" href="/admin/site">Site, contact, terms &amp; FAQ</a>
     <a class="top-link" href="${FRONTEND_URL}" target="_blank" rel="noopener">View site &#8599;</a>
     <span id="clock" class="clock"></span>
   </nav>
@@ -1807,6 +1821,7 @@ dialog .btn.danger-solid:hover { background: #941c15; border-color: #941c15; }
     <button class="btn ghost" id="refresh-btn" type="button">Refresh</button>
   </div>
 
+  <div id="lock-alert" class="alert lock-line hidden" role="status"><span><b>Site is locked</b><span id="lock-alert-when"></span></span><a class="btn small ghost" href="/admin/site">Manage</a></div>
   <div id="alert" class="alert hidden"><span id="alert-text"></span><button class="btn small" id="alert-go" type="button">Review</button></div>
   <div id="req-alert" class="alert hidden"><span id="req-alert-text"></span><button class="btn small" id="req-alert-go" type="button">Review</button></div>
 
@@ -2499,7 +2514,17 @@ function labelCells(tbody) {
 }
 function renderAll() { renderStats(); renderSales(); renderGuests(); renderRequests(); renderInvites(); renderProducts(); renderOrders(); renderDoor(); renderCounts(); }
 
+// The site lock's status line: shown while the site is locked, with the unlock time when one is set.
+async function refreshLock() {
+  try {
+    const d = await api('/api/admin/site-lock');
+    $('lock-alert').classList.toggle('hidden', !d.locked);
+    $('lock-alert-when').textContent = d.locked && d.site_unlock_at ? ' · Opens ' + timeOf(d.site_unlock_at) + ' Antigua time' : ' · Guests see only the trailer';
+  } catch (e) { /* the status line is only a reminder */ }
+}
+
 async function refresh() {
+  refreshLock();
   try {
     const r = await Promise.all([api('/api/admin/guests'), api('/api/admin/invites'), api('/api/admin/packages'), api('/api/admin/orders'), api('/api/admin/checkins')]);
     guests = r[0]; invites = r[1]; products = r[2]; orders = r[3]; checkins = Array.isArray(r[4]) ? r[4] : [];

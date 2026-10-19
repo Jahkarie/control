@@ -1,4 +1,5 @@
-// site.js: the contact details, terms, FAQ and sponsor logos the guest site shows, edited at /admin/site.
+// site.js: the contact details, terms, FAQ and sponsor logos the guest site shows, edited at /admin/site
+// ("Site, contact, terms & FAQ"), which also has the site lock's switch, unlock time and preview link (see lock.js).
 // The contact details also go at the bottom of every email (see setContact in emails.js).
 import { setContact } from './emails.js';
 
@@ -153,7 +154,7 @@ function parseSponsors(raw) {
   return list.slice(0, MAX_SPONSORS).map((s, i) => checkSponsor(s, i + 1).sponsor).filter(Boolean);
 }
 
-export function registerSite({ app, pool, express, requireAdmin, FRONTEND_URL = process.env.FRONTEND_URL || 'https://controlfrontend.onrender.com' }) {
+export function registerSite({ app, pool, express, requireAdmin, lock, FRONTEND_URL = process.env.FRONTEND_URL || 'https://controlfrontend.onrender.com' }) {
   const json = express.json({ limit: '100kb' }); // the terms and FAQ can be longer than the app-wide 10kb limit
   const KEYS = ['contact_whatsapp', 'contact_instagram', 'contact_email', 'terms', 'terms_updated_at', 'faq', 'sponsors'];
   // The admin page previews logos like "sponsors/acme.png" from the guest site, where they're served.
@@ -179,9 +180,16 @@ export function registerSite({ app, pool, express, requireAdmin, FRONTEND_URL = 
     try { setContact((await getSite()).contact); } catch (err) { console.error('Could not load contact details:', err.message); }
   }
 
-  // Public: the guest site shows these before anyone logs in.
+  // Public: the guest site shows these before anyone logs in. It's also how the guest site learns about the site lock:
+  // while locked (and without a valid preview header) the answer is only { locked: true }, nothing else.
+  // Otherwise the usual details plus locked: false, and preview: true when the preview header is what let it in.
   app.get('/api/site', async (req, res) => {
-    try { res.json(await getSite()); } catch (err) { fail(res, err); }
+    try {
+      const gate = lock ? await lock.check(req) : { locked: false, preview: false };
+      res.set('Cache-Control', 'no-store');
+      if (gate.locked) return res.json({ locked: true });
+      res.json({ ...(await getSite()), locked: false, ...(gate.preview ? { preview: true } : {}) });
+    } catch (err) { fail(res, err); }
   });
 
   app.get('/api/admin/site', requireAdmin, async (req, res) => {
@@ -241,7 +249,7 @@ export function registerSite({ app, pool, express, requireAdmin, FRONTEND_URL = 
   const PAGE = `<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex"><meta name="theme-color" content="#0a0a0b">
-<title>Contact, terms &amp; FAQ | On D' Road</title>
+<title>Site, contact, terms &amp; FAQ | On D' Road</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <style>
@@ -319,14 +327,60 @@ button.sm { min-height: 36px; padding: 0 14px; font-size: 12px; }
 .strip img { display: block; height: 32px; width: auto; max-width: 160px; object-fit: contain; opacity: .7; filter: grayscale(1) brightness(1.4); transition: opacity .15s, filter .15s; }
 .strip img:hover, .strip a:focus-visible img { opacity: 1; filter: none; }
 @media (max-width: 600px) { .sp-row { grid-template-columns: minmax(0, 1fr); } .sp-row > button { justify-self: start; } }
+/* Site lock: a big two-way switch (orange = locked, acid green = open) over the state line */
+.lock-card { border-top: 2px solid var(--line-strong); }
+.lock-card.is-locked { border-top-color: var(--accent); }
+.lock-card.is-open { border-top-color: var(--good); }
+.lock-switch { display: grid; grid-template-columns: 1fr 1fr; align-items: stretch; justify-content: stretch; gap: 4px; width: 100%; max-width: 440px; min-height: 72px; margin-top: 20px; padding: 4px; color: var(--dim); background: var(--well); border: 1px solid var(--line-strong); }
+.lock-switch:hover { background: var(--well); border-color: var(--text); }
+.lock-switch:disabled { cursor: progress; }
+.ls-opt { display: flex; align-items: center; justify-content: center; gap: 10px; font-family: var(--display); font-stretch: 125%; font-weight: 800; font-size: 20px; letter-spacing: .02em; transition: background .15s, color .15s; }
+.ls-opt::before { content: ''; width: 9px; height: 9px; border: 1.5px solid currentColor; }
+.lock-switch[aria-checked=true] .ls-locked { background: var(--accent); color: var(--accent-ink); }
+.lock-switch[aria-checked=false] .ls-open { background: var(--good); color: var(--accent-ink); }
+.lock-switch[aria-checked=true] .ls-locked::before, .lock-switch[aria-checked=false] .ls-open::before { background: currentColor; }
+.card > p.lock-state { margin: 16px 0 0; font-family: var(--mono); font-size: 13px; letter-spacing: .02em; color: var(--text); }
+.row { display: flex; flex-wrap: wrap; gap: 8px; }
+.row input { flex: 1 1 220px; width: auto; }
+input:disabled, .row input:disabled { opacity: .5; cursor: not-allowed; }
+.link-row code { display: block; padding: 11px 13px; font-size: 12.5px; line-height: 1.5; word-break: break-all; background: var(--well); border: 1px solid var(--line); }
+/* Dialog: a concrete utility panel with registration marks */
+dialog { width: min(480px, calc(100vw - 32px)); padding: 0; border: 0; border-radius: 0; color: var(--ink); background: var(--xh) no-repeat 8px 8px / 18px, var(--xh) no-repeat right 8px bottom 8px / 18px, var(--concrete); box-shadow: 0 30px 80px -20px rgba(0, 0, 0, .9); }
+dialog::backdrop { background: rgba(5, 5, 6, .76); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); }
+dialog :focus-visible { outline-color: var(--ink); }
+dialog form { padding: 34px 26px 24px; }
+dialog h3 { margin: 0; font-family: var(--display); font-size: 24px; font-weight: 800; font-stretch: 122%; line-height: 1.05; text-transform: uppercase; color: var(--ink); }
+dialog p { margin: 10px 0 0; color: var(--ink-2); font-size: 14.5px; }
+dialog button { border-color: var(--ink); }
+dialog button.ghost { color: var(--ink); border-color: rgba(20, 20, 22, .45); }
+dialog button.ghost:hover { border-color: var(--ink); background: rgba(20, 20, 22, .06); }
+dialog button.danger-solid { background: #b3261e; border-color: #b3261e; color: #fff; }
+dialog button.danger-solid:hover { background: #941c15; border-color: #941c15; }
+.dlg-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; margin-top: 24px; }
 </style></head><body>
 <header class="top">
   <div class="brand"><svg class="mark" viewBox="0 0 30 18" aria-hidden="true" focusable="false"><path fill="#e4e3df" d="M0 6h30v12H0z"/><path fill="#0a0a0b" d="M18.2 0h5.6l-4.6 18h-5.6z"/><path fill="#ff5a1f" d="M19.6 0h2.8l-4.6 18h-2.8z"/></svg><b>ON D<span>'</span> <i>ROAD</i></b><span class="sub">Command Center</span></div>
   <a class="back" href="/admin">&larr; Back to overview</a>
 </header>
 <main class="wrap">
-  <h1>Contact, terms &amp; FAQ</h1>
-  <p class="lead">How guests reach you, the terms they agree to when they reserve a package, answers to the questions they ask most, and your sponsors.</p>
+  <h1>Site, contact, terms &amp; FAQ</h1>
+  <p class="lead">Whether the site is open, how guests reach you, the terms they agree to when they reserve a package, answers to the questions they ask most, and your sponsors.</p>
+
+  <section class="card lock-card" id="site-lock" aria-labelledby="l-h">
+    <h2 id="l-h">Site lock</h2>
+    <p>While the site is locked, everyone sees only the trailer. Logins, invites and sign-ups are off. Your preview link shows you the real site.</p>
+    <button class="lock-switch" id="l-switch" type="button" role="switch" aria-checked="true" aria-label="Site locked" aria-describedby="l-state" disabled>
+      <span class="ls-opt ls-locked">Locked</span><span class="ls-opt ls-open">Open</span>
+    </button>
+    <p id="l-state" class="lock-state" role="status">Loading&hellip;</p>
+    <label for="l-at">Unlock automatically at</label>
+    <div class="row"><input id="l-at" type="datetime-local" autocomplete="off"><button id="l-set" type="button">Set time</button><button id="l-clear" class="ghost" type="button">Clear</button></div>
+    <small id="l-at-help">Antigua time. The site opens by itself then. Leave it empty to keep it locked until you switch it open.</small>
+    <div class="lbl">Preview link</div>
+    <div class="link-row"><code id="l-url">&hellip;</code></div>
+    <div class="foot"><button id="l-copy" class="ghost" type="button">Copy preview link</button><button id="l-rotate" class="ghost" type="button">Reset preview link</button><span id="l-msg" class="msg" role="status"></span></div>
+    <small>Opens the real site on any phone or laptop while it's locked. It's yours: don't share it. Resetting it makes the old link stop working.</small>
+  </section>
 
   <section class="card" aria-labelledby="c-h">
     <h2 id="c-h">Contact details</h2>
@@ -381,6 +435,16 @@ button.sm { min-height: 36px; padding: 0 14px; font-size: 12px; }
     <div class="foot"><button id="sp-save" type="button">Save sponsors</button><span id="sp-msg" class="msg" role="status"></span></div>
   </section>
 </main>
+<dialog id="dlg" aria-labelledby="dlg-title" aria-describedby="dlg-text">
+  <form id="dlg-form" method="dialog">
+    <h3 id="dlg-title"></h3>
+    <p id="dlg-text"></p>
+    <div class="dlg-actions">
+      <button class="ghost" type="button" id="dlg-cancel">Cancel</button>
+      <button type="submit" id="dlg-ok">Confirm</button>
+    </div>
+  </form>
+</dialog>
 <script>
 var $ = function (id) { return document.getElementById(id); };
 var GUEST_SITE = ${JSON.stringify(GUEST_SITE).replace(/</g, '\\u003c')};
@@ -515,6 +579,106 @@ function showSponsors(list) {
   list.forEach(function (s) { addRow(s); });
   layout(); strip();
 }
+
+// Styled replacement for confirm(): resolves true when confirmed.
+function ask(o) {
+  return new Promise(function (resolve) {
+    var dlg = $('dlg'), done = false;
+    $('dlg-title').textContent = o.title;
+    $('dlg-text').textContent = o.text || '';
+    $('dlg-ok').textContent = o.ok || 'Confirm';
+    $('dlg-ok').className = o.danger ? 'danger-solid' : '';
+    function finish(v) { if (done) return; done = true; $('dlg-form').onsubmit = null; $('dlg-cancel').onclick = null; dlg.onclose = null; if (dlg.open) dlg.close(); resolve(v); }
+    $('dlg-form').onsubmit = function (e) { e.preventDefault(); finish(true); };
+    $('dlg-cancel').onclick = function () { finish(false); };
+    dlg.onclose = function () { finish(false); };
+    dlg.showModal();
+    $('dlg-cancel').focus();
+  });
+}
+
+// ---------- Site lock ----------
+// The unlock time is a datetime-local input in Antigua time (UTC-4 all year, no daylight saving); "-04:00" is added when sending.
+var AST = 4 * 36e5, lockNow = null;
+function toInput(iso) { return iso ? new Date(new Date(iso).getTime() - AST).toISOString().slice(0, 16) : ''; }
+function fromInput(v) { return v ? v + '-04:00' : ''; }
+// "Sat 1 Nov, 8:00 PM" in Antigua time.
+function antiguaTime(iso) {
+  var p = {};
+  new Intl.DateTimeFormat('en-US', { weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit', timeZone: 'America/Antigua' })
+    .formatToParts(new Date(iso)).forEach(function (x) { p[x.type] = x.value; });
+  return p.weekday + ' ' + p.day + ' ' + p.month + ', ' + p.hour + ':' + p.minute + ' ' + p.dayPeriod;
+}
+function lockCall(path, body) {
+  return fetch(path, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : undefined)
+    .then(function (r) { return r.json().catch(function () { return {}; }).then(function (d) { if (!r.ok) throw new Error(d.error || 'Something went wrong.'); return d; }); });
+}
+// Which controls work: the time only matters while locked, and Clear only when a time is set.
+function lockControls(busy) {
+  var d = lockNow || {};
+  $('l-switch').disabled = busy || !lockNow;
+  $('l-at').disabled = $('l-set').disabled = busy || !d.locked;
+  $('l-clear').disabled = busy || !d.locked || !d.site_unlock_at;
+  $('l-rotate').disabled = busy || !lockNow;
+}
+function lockBusy(on) { lockControls(on); }
+function showLock(d) {
+  lockNow = d;
+  var auto = !d.locked && d.site_lock === 'on' && d.site_unlock_at;
+  $('site-lock').className = 'card lock-card ' + (d.locked ? 'is-locked' : 'is-open');
+  $('l-switch').setAttribute('aria-checked', d.locked ? 'true' : 'false');
+  $('l-state').textContent = d.locked
+    ? (d.site_unlock_at ? 'Locked. Opens on ' + antiguaTime(d.site_unlock_at) + ' (Antigua time).' : 'Locked. It stays locked until you switch it open.')
+    : auto ? 'Opened automatically on ' + antiguaTime(d.site_unlock_at) + ' (Antigua time).' : 'Open. Everyone with an invite can get in.';
+  $('l-at').value = d.locked ? toInput(d.site_unlock_at) : '';
+  $('l-at').min = toInput(new Date().toISOString());
+  lockControls(false);
+  $('l-at-help').textContent = d.locked
+    ? 'Antigua time. The site opens by itself then. Leave it empty to keep it locked until you switch it open.'
+    : 'The site is open, so there is nothing to schedule. Lock it again to set a time.';
+  $('l-url').textContent = d.preview_url;
+}
+function lockSave(body, done) {
+  lockBusy(true); $('l-msg').textContent = '';
+  return lockCall('/api/admin/site-lock', body).then(function (d) { showLock(d); say('l-msg', done(d), true); })
+    .catch(function (e) { say('l-msg', e.message); }).then(function () { lockBusy(false); });
+}
+$('l-switch').addEventListener('click', function () {
+  if (!lockNow) return;
+  var open = lockNow.locked;
+  ask(open
+    ? { title: 'Open the site?', text: 'Everyone sees the real site straight away. Logins, invites and sign-ups work again.', ok: 'Open the site' }
+    : { title: 'Lock the site?', text: "Everyone sees only the trailer from now on, and guests can't log in, sign up or use their account until you open it again. Your preview link keeps working.", ok: 'Lock the site', danger: true })
+    .then(function (yes) {
+      if (!yes) return $('l-switch').focus();
+      lockSave({ site_lock: open ? 'off' : 'on' }, function (d) { return d.locked ? 'Locked. Guests see only the trailer.' : 'Open. Guests see the site now.'; })
+        .then(function () { $('l-switch').focus(); });
+    });
+});
+$('l-set').addEventListener('click', function () {
+  var v = $('l-at').value;
+  if (!v) { say('l-msg', 'Pick a date and time first.'); return $('l-at').focus(); }
+  lockSave({ site_unlock_at: fromInput(v) }, function (d) { return 'Saved. The site opens on ' + antiguaTime(d.site_unlock_at) + '.'; });
+});
+$('l-clear').addEventListener('click', function () {
+  $('l-at').value = '';
+  lockSave({ site_unlock_at: '' }, function () { return 'Cleared. The site stays locked until you switch it open.'; });
+});
+$('l-copy').addEventListener('click', function () {
+  if (!lockNow) return;
+  navigator.clipboard.writeText(lockNow.preview_url).then(function () { say('l-msg', 'Preview link copied.', true); },
+    function () { say('l-msg', 'Copy failed. Select the link above and copy it.'); });
+});
+$('l-rotate').addEventListener('click', function () {
+  ask({ title: 'Reset the preview link?', text: 'The link you have now stops working straight away, everywhere it was opened. You get a new one to copy.', ok: 'Reset link', danger: true })
+    .then(function (yes) {
+      if (!yes) return $('l-rotate').focus();
+      lockBusy(true); $('l-msg').textContent = '';
+      lockCall('/api/admin/site-lock/preview-reset', {}).then(function (d) { showLock(d); say('l-msg', 'New preview link ready. The old one no longer works.', true); })
+        .catch(function (e) { say('l-msg', e.message); }).then(function () { lockBusy(false); $('l-rotate').focus(); });
+    });
+});
+lockCall('/api/admin/site-lock').then(showLock).catch(function (e) { $('l-state').textContent = 'Could not load the site lock: ' + e.message; });
 
 fetch('/api/admin/site').then(function (r) { return r.json(); }).then(function (d) {
   defaults = d.default_terms; defaultFaq = d.default_faq;

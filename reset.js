@@ -2,7 +2,9 @@
 // - 'guests': guests, invites, login links, orders (with their check-ins and pickups) and the group email log.
 //   Keeps the setup: packages, price tiers, promo codes and every setting.
 // - 'everything': all of that plus packages, price tiers, promo codes and every setting (payments, event, contact,
-//   terms, FAQ, sponsors, size lock), so the site is back to its built-in defaults.
+//   terms, FAQ, sponsors, size lock, site lock), so the site is back to its built-in defaults: that includes locked,
+//   since a missing site_lock means locked (see lock.js). Only preview_version stays, so a preview link that was
+//   reset before never works again.
 // The page asks the server for a one-time 6-digit number for a scope, and the reset only runs when that number is
 // typed back for the same scope within 10 minutes. One try per number, so a stray click or a forged request can't
 // wipe anything. Rows are DELETEd (not TRUNCATE ... CASCADE), so a table we don't know about can never go with them.
@@ -13,8 +15,8 @@ const GUEST_TABLES = ['checkins', 'orders', 'login_links', 'invites', 'guests', 
 const SETUP_TABLES = ['package_tiers', 'promo_codes', 'packages', 'settings'];
 const SCOPES = ['guests', 'everything'];
 
-// afterReset() runs after an 'everything' reset (server.js passes site.refresh, which clears the email footer's
-// cached contact details).
+// afterReset() runs after an 'everything' reset (server.js clears the site lock's cache and calls site.refresh, which
+// clears the email footer's cached contact details).
 export function registerReset({ app, pool, requireAdmin, rateLimit, afterReset }) {
   let pending = null; // { code, scope, expires }
   const fail = (res, err) => { console.error('Reset error:', err); res.status(500).json({ error: 'Server error. Nothing was deleted.' }); };
@@ -69,7 +71,7 @@ export function registerReset({ app, pool, requireAdmin, rateLimit, afterReset }
       // Check-ins and pickups go with their orders (checkins.order_id cascades), but delete them explicitly anyway.
       // Setup tables come after orders, which point at packages and tiers.
       for (const table of scope === 'everything' ? [...GUEST_TABLES, ...SETUP_TABLES] : GUEST_TABLES) {
-        await client.query(`DELETE FROM ${table}`);
+        await client.query(table === 'settings' ? "DELETE FROM settings WHERE key <> 'preview_version'" : `DELETE FROM ${table}`);
       }
       await client.query('COMMIT');
       console.log(`Reset (${scope}): deleted ${before.guests} guests, ${before.invites} invites, ${before.orders} orders (${before.paid} paid), ${before.checkins} door scans, ${before.broadcasts} group emails` +
@@ -173,9 +175,9 @@ button:disabled { opacity: .5; cursor: not-allowed; transform: none; }
     <h2 id="w-h">What to reset</h2>
     <div class="scopes" role="radiogroup" aria-label="What to reset">
       <label class="scope on"><input type="radio" name="scope" value="guests" checked><b>Guest data only</b>
-        <span>Deletes every guest and everything they did. Keeps your setup: packages, prices and tiers, promo codes, and every setting (payments, event details, contact, terms, FAQ, sponsors, size lock).</span></label>
+        <span>Deletes every guest and everything they did. Keeps your setup: packages, prices and tiers, promo codes, and every setting (payments, event details, contact, terms, FAQ, sponsors, size lock, site lock).</span></label>
       <label class="scope"><input type="radio" name="scope" value="everything"><b>Everything</b>
-        <span>Also deletes your setup, so the site goes back to a blank start with the original terms and FAQ drafts. You'd set up packages, prices and settings again.</span></label>
+        <span>Also deletes your setup, so the site goes back to a blank start with the original terms and FAQ drafts, and locked again: only the trailer shows. Your preview link stays the same. You'd set up packages, prices and settings again.</span></label>
     </div>
     <ul class="counts" id="counts" aria-live="polite"><li><b>&hellip;</b><span>Loading</span></li></ul>
     <div id="money" class="warn hidden" role="status"></div>
