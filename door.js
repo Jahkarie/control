@@ -189,7 +189,7 @@ const PAGE = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex">
-<meta name="theme-color" content="#09080b">
+<meta name="theme-color" content="#0a0a0b">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="ODR Door">
@@ -197,198 +197,242 @@ const PAGE = `<!DOCTYPE html>
 <title>Door | On D' Road</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js" defer></script>
 <style>
-/* Paint & Powder, door edition: black canvas, neon paint, sticker buttons. Results stay flat, full-screen colour
-   so they read at a glance in a dark street: green = in, red = stop, yellow = not paid. */
-/* If the web fonts never load, headlines fall back to a local narrow bold font so the big words still fit. */
-@font-face { font-family: 'Display Narrow'; font-weight: 100 900; src: local('Arial Narrow Bold'), local('ArialNarrow-Bold'), local('Roboto Condensed Bold'), local('RobotoCondensed-Bold'); }
-@font-face { font-family: 'Display Wide'; font-weight: 100 900; size-adjust: 74%; src: local('Arial Bold'), local('Arial-BoldMT'), local('Helvetica Neue Bold'), local('HelveticaNeue-Bold'), local('Roboto Bold'), local('Roboto-Bold'), local('Liberation Sans Bold'), local('LiberationSans-Bold'), local('DejaVu Sans Bold'), local('DejaVuSans-Bold'); }
+/* Night Kinetic, door edition: matte charcoal, one sharp accent (safety orange), sharp corners and hairline rules,
+   heavy expanded "ON D'" over a thin "ROAD", Space Mono for bracket tags and codes. Entry is orange, Pickup is cyan.
+   Results stay flat, full-screen colour so they read at a glance in a dark street: green = in / hand over, red = stop,
+   yellow = not paid. Check ID is a concrete card in an orange frame: stop and check. */
+/* If the web fonts never load, headlines fall back to a local bold font. */
+@font-face { font-family: 'Display Wide'; font-weight: 100 900; src: local('Arial Bold'), local('Arial-BoldMT'), local('Helvetica Neue Bold'), local('HelveticaNeue-Bold'), local('Roboto Bold'), local('Roboto-Bold'), local('Liberation Sans Bold'), local('LiberationSans-Bold'), local('DejaVu Sans Bold'), local('DejaVuSans-Bold'); }
 :root {
-  --bg: #09080b; --surface: #131117; --surface-2: #1b1820; --well: #0c0b0f;
-  --line: rgba(246, 241, 232, .10); --line-strong: rgba(246, 241, 232, .24);
-  --text: #f6f1e8; --muted: #b4adbb; --dim: #8f8898; --ink: #0b0a0d; --paper: #f6f1e8;
-  --pink: #ff2e93; --yellow: #ffe500; --cyan: #1ee3ff; --lime: #a3ff2b; --red: #ff4d4d;
-  --accent: var(--pink); --accent-ink: var(--ink);
-  /* --go is the brand lime pushed toward green, so ADMIT never reads as the yellow warning. */
-  --go: #6dff45; --good: var(--lime); --warn: var(--yellow); --bad: var(--red);
-  --display: 'Archivo', 'Display Narrow', 'Display Wide', Impact, sans-serif;
-  --body: 'Archivo', system-ui, -apple-system, sans-serif;
-  --mono: 'Space Mono', ui-monospace, monospace;
-  --m-splat: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 200 200' preserveAspectRatio='none'%3E%3Cpath d='M143.6 100C143.3 100.7 143 101.4 142.8 102.1C142.7 102.8 142.7 103.4 142.8 104.1C142.9 104.9 143.1 105.6 143.4 106.3C143.7 107.1 143.9 107.8 144.4 108.7C144.8 109.5 145.2 110.3 146.2 111.4C147.3 112.5 149.1 113.8 150.6 115.1C152.2 116.5 155 118.4 155.3 119.5C155.7 120.5 154.9 121.4 152.7 121.5C150.6 121.5 145.7 120.4 142.4 119.7C139.1 119 135.4 117.8 133.1 117.4C130.8 116.9 129.7 116.8 128.7 116.9C127.6 116.9 127.4 117.3 126.9 117.6C126.4 117.9 126.2 118.4 125.8 118.7C125.4 119.1 125.1 119.5 124.7 119.8C124.3 120.2 123.8 120.5 123.5 120.8C123.1 121.1 122.7 121.5 122.4 121.9C122.1 122.3 121.8 122.7 121.6 123.2C121.4 123.8 121.3 124.4 121.1 125C120.9 125.6 120.7 126.3 120.5 126.8C120.3 127.4 120 128 119.6 128.4C119.2 128.8 118.7 129.1 118.2 129.3C117.7 129.5 117.1 129.6 116.5 129.6C115.9 129.7 115.3 129.7 114.7 129.8C114.2 130 113.7 130.1 113.3 130.5C112.8 130.9 112.5 131.4 112.2 132.1C111.8 132.8 111.6 133.8 111.3 134.7C111 135.6 110.7 136.8 110.3 137.7C109.9 138.6 109.4 139.6 108.9 140.2C108.4 140.8 107.7 141.3 107.1 141.6C106.5 141.8 105.7 141.8 105.1 141.6C104.4 141.5 103.6 141.1 103 140.7C102.3 140.4 101.6 139.9 101 139.6C100.3 139.2 99.7 138.9 99.1 138.7C98.4 138.5 97.8 138.5 97.2 138.4C96.6 138.4 96 138.4 95.3 138.4C94.7 138.4 94.1 138.4 93.4 138.4C92.8 138.3 92.2 138.2 91.6 138.1C91 138 90.4 137.7 89.7 137.8C89 137.8 88.5 137.7 87.5 138.5C86.5 139.4 85.6 140.3 83.7 143C81.9 145.6 79.5 149.5 76.4 154.2C73.3 158.9 68.3 166.8 64.9 171.1C61.4 175.3 56.7 180.5 55.6 179.8C54.6 179.1 56.5 172.2 58.4 167C60.3 161.7 64.9 152.6 66.8 148.2C68.6 143.7 69.5 141.4 69.3 140.2C69 139 66.9 140.6 65.3 141.1C63.7 141.7 60.9 143.3 59.6 143.4C58.3 143.5 57.4 142.8 57.4 141.6C57.3 140.4 58.5 137.9 59.2 136.1C59.9 134.3 61.2 132.2 61.7 130.8C62.1 129.4 62.3 128.3 62 127.6C61.6 126.9 60.7 126.7 59.4 126.6C58.2 126.4 56.1 126.8 54.5 126.8C52.9 126.7 50.6 126.9 49.6 126.4C48.7 125.9 48.2 125 48.8 123.8C49.4 122.6 51.4 120.6 53.3 119C55.1 117.4 57.9 115.6 59.8 114.1C61.8 112.7 63.6 111.5 65 110.5C66.3 109.4 67.2 108.7 67.9 107.9C68.7 107.2 69.1 106.6 69.4 106C69.8 105.4 70 104.9 70 104.4C70.1 103.9 70 103.4 69.8 102.9C69.6 102.5 69.2 102 68.8 101.5C68.4 101 68 100.5 67.6 100C67.3 99.5 67.1 98.9 66.8 98.4C66.5 97.8 66.7 97.4 65.9 96.7C65 96 64.5 95.5 61.8 94.4C59 93.3 54.7 92 49.5 90.1C44.4 88.2 36.3 85.4 30.9 83C25.5 80.5 20.1 77.5 17.2 75.3C14.3 73.1 14 71.3 13.4 69.5C12.8 67.8 13.4 66.4 13.5 64.8C13.7 63.2 13.3 61.4 14.3 60.2C15.2 59 16.4 57.7 19.2 57.6C22 57.5 26.6 58.3 31.1 59.5C35.6 60.6 41.7 63 46.1 64.7C50.5 66.3 54.6 68.1 57.6 69.2C60.5 70.2 62.1 70.6 63.5 70.7C65 70.9 65.5 70.4 66.2 70.1C67 69.7 67.4 69.1 68 68.7C68.6 68.3 69.2 67.9 69.8 67.6C70.5 67.3 71.3 67.1 72 66.8C72.7 66.6 73.6 66.6 74.1 66.2C74.7 65.8 75.3 65.5 75.5 64.5C75.7 63.5 75.6 62.2 75.2 60C74.8 57.9 73.8 54.8 73.2 51.8C72.6 48.9 71.6 44.7 71.5 42.4C71.5 40.1 72 38.2 73 38C74 37.8 76.5 41.1 77.7 41.2C78.9 41.3 79.6 40.7 80.1 38.6C80.6 36.6 79.1 26.9 80.6 28.8C82.1 30.8 86.8 44.2 89 50.3C91.2 56.3 92.9 62.5 94 65.1C95.2 67.8 95.3 66.1 95.9 66.1C96.5 66.1 96.9 65.3 97.5 64.9C98 64.5 98.5 63.9 99.1 63.6C99.7 63.2 100.3 62.9 100.9 62.8C101.5 62.6 102.1 62.6 102.7 62.6C103.3 62.7 103.9 62.9 104.5 63C105.1 63.1 105.6 63.4 106.3 63.4C106.9 63.4 107.4 63.5 108.2 63C109 62.4 109.7 61.7 110.9 60C112.1 58.3 113.7 55.3 115.4 52.6C117.1 49.9 119.7 45.4 121.3 43.8C122.9 42.2 124.7 41.1 124.9 42.9C125.1 44.6 123.6 50.4 122.6 54.4C121.5 58.3 119.4 63.6 118.7 66.4C117.9 69.2 117.9 70.1 118 70.9C118.2 71.8 119 71.4 119.7 71.5C120.3 71.5 121.2 71.3 121.9 71.4C122.6 71.4 123.3 71.5 123.9 71.7C124.4 72 124.8 72.5 125.1 73C125.4 73.6 125.5 74.3 125.5 75.1C125.6 75.8 125.4 76.7 125.5 77.4C125.5 78.1 125.3 78.9 125.9 79.2C126.4 79.5 126.8 79.8 128.6 79.2C130.5 78.6 133.4 77.2 137.2 75.6C140.9 74.1 147.3 71.1 151.3 69.9C155.2 68.6 159.9 67.4 161 68C162 68.6 159.8 71.2 157.6 73.3C155.3 75.4 150.3 78.6 147.7 80.6C145 82.6 142.9 84.1 141.8 85.3C140.7 86.5 141 87 141.1 87.7C141.2 88.4 142 88.9 142.5 89.5C143 90.1 143.7 90.7 144.2 91.4C144.6 92 145 92.7 145.3 93.4C145.5 94.1 145.5 94.9 145.4 95.6C145.3 96.3 145 97.1 144.7 97.8C144.4 98.6 143.9 99.3 143.6 100ZM58.3 171.2a2.9 2.9 0 1 1 5.9 0a2.9 2.9 0 1 1 -5.9 0ZM22.5 79.8a4.5 4.5 0 1 1 9 0a4.5 4.5 0 1 1 -9 0ZM121.8 45a2.8 2.8 0 1 1 5.5 0a2.8 2.8 0 1 1 -5.5 0ZM76 25a3.7 3.7 0 1 1 7.5 0a3.7 3.7 0 1 1 -7.5 0ZM66 30.3a3.2 3.2 0 1 1 6.5 0a3.2 3.2 0 1 1 -6.5 0ZM164.1 64.9a2.9 2.9 0 1 1 5.8 0a2.9 2.9 0 1 1 -5.8 0ZM23 60.8a2.8 2.8 0 1 1 5.5 0a2.8 2.8 0 1 1 -5.5 0ZM50.8 148.1a2.7 2.7 0 1 1 5.3 0a2.7 2.7 0 1 1 -5.3 0ZM36.4 129a3.6 3.6 0 1 1 7.1 0a3.6 3.6 0 1 1 -7.1 0ZM22.9 72.6a4.5 4.5 0 1 1 9 0a4.5 4.5 0 1 1 -9 0ZM156.5 123.5a4.4 4.4 0 1 1 8.7 0a4.4 4.4 0 1 1 -8.7 0ZM49.3 44.4a1.8 1.8 0 1 1 3.6 0a1.8 1.8 0 1 1 -3.6 0ZM65.7 19.5a1.9 1.9 0 1 1 3.8 0a1.9 1.9 0 1 1 -3.8 0ZM98.3 172a1.2 1.2 0 1 1 2.4 0a1.2 1.2 0 1 1 -2.4 0ZM36.2 150.9a1.1 1.1 0 1 1 2.2 0a1.1 1.1 0 1 1 -2.2 0ZM120.4 54a1 1 0 1 1 1.9 0a1 1 0 1 1 -1.9 0ZM177.4 141.9a1.3 1.3 0 1 1 2.6 0a1.3 1.3 0 1 1 -2.6 0ZM140 152.4a1 1 0 1 1 2.1 0a1 1 0 1 1 -2.1 0ZM170.5 60.2a4 4 0 1 1 8 0a4 4 0 1 1 -8 0ZM165.7 56.6a0.7 0.7 0 1 1 1.4 0a0.7 0.7 0 1 1 -1.4 0ZM99.8 150.7a0.7 0.7 0 1 1 1.4 0a0.7 0.7 0 1 1 -1.4 0ZM107 177.9a2.1 2.1 0 1 1 4.2 0a2.1 2.1 0 1 1 -4.2 0ZM105.3 184.1a1.1 1.1 0 1 1 2.1 0a1.1 1.1 0 1 1 -2.1 0ZM140.6 67.7a0.7 0.7 0 1 1 1.4 0a0.7 0.7 0 1 1 -1.4 0ZM162.5 61.5a0.8 0.8 0 1 1 1.6 0a0.8 0.8 0 1 1 -1.6 0ZM141.8 67.5a3 3 0 1 1 6 0a3 3 0 1 1 -6 0ZM73.9 47a0.9 0.9 0 1 1 1.8 0a0.9 0.9 0 1 1 -1.8 0ZM51.4 80.4a3 3 0 1 1 5.9 0a3 3 0 1 1 -5.9 0ZM84 33.4a0.7 0.7 0 1 1 1.4 0a0.7 0.7 0 1 1 -1.4 0ZM143 74.2a3.3 3.3 0 1 1 6.6 0a3.3 3.3 0 1 1 -6.6 0ZM177.8 119.5a4.3 4.3 0 1 1 8.6 0a4.3 4.3 0 1 1 -8.6 0ZM175.1 77.5a1.1 1.1 0 1 1 2.3 0a1.1 1.1 0 1 1 -2.3 0ZM87.1 16.5a1.1 1.1 0 1 1 2.2 0a1.1 1.1 0 1 1 -2.2 0Z'/%3E%3C/svg%3E");
-  --m-drip: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 320 70' preserveAspectRatio='none'%3E%3Cpath d='M0 7.3L0 7.3L5 3.3L10 3.4L15 3.6L20 3.9L25 4.3L30 4.6L35 4.8L40 5L45 5.1L50 5.1L55 5.1L60 5L65 4.9L70 4.8L75 4.8L80 4.8L85 5L90 5.2L95 5.6L100 6.1L105 6.5L110 7L115 7.4L120 7.7L125 7.9L130 8L135 7.9L140 7.7L145 7.4L150 6.9L155 6.5L160 6.1L165 5.7L170 5.4L175 5.2L180 5.1L185 5.1L190 5.1L195 5.2L200 5.3L205 5.4L210 5.4L215 5.3L220 5.1L225 4.8L230 4.5L235 4.1L240 3.8L245 3.5L250 3.2L255 3.1L260 3.2L265 3.3L270 3.6L275 4.1L280 4.5L285 5.1L290 5.6L295 6L300 6.4L305 6.6L310 6.8L315 6.8L320 9.7L320 12.6L315 16.2L310 16.9L305 17.8L300 18.7L295 19.2L290 18.8L285 17.6L280 16.3L275 15.3L270 14.7L265 14.3L260 14.1L255 14.1L250 14.2L245 14.4L240 14.7L235 15.6L230 16.6L225 15.5L220 14.2L215 13.6L210 13.4L205 13.4L200 14.1L195 15.8L190 16.2L185 15.5L180 15.7L175 16.3L170 16.8L165 17.4L160 18.4L155 18.8L150 17.7L145 16.5L140 16.1L135 16.5L130 17.2L125 17.6L120 17.2L115 16.5L110 16L105 15.6L100 15.3L95 14.8L90 14.2L85 13.7L80 13.3L75 13.3L70 14.1L65 15.1L60 15.3L55 14.8L50 14.7L45 15L40 15.4L35 15.7L30 16.6L25 17.8L20 17L15 15.8L10 15.4L5 15.5L0 12.7ZM28.9 14Q25.9 14 25.9 19L25.5 30.9A2.5 2.5 0 1 1 22.4 30.9L22 19Q22 14 19 14ZM69 14Q66 14 66 19L65.5 45.1A3.4 3.4 0 1 1 61.1 45.1L60.6 19Q60.6 14 57.6 14ZM61.5 52.9a1.8 1.8 0 1 1 3.5 0a1.8 1.8 0 1 1 -3.5 0ZM131.9 14Q128.9 14 128.9 19L128.3 28.8A4 4 0 1 1 123.1 28.8L122.4 19Q122.4 14 119.4 14ZM160.7 14Q157.7 14 157.7 19L157.2 44.2A3 3 0 1 1 153.3 44.2L152.9 19Q152.9 14 149.9 14ZM197.8 14Q194.8 14 194.8 19L194.4 54.6A2.3 2.3 0 1 1 191.5 54.6L191.1 19Q191.1 14 188.1 14ZM234.6 14Q231.6 14 231.6 19L231.2 36.8A2.4 2.4 0 1 1 228.1 36.8L227.7 19Q227.7 14 224.7 14ZM228.4 44.4a1.3 1.3 0 1 1 2.5 0a1.3 1.3 0 1 1 -2.5 0ZM299.6 14Q296.6 14 296.6 19L295.9 30.8A4.2 4.2 0 1 1 290.5 30.8L289.8 19Q289.8 14 286.8 14Z'/%3E%3C/svg%3E");
-  --torn: polygon(0 14%, 3% 0, 22% 7%, 46% 0, 71% 6%, 93% 0, 100% 9%, 97% 34%, 100% 58%, 97% 82%, 100% 100%, 78% 93%, 53% 100%, 28% 94%, 6% 100%, 0 88%, 3% 63%, 0 38%);
-  /* Entry is pink, Pickup is cyan: the switch, the count, the camera border and its frame all follow. */
-  --mode: var(--pink); --mode-pop: var(--yellow);
+  --black: #0a0a0b; --char: #141416; --char-2: #1a1a1d; --char-3: #232327; --well: rgba(10, 10, 11, .6);
+  --line: rgba(236, 235, 230, .12); --line-2: rgba(236, 235, 230, .26);
+  --text: #ecebe6; --muted: #a6a59f; --dim: #86857f;
+  --ink: #141416; --ink-2: #47463f; --ink-line: rgba(20, 20, 22, .22); --concrete: #c9c8c3; --concrete-2: #e4e3df; --paper: #f4f3ef;
+  --orange: #ff5a1f; --cyan: #22e1ff; --acid: #b6ff3b; --purple: #8b3dff;
+  --accent: var(--orange);
+  /* Result fills, each its own hue: --go is the acid green pushed toward green, so ADMIT never reads as the yellow
+     warning; --stop leans crimson, so it never reads as the orange accent. */
+  --go: #6dff45; --stop: #ff3346; --caution: #ffd60a;
+  /* The same three as small text on charcoal */
+  --good: var(--acid); --warn: var(--caution); --bad: #ff7a6b;
+  --wide: 'Archivo', 'Display Wide', system-ui, sans-serif;
+  --body: 'Archivo', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --mono: 'Space Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --ease: cubic-bezier(.2, .8, .2, 1);
+  --matte: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='g' x='0' y='0' width='1' height='1'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' seed='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 .16 0 0 0 -.055'/%3E%3C/filter%3E%3Crect width='200' height='200' filter='url(%23g)'/%3E%3C/svg%3E");
+  --concrete-tex: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='640'%3E%3Cfilter id='b' x='0' y='0' width='1' height='1'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.0094' numOctaves='3' seed='4' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 .1 0 0 0 0 .1 0 0 0 0 .1 .6 0 0 0 -.27'/%3E%3C/filter%3E%3Cfilter id='s' x='0' y='0' width='1' height='1'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.75' numOctaves='2' seed='9' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 .08 0 0 0 0 .08 0 0 0 0 .08 1.6 0 0 0 -1.12'/%3E%3C/filter%3E%3Crect width='640' height='640' filter='url(%23b)'/%3E%3Crect width='640' height='640' filter='url(%23s)'/%3E%3C/svg%3E");
+  --streak-ink: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='900' height='320' viewBox='0 0 900 320' fill='none' stroke='%23141416'%3E%3Cdefs%3E%3ClinearGradient id='f' x1='0' x2='1'%3E%3Cstop offset='0' stop-color='%23141416' stop-opacity='0'/%3E%3Cstop offset='1' stop-color='%23141416'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath d='M20 250L560 125.3' stroke-opacity='.38'/%3E%3Cpath d='M180 214L520 135.5' stroke='url(%23f)' stroke-width='4' stroke-opacity='.7'/%3E%3Cpath d='M0 180L380 92.3' stroke-width='8' stroke-dasharray='1 2.2' stroke-opacity='.3'/%3E%3Cpath d='M470 300L860 210' stroke='url(%23f)' stroke-width='2' stroke-opacity='.5'/%3E%3Cpath d='M600 150L700 126.9' stroke-width='7' stroke-opacity='.45'/%3E%3Cpath d='M520 60L900 -27.7' stroke-opacity='.28'/%3E%3Cpath d='M60 300L240 258.4' stroke-width='3' stroke-opacity='.4'/%3E%3Cg fill='%23141416' stroke='none' fill-opacity='.45'%3E%3Crect x='724' y='168' width='6' height='6'/%3E%3Crect x='738' y='160' width='4' height='4'/%3E%3Crect x='748' y='174' width='9' height='4'/%3E%3Crect x='104' y='118' width='5' height='5'/%3E%3Crect x='118' y='112' width='3' height='3'/%3E%3C/g%3E%3C/svg%3E");
+  --streak-lite: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='900' height='320' viewBox='0 0 900 320' fill='none' stroke='%23ecebe6'%3E%3Cdefs%3E%3ClinearGradient id='c' x1='0' x2='1'%3E%3Cstop offset='0' stop-color='%2322e1ff' stop-opacity='0'/%3E%3Cstop offset='.85' stop-color='%2322e1ff'/%3E%3Cstop offset='1' stop-color='%23d9fbff'/%3E%3C/linearGradient%3E%3ClinearGradient id='g' x1='0' x2='1'%3E%3Cstop offset='0' stop-color='%23b6ff3b' stop-opacity='0'/%3E%3Cstop offset='.6' stop-color='%23b6ff3b'/%3E%3Cstop offset='1' stop-color='%2322e1ff'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath d='M20 250L560 125.3' stroke-opacity='.16'/%3E%3Cpath d='M180 214L520 135.5' stroke='url(%23c)' stroke-width='3' stroke-opacity='.75'/%3E%3Cpath d='M0 180L380 92.3' stroke-width='8' stroke-dasharray='1 2.2' stroke-opacity='.16'/%3E%3Cpath d='M470 300L860 210' stroke='url(%23g)' stroke-width='3' stroke-opacity='.6'/%3E%3Cpath d='M600 150L700 126.9' stroke='%238b3dff' stroke-width='7' stroke-opacity='.75'/%3E%3Cpath d='M520 60L900 -27.7' stroke-opacity='.1'/%3E%3Cpath d='M60 300L240 258.4' stroke='%238b3dff' stroke-width='5' stroke-opacity='.5'/%3E%3Cg fill='%23ecebe6' stroke='none' fill-opacity='.35'%3E%3Crect x='724' y='168' width='5' height='5'/%3E%3Crect x='738' y='160' width='3' height='3'/%3E%3Crect x='104' y='118' width='4' height='4'/%3E%3C/g%3E%3C/svg%3E");
+  --xh-ink: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='28' height='28' viewBox='0 0 28 28' fill='none' stroke='%23141416' stroke-opacity='0.6' stroke-width='1'%3E%3Ccircle cx='14' cy='14' r='6.5'/%3E%3Cpath d='M14 0v28M0 14h28'/%3E%3C/svg%3E");
+  --xh-lite: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='28' height='28' viewBox='0 0 28 28' fill='none' stroke='%23ecebe6' stroke-opacity='0.32' stroke-width='1'%3E%3Ccircle cx='14' cy='14' r='6.5'/%3E%3Cpath d='M14 0v28M0 14h28'/%3E%3C/svg%3E");
+  --circ-ink-tr: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='340' height='230' viewBox='0 0 340 230' fill='none' stroke='%23141416' stroke-opacity='0.3' stroke-width='1'%3E%3Cpath d='M340 30H252l-16 16h-62'/%3E%3Cpath d='M340 46H260l-16 16v38l-14 14h-30'/%3E%3Cpath d='M340 62h-62l-12 12v74'/%3E%3Cpath d='M340 100h-30l-12 12v66l-14 14h-44'/%3E%3Cpath d='M340 164h-10v66'/%3E%3Cpath d='M212 0v12l-14 14h-50'/%3E%3Cpath d='M284 0v8l-8 8h-28'/%3E%3Cpath d='M302 0v18l12 12'/%3E%3Cpath d='M340 196h-28l-10 10v24'/%3E%3Ccircle cx='170' cy='46' r='3.2'/%3E%3Ccircle cx='196' cy='114' r='3.2'/%3E%3Ccircle cx='266' cy='152' r='3.2'/%3E%3Ccircle cx='236' cy='192' r='3.2'/%3E%3Ccircle cx='144' cy='26' r='3.2'/%3E%3Ccircle cx='244' cy='16' r='2.6'/%3E%3Ccircle cx='302' cy='230' r='2.6'/%3E%3Crect x='210' y='124' width='36' height='24'/%3E%3Cpath d='M216 124v-6M224 124v-6M232 124v-6M240 124v-6M216 148v6M224 148v6M232 148v6M240 148v6'/%3E%3C/svg%3E");
+  --circ-lite-tr: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='340' height='230' viewBox='0 0 340 230' fill='none' stroke='%23ecebe6' stroke-opacity='0.1' stroke-width='1'%3E%3Cpath d='M340 30H252l-16 16h-62'/%3E%3Cpath d='M340 46H260l-16 16v38l-14 14h-30'/%3E%3Cpath d='M340 62h-62l-12 12v74'/%3E%3Cpath d='M340 100h-30l-12 12v66l-14 14h-44'/%3E%3Cpath d='M340 164h-10v66'/%3E%3Cpath d='M212 0v12l-14 14h-50'/%3E%3Cpath d='M284 0v8l-8 8h-28'/%3E%3Cpath d='M302 0v18l12 12'/%3E%3Cpath d='M340 196h-28l-10 10v24'/%3E%3Ccircle cx='170' cy='46' r='3.2'/%3E%3Ccircle cx='196' cy='114' r='3.2'/%3E%3Ccircle cx='266' cy='152' r='3.2'/%3E%3Ccircle cx='236' cy='192' r='3.2'/%3E%3Ccircle cx='144' cy='26' r='3.2'/%3E%3Ccircle cx='244' cy='16' r='2.6'/%3E%3Ccircle cx='302' cy='230' r='2.6'/%3E%3Crect x='210' y='124' width='36' height='24'/%3E%3Cpath d='M216 124v-6M224 124v-6M232 124v-6M240 124v-6M216 148v6M224 148v6M232 148v6M240 148v6'/%3E%3C/svg%3E");
+  --circ-lite-bl: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='340' height='230' viewBox='0 0 340 230' fill='none' stroke='%23ecebe6' stroke-opacity='0.1' stroke-width='1'%3E%3Cg transform='translate(340 230) scale(-1 -1)'%3E%3Cpath d='M340 30H252l-16 16h-62'/%3E%3Cpath d='M340 46H260l-16 16v38l-14 14h-30'/%3E%3Cpath d='M340 62h-62l-12 12v74'/%3E%3Cpath d='M340 100h-30l-12 12v66l-14 14h-44'/%3E%3Cpath d='M340 164h-10v66'/%3E%3Cpath d='M212 0v12l-14 14h-50'/%3E%3Cpath d='M284 0v8l-8 8h-28'/%3E%3Cpath d='M302 0v18l12 12'/%3E%3Cpath d='M340 196h-28l-10 10v24'/%3E%3Ccircle cx='170' cy='46' r='3.2'/%3E%3Ccircle cx='196' cy='114' r='3.2'/%3E%3Ccircle cx='266' cy='152' r='3.2'/%3E%3Ccircle cx='236' cy='192' r='3.2'/%3E%3Ccircle cx='144' cy='26' r='3.2'/%3E%3Ccircle cx='244' cy='16' r='2.6'/%3E%3Ccircle cx='302' cy='230' r='2.6'/%3E%3Crect x='210' y='124' width='36' height='24'/%3E%3Cpath d='M216 124v-6M224 124v-6M232 124v-6M240 124v-6M216 148v6M224 148v6M232 148v6M240 148v6'/%3E%3C/g%3E%3C/svg%3E");
+  /* Entry is orange, Pickup is cyan: the switch, the count, the camera border and its frame all follow. */
+  --mode: var(--orange);
+  color-scheme: dark;
 }
-body.pickup { --mode: var(--cyan); --mode-pop: var(--pink); }
-* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+body.pickup { --mode: var(--cyan); }
+*, *::before, *::after { box-sizing: border-box; }
+* { -webkit-tap-highlight-color: transparent; }
 html, body { height: 100%; }
-body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 var(--body); -webkit-font-smoothing: antialiased; overscroll-behavior: none; overflow-x: hidden; }
-::selection { background: var(--yellow); color: var(--ink); }
+body { margin: 0; background: var(--char) var(--matte); color: var(--text); font: 400 15px/1.5 var(--body); font-variant-numeric: tabular-nums; -webkit-font-smoothing: antialiased; overscroll-behavior: none; overflow-x: hidden; }
+::selection { background: var(--orange); color: var(--ink); }
 .hidden { display: none !important; }
-:focus-visible { outline: 3px solid var(--cyan); outline-offset: 3px; }
+:focus-visible { outline: 2px solid var(--mode); outline-offset: 3px; }
 .wrap { position: relative; max-width: 520px; margin: 0 auto; padding: max(16px, env(safe-area-inset-top)) 16px max(28px, env(safe-area-inset-bottom)); }
 
-/* Wordmark: ON D' ROAD with the yellow apostrophe; the phone's name is a strip of tape. */
-.brand { font-family: var(--display); font-weight: 900; font-stretch: 62%; font-size: 27px; line-height: 1.1; letter-spacing: .01em; text-transform: uppercase; }
-.brand span { color: var(--yellow); }
+/* Wordmark: heavy expanded ON D' (orange apostrophe) and a thin ROAD; the phone's name is a bracket tag under it. */
+.brand { font-family: var(--wide); font-stretch: 125%; font-size: 17px; line-height: 1.1; letter-spacing: .02em; text-transform: uppercase; white-space: nowrap; }
+.brand b { font-weight: 900; }
+.brand i { font-style: normal; font-weight: 200; }
+.brand span { color: var(--orange); }
 .brand em {
-  display: inline-block; max-width: 56vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle; position: relative; top: -3px;
-  margin-left: 10px; padding: 5px 10px 4px; font-style: normal; font-family: var(--mono); font-stretch: 100%; font-size: 10.5px; font-weight: 700; line-height: 1.3; letter-spacing: .14em; text-transform: uppercase;
-  color: var(--ink); background: var(--mode); clip-path: var(--torn); transform: rotate(-3deg);
+  display: block; width: fit-content; max-width: 100%; overflow: hidden; text-overflow: ellipsis; margin-top: 7px;
+  font: 400 11px/1.3 var(--mono); font-stretch: 100%; letter-spacing: .14em; text-transform: uppercase; color: var(--mode);
 }
+.brand em::before { content: '[ '; content: '[ ' / ''; color: var(--muted); }
+.brand em::after { content: ' ]'; content: ' ]' / ''; color: var(--muted); }
+/* Eyebrow: a mono label with a hairline running off to the right */
+.eb, h2 { display: flex; align-items: center; gap: 12px; font: 400 12px/1.2 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
+.eb::after, h2::after { content: ''; flex: 1; min-width: 24px; height: 1px; background: var(--line); }
 
-input { width: 100%; font: 500 16px var(--body); color: var(--text); background: var(--well); border: 2px solid rgba(246, 241, 232, .16); border-radius: 8px; padding: 14px 15px; -webkit-appearance: none; appearance: none; transition: border-color .2s, box-shadow .2s; }
+input { width: 100%; min-height: 52px; font: 400 16px/1.4 var(--body); color: var(--text); background: var(--well); border: 1px solid var(--line-2); border-radius: 0; padding: 13px 14px; -webkit-appearance: none; appearance: none; transition: border-color .2s, background .2s; }
 input::placeholder { color: var(--dim); }
-input:focus { outline: none; border-color: var(--cyan); box-shadow: 0 0 0 4px rgba(30, 227, 255, .16), 0 0 26px -6px rgba(30, 227, 255, .55); }
+input:hover { border-color: rgba(236, 235, 230, .45); }
+input:focus { outline: 2px solid var(--mode); outline-offset: 0; border-color: transparent; }
 
-/* Buttons: neon stickers with an ink die-cut edge and a misprinted shadow. */
+/* Buttons: sharp, flat orange with an arrow; ghosts are a hairline box. */
 .btn {
-  display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 16px 22px 15px; cursor: pointer;
-  font-family: var(--display); font-weight: 900; font-stretch: 75%; font-size: 20px; line-height: 1; letter-spacing: .05em; text-transform: uppercase;
-  color: var(--ink); background: var(--yellow); border: 0; border-radius: 999px;
-  box-shadow: 0 0 0 3px var(--ink), 5px 6px 0 3px var(--pink); transform: rotate(-.8deg); transition: transform .15s, box-shadow .2s;
+  --b: var(--orange); display: inline-flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 54px; padding: 0 18px; cursor: pointer;
+  font: 700 15px/1 var(--wide); font-stretch: 112%; letter-spacing: .05em; text-transform: uppercase; text-align: left;
+  color: var(--ink); background: var(--b); border: 1px solid var(--b); border-radius: 0; transition: background .2s, border-color .2s, color .2s, filter .2s, transform .15s var(--ease);
 }
-.btn:active { transform: translate(3px, 3px); box-shadow: 0 0 0 3px var(--ink), 2px 2px 0 3px var(--pink); }
+.btn::after { content: '→'; content: '→' / ''; flex: none; font: 400 18px/1 var(--mono); transition: transform .25s var(--ease); }
+.btn:active { transform: translateY(1px); }
 .btn:disabled { opacity: .5; cursor: default; }
-.btn.ghost { background: transparent; color: var(--text); box-shadow: inset 0 0 0 2px var(--line-strong); transform: none; }
-.btn.ghost:active { transform: translateY(1px); box-shadow: inset 0 0 0 2px var(--cyan); }
-.btn.small { padding: 10px 14px 9px; font-size: 15px; letter-spacing: .06em; }
+.btn.ghost { --b: transparent; justify-content: center; color: var(--text); border-color: var(--line-2); }
+.btn.ghost::after { content: none; }
+.btn.small { min-height: 40px; padding: 0 14px; font-size: 12px; letter-spacing: .08em; }
 @media (hover: hover) {
-  .btn:hover { transform: rotate(0) translateY(-2px); box-shadow: 0 0 0 3px var(--ink), 6px 8px 0 3px var(--pink), 0 0 30px rgba(255, 229, 0, .3); }
-  .btn.ghost:hover { color: var(--cyan); transform: none; box-shadow: inset 0 0 0 2px var(--cyan); }
+  .btn:not(.ghost):hover { filter: brightness(1.1); }
+  .btn:hover::after { transform: translateX(4px); }
+  .btn.ghost:hover { border-color: var(--text); background: rgba(236, 235, 230, .05); }
 }
 
 /* ---------- Sign in ---------- */
-.signin { min-height: 100%; display: flex; flex-direction: column; justify-content: center; isolation: isolate; }
-/* Paint thrown at the corners of the screen */
-.signin::before, .signin::after { content: ''; position: fixed; z-index: -1; pointer-events: none; -webkit-mask: var(--m-splat) center / contain no-repeat; mask: var(--m-splat) center / contain no-repeat; }
-.signin::before { width: 330px; height: 330px; top: -120px; right: -150px; background: var(--pink); transform: rotate(18deg); }
-.signin::after { width: 220px; height: 220px; bottom: -96px; left: -104px; background: var(--cyan); opacity: .85; transform: rotate(-50deg); }
-.signin h1 {
-  position: relative; width: fit-content; margin: 30px 0 40px;
-  font-family: var(--display); font-weight: 900; font-stretch: 62%; font-size: 84px; line-height: .84; letter-spacing: .005em; text-transform: uppercase; color: var(--text);
-  text-shadow: -.012em -.012em 0 var(--ink), .012em -.012em 0 var(--ink), -.012em .012em 0 var(--ink), .012em .012em 0 var(--ink), .045em .045em 0 var(--ink), .075em .07em 0 var(--pink);
+/* Full width (so the streaks can run edge to edge, clipped here), with the content in a centred column */
+.signin {
+  max-width: none; min-height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; isolation: isolate; overflow: clip;
+  background: var(--xh-lite) no-repeat 16px 16px / 24px, var(--xh-lite) no-repeat right 16px bottom 16px / 24px, var(--circ-lite-tr) no-repeat right top / 340px auto;
 }
-/* A neon drip hanging off the heading */
-.signin h1::after {
-  content: ''; position: absolute; left: .02em; right: -.04em; top: calc(100% - .03em); height: .26em; z-index: -1;
-  background: var(--pink); -webkit-mask: var(--m-drip) left top / 100% 100% no-repeat; mask: var(--m-drip) left top / 100% 100% no-repeat;
-  animation: drip-down 1.3s .2s cubic-bezier(.5, 0, .3, 1) both;
+.signin > * { width: 100%; max-width: 488px; }
+/* Speed streaks on the -13deg diagonal, in a band behind the wordmark and heading only, fading out above and below
+   so they never run behind the small text */
+.sig-head { position: relative; isolation: isolate; }
+.kin {
+  position: absolute; z-index: -1; top: -56px; bottom: -6px; left: calc(50% - 50vw); width: 100vw; overflow: hidden; pointer-events: none;
+  -webkit-mask-image: linear-gradient(transparent, #000 24%, #000 76%, transparent); mask-image: linear-gradient(transparent, #000 24%, #000 76%, transparent);
 }
-@keyframes drip-down { from { clip-path: inset(0 0 100% 0); } to { clip-path: inset(0 0 0 0); } }
-.signin p.lead { color: var(--muted); font-size: 16px; margin: 0 0 22px; max-width: 420px; }
-.signin label { display: block; font-family: var(--mono); font-size: 11.5px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin: 18px 0 8px; }
-.signin .btn { width: 100%; margin-top: 28px; }
-.msg { min-height: 22px; margin: 16px 0 0; font-size: 14.5px; font-weight: 600; color: var(--red); }
+.kin-field { position: absolute; inset: -60% -8%; transform: rotate(-13deg); }
+.sk { position: absolute; display: block; left: var(--x); top: var(--y); width: var(--w); height: var(--h, 1px); opacity: var(--o, 1); animation: zip 1.15s var(--ease) both; animation-delay: calc(var(--d, 0) * 1ms + 120ms); }
+.sk.c { background: linear-gradient(90deg, rgba(34, 225, 255, 0), rgba(34, 225, 255, .25) 35%, var(--cyan) 88%, #d9fbff); box-shadow: 0 0 14px 1px rgba(34, 225, 255, .45); }
+.sk.g { background: linear-gradient(90deg, rgba(182, 255, 59, 0), var(--acid) 45%, #7ff0c8 72%, var(--cyan)); box-shadow: 0 0 16px 1px rgba(160, 255, 120, .35); }
+.sk.p { background: var(--purple); box-shadow: 0 0 12px rgba(139, 61, 255, .55); }
+.sk.w { background: linear-gradient(90deg, rgba(236, 235, 230, 0), rgba(236, 235, 230, .55)); }
+.sk.n { background: repeating-linear-gradient(90deg, rgba(214, 213, 207, .5) 0 1px, rgba(214, 213, 207, 0) 1px 3px), linear-gradient(90deg, rgba(214, 213, 207, 0), rgba(214, 213, 207, .18) 40%, rgba(214, 213, 207, .08)); }
+@keyframes zip { from { transform: translateX(-38%) scaleX(.4); opacity: 0; } 35% { opacity: var(--o, 1); } to { transform: none; opacity: var(--o, 1); } }
+.signin .eb { margin: 40px 0 16px; }
+.signin h1 { margin: 0 0 18px; font-family: var(--wide); font-stretch: 125%; font-size: clamp(42px, 13vw, 68px); line-height: .92; letter-spacing: -.015em; text-transform: uppercase; color: var(--text); }
+.signin h1 b { font-weight: 900; }
+.signin h1 i { font-style: normal; font-weight: 200; letter-spacing: .01em; }
+.signin p.lead { color: var(--muted); font-size: 16px; line-height: 1.5; margin: 0 0 26px; }
+/* The form is a concrete utility panel: crosshairs in the corners, circuit traces, ink type. */
+.signin form {
+  position: relative; padding: 34px 20px 22px; color: var(--ink);
+  background: var(--xh-ink) no-repeat 8px 8px / 20px, var(--xh-ink) no-repeat right 8px bottom 8px / 20px, var(--circ-ink-tr) no-repeat right top / 280px auto, var(--concrete) var(--concrete-tex);
+}
+.signin label { display: block; font: 400 12px/1.2 var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--ink-2); margin: 20px 0 8px; }
+.signin label:first-child { margin-top: 0; }
+.signin form input { color: var(--ink); background: rgba(244, 243, 239, .94); border-color: rgba(20, 20, 22, .42); }
+.signin form input::placeholder { color: #6b6a64; }
+.signin form input:hover { border-color: var(--ink); }
+.signin form input:focus { outline: 2px solid var(--ink); border-color: var(--ink); background: var(--paper); }
+.signin form :focus-visible { outline-color: var(--ink); }
+.signin .btn { width: 100%; margin-top: 26px; box-shadow: 0 0 0 1px var(--ink); }
+.msg { min-height: 22px; margin: 14px 0 0; font-size: 14.5px; font-weight: 600; color: #a3140c; }
+.sig-data { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 16px; margin-top: 26px; padding-top: 14px; border-top: 1px solid var(--line); font: 400 11px/1.2 var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--dim); }
 
 /* ---------- Main ---------- */
-.bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 12px; margin-bottom: 16px; padding-bottom: 14px; border-bottom: 2px dashed var(--line); }
-.bar .brand { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 3px 0; }
-.bar .net { flex: none; }
-.net { display: inline-flex; align-items: center; gap: 7px; padding: 6px 11px 5px; border-radius: 999px; border: 2px solid currentColor; font-family: var(--mono); font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; white-space: nowrap; }
-.net i { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
-.net.ok { color: var(--good); }
+.bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; padding: 4px 0 14px; border-bottom: 1px solid var(--line); }
+.bar .brand { flex: 1 1 auto; min-width: 0; overflow: hidden; }
+.net { flex: none; display: inline-flex; align-items: center; gap: 8px; min-height: 30px; padding: 0 10px; border: 1px solid currentColor; font: 700 11px/1 var(--mono); letter-spacing: .1em; text-transform: uppercase; white-space: nowrap; }
+.net i { width: 7px; height: 7px; background: currentColor; }
+.net.ok { color: var(--good); border-color: rgba(182, 255, 59, .45); }
 .net.warn { color: var(--warn); }
-/* Offline is a yellow sticker, hard to miss */
-.net.off { color: var(--ink); background: var(--warn); border-color: var(--warn); box-shadow: 2px 3px 0 var(--pink); transform: rotate(-2deg); }
-.count { position: relative; isolation: isolate; display: flex; align-items: baseline; gap: 12px; margin: 6px 0 18px; color: var(--muted); font-family: var(--mono); font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
-.count::before {
-  content: ''; position: absolute; z-index: -1; left: -30px; top: -26px; width: 120px; height: 120px; opacity: .22; pointer-events: none;
-  background: var(--mode); -webkit-mask: var(--m-splat) center / contain no-repeat; mask: var(--m-splat) center / contain no-repeat; transform: rotate(-20deg);
-}
-.count b#in-count {
-  font-family: var(--display); font-weight: 900; font-stretch: 62%; font-size: 76px; line-height: .86; letter-spacing: 0; color: var(--text);
-  text-shadow: .04em .04em 0 var(--ink), .07em .065em 0 var(--mode);
-}
+/* Offline is a solid yellow block with a blinking square, hard to miss */
+.net.off { color: var(--ink); background: var(--warn); border-color: var(--warn); }
+.net.off i { animation: blink 1.2s steps(2, start) infinite; }
+@keyframes blink { to { visibility: hidden; } }
+
+/* Count: the big number, an orange (or cyan) slash, and what it counts */
+.count { display: flex; align-items: center; gap: 14px; margin: 4px 0 20px; font: 400 12px/1.4 var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+.count b#in-count { order: 0; font-family: var(--wide); font-stretch: 125%; font-weight: 900; font-size: 58px; line-height: .9; letter-spacing: -.02em; color: var(--text); }
+.count::before { content: ''; order: 1; flex: none; width: 3px; height: 52px; margin: 0 4px; background: var(--mode); transform: rotate(24deg); box-shadow: 0 0 12px var(--mode); }
+.count > span { order: 2; }
 .count span b { color: var(--text); font-weight: 700; }
 
-/* Entry / Pickup switch. The chosen mode is a sticker in its colour; Pickup tints everything cyan. */
-.mode { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; padding: 5px; margin: 0 0 18px; border: 2px solid var(--line-strong); border-radius: 999px; background: var(--well); }
+/* Entry / Pickup switch: two hairline cells; the chosen one fills with its mode colour. */
+.mode { display: grid; grid-template-columns: 1fr 1fr; margin: 0 0 18px; border: 1px solid var(--line-2); background: var(--well); }
 .mode label { position: relative; display: block; cursor: pointer; }
-.mode input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; padding: 0; border: 0; opacity: 0; cursor: pointer; }
+.mode label + label { border-left: 1px solid var(--line-2); }
+.mode input { position: absolute; inset: 0; width: 100%; height: 100%; min-height: 0; margin: 0; padding: 0; border: 0; opacity: 0; cursor: pointer; }
 .mode span {
-  display: block; padding: 13px 10px 12px; border-radius: 999px; text-align: center;
-  font-family: var(--display); font-weight: 900; font-stretch: 75%; font-size: 19px; line-height: 1; letter-spacing: .07em; text-transform: uppercase;
-  color: var(--muted); transition: background .15s, color .15s, transform .15s, box-shadow .15s;
+  display: flex; align-items: center; justify-content: center; gap: 10px; min-height: 54px; padding: 0 10px;
+  font: 700 15px/1 var(--wide); font-stretch: 118%; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--muted); transition: background .15s, color .15s;
 }
-.mode input:checked + span { background: var(--mode); color: var(--ink); box-shadow: 0 0 0 2px var(--ink), 3px 4px 0 2px var(--mode-pop); transform: rotate(-1.5deg); }
-.mode input:focus-visible + span { outline: 3px solid var(--text); outline-offset: 3px; }
+.mode span::before { content: ''; flex: none; width: 8px; height: 8px; border: 1px solid currentColor; }
+.mode input:checked + span { background: var(--mode); color: var(--ink); }
+.mode input:checked + span::before { background: var(--ink); }
+.mode input:focus-visible + span { outline: 2px solid var(--text); outline-offset: -6px; }
+@media (hover: hover) { .mode input:not(:checked):hover + span { color: var(--text); background: rgba(236, 235, 230, .04); } }
 
-.cam { position: relative; aspect-ratio: 1; border-radius: 16px; overflow: hidden; background: #000; border: 2px solid var(--mode); }
+.cam { position: relative; aspect-ratio: 1; overflow: hidden; background: var(--black); border: 1px solid var(--mode); }
+/* The mode, as a tag in the camera's corner, so it shows even with the video running */
+.cam::after { content: '[ Entry ]'; content: '[ Entry ]' / ''; position: absolute; z-index: 2; left: 12px; top: 12px; font: 700 11px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--mode); text-shadow: 0 1px 6px rgba(0, 0, 0, .9); pointer-events: none; }
+body.pickup .cam::after { content: '[ Pickup ]'; content: '[ Pickup ]' / ''; }
 .cam video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: 0; transition: opacity .3s; }
 .cam.on video { opacity: 1; }
-.frame { position: absolute; inset: 17%; border-radius: 18px; pointer-events: none; opacity: 0; transition: opacity .3s;
+.frame { position: absolute; inset: 17%; pointer-events: none; opacity: 0; transition: opacity .3s;
   background:
-    linear-gradient(var(--mode), var(--mode)) top left / 38px 5px no-repeat,
-    linear-gradient(var(--mode), var(--mode)) top left / 5px 38px no-repeat,
-    linear-gradient(var(--mode), var(--mode)) top right / 38px 5px no-repeat,
-    linear-gradient(var(--mode), var(--mode)) top right / 5px 38px no-repeat,
-    linear-gradient(var(--mode), var(--mode)) bottom left / 38px 5px no-repeat,
-    linear-gradient(var(--mode), var(--mode)) bottom left / 5px 38px no-repeat,
-    linear-gradient(var(--mode), var(--mode)) bottom right / 38px 5px no-repeat,
-    linear-gradient(var(--mode), var(--mode)) bottom right / 5px 38px no-repeat; }
+    linear-gradient(var(--mode), var(--mode)) top left / 34px 3px no-repeat,
+    linear-gradient(var(--mode), var(--mode)) top left / 3px 34px no-repeat,
+    linear-gradient(var(--mode), var(--mode)) top right / 34px 3px no-repeat,
+    linear-gradient(var(--mode), var(--mode)) top right / 3px 34px no-repeat,
+    linear-gradient(var(--mode), var(--mode)) bottom left / 34px 3px no-repeat,
+    linear-gradient(var(--mode), var(--mode)) bottom left / 3px 34px no-repeat,
+    linear-gradient(var(--mode), var(--mode)) bottom right / 34px 3px no-repeat,
+    linear-gradient(var(--mode), var(--mode)) bottom right / 3px 34px no-repeat; }
 .cam.on .frame { opacity: 1; }
-.frame::after { content: ''; position: absolute; left: 8%; right: 8%; top: 50%; height: 3px; border-radius: 3px; background: var(--mode); box-shadow: 0 0 16px var(--mode); opacity: .85; animation: sweep 2.4s ease-in-out infinite; }
+.frame::after { content: ''; position: absolute; left: 6%; right: 6%; top: 50%; height: 2px; background: var(--mode); box-shadow: 0 0 14px var(--mode); opacity: .85; animation: sweep 2.4s ease-in-out infinite; }
 @keyframes sweep { 0%, 100% { top: 12%; } 50% { top: 88%; } }
-.cam-idle { position: absolute; inset: 0; isolation: isolate; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 22px; padding: 24px; text-align: center; }
-.cam-idle::before {
-  content: ''; position: absolute; z-index: -1; width: 86%; aspect-ratio: 1; left: 7%; top: 4%; opacity: .2; pointer-events: none;
-  background: var(--mode); -webkit-mask: var(--m-splat) center / contain no-repeat; mask: var(--m-splat) center / contain no-repeat; transform: rotate(24deg);
+.cam-idle {
+  position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 22px; padding: 24px; text-align: center;
+  background: var(--xh-lite) no-repeat 12px calc(100% - 12px) / 22px, var(--xh-lite) no-repeat right 12px bottom 12px / 22px, var(--circ-lite-tr) no-repeat right top / 250px auto, var(--streak-lite) center 18% / 760px auto repeat-x;
 }
 .cam.on .cam-idle { display: none; }
-.cam-idle .btn { box-shadow: 0 0 0 3px var(--ink), 5px 6px 0 3px var(--mode); }
-.cam-idle .btn:active { box-shadow: 0 0 0 3px var(--ink), 2px 2px 0 3px var(--mode); }
-.cam-idle p { margin: 0; color: var(--text); font-size: 15px; font-weight: 500; max-width: 270px; text-shadow: 0 1px 10px var(--bg); }
-.cam-hint { position: absolute; left: 0; right: 0; bottom: 12px; margin: 0; text-align: center; font-family: var(--mono); font-size: 11.5px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: #fff; text-shadow: 0 1px 6px rgba(0, 0, 0, .9); }
+.cam-idle .btn { --b: var(--mode); min-width: 230px; }
+.cam-idle p { margin: 0; color: var(--muted); font-size: 15px; max-width: 280px; }
+.cam-hint { position: absolute; left: 0; right: 0; bottom: 14px; margin: 0; text-align: center; font: 700 11px/1.3 var(--mono); letter-spacing: .12em; text-transform: uppercase; color: #fff; text-shadow: 0 1px 6px rgba(0, 0, 0, .9); }
 .cam:not(.on) .cam-hint { display: none; }
-.btn.cam-stop { position: absolute; top: 10px; right: 10px; padding: 8px 13px 7px; font-size: 14px; background: rgba(0, 0, 0, .6); color: #fff; box-shadow: inset 0 0 0 2px rgba(255, 255, 255, .45); }
+.btn.cam-stop { position: absolute; top: 8px; right: 8px; background: rgba(10, 10, 11, .72); }
 .cam:not(.on) .cam-stop { display: none; }
 
 .search { display: flex; gap: 8px; margin-top: 18px; }
 .search input { flex: 1; min-width: 0; }
-.matches { display: grid; gap: 8px; margin-top: 10px; }
-.match { display: grid; grid-template-columns: 1fr auto; gap: 3px 12px; align-items: center; text-align: left; width: 100%; padding: 13px 14px; border-radius: 10px; border: 2px solid var(--line); background: var(--surface); color: var(--text); font: inherit; cursor: pointer; transition: border-color .15s; }
-.match:active { border-color: var(--mode); }
-.match .m-email { font-weight: 700; overflow-wrap: anywhere; }
-.match .m-sub { grid-column: 1; font-size: 12px; color: var(--muted); font-family: var(--mono); }
-.match .m-status { grid-column: 2; grid-row: 1 / span 2; font-family: var(--mono); font-size: 11px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+.matches { display: grid; gap: 6px; margin-top: 10px; }
+/* A match is a hairline row; a mode-coloured bar slides in on the left when it's pressed or focused. */
+.match { position: relative; display: grid; grid-template-columns: 1fr auto; gap: 3px 14px; align-items: center; text-align: left; width: 100%; padding: 13px 14px 13px 16px; border: 1px solid var(--line); border-radius: 0; background: var(--char-2); color: var(--text); font: inherit; cursor: pointer; transition: border-color .15s, background .15s; }
+.match::before { content: ''; position: absolute; left: -1px; top: -1px; bottom: -1px; width: 3px; background: var(--mode); transform: scaleY(0); transform-origin: top; transition: transform .2s var(--ease); }
+.match:active::before, .match:focus-visible::before { transform: none; }
+.match:active { border-color: var(--line-2); }
+.match .m-email { font-weight: 600; overflow-wrap: anywhere; }
+.match .m-sub { grid-column: 1; font: 400 12px/1.45 var(--mono); color: var(--muted); }
+.match .m-status { grid-column: 2; grid-row: 1 / span 2; display: inline-flex; align-items: center; gap: 7px; font: 700 11px/1.2 var(--mono); letter-spacing: .1em; text-transform: uppercase; white-space: nowrap; }
+.match .m-status::before { content: ''; flex: none; width: 7px; height: 7px; background: currentColor; }
 .st-ok { color: var(--good); } .st-in { color: var(--muted); } .st-warn { color: var(--warn); } .st-bad { color: var(--bad); }
-.empty { color: var(--muted); font-size: 14px; margin: 4px 2px; }
+.empty { color: var(--muted); font-size: 14px; margin: 4px 0; }
 /* Pickup search: the guest's name leads, their email sits under it. */
 .match.pick .m-status { grid-row: 1 / span 3; }
-.match .m-name { font-weight: 800; font-size: 17px; line-height: 1.25; overflow-wrap: anywhere; }
+.match .m-name { font-weight: 700; font-size: 17px; line-height: 1.25; overflow-wrap: anywhere; }
 .match .m-mail { grid-column: 1; font-size: 13.5px; color: var(--text); opacity: .86; overflow-wrap: anywhere; }
 .match .m-mail.none { color: var(--dim); opacity: 1; font-style: italic; }
 .match .m-ref { white-space: nowrap; }
-@media (hover: hover) { .match:hover { border-color: var(--line-strong); } body.pickup .match:hover { border-color: var(--mode); } }
-.empty.more { font-family: var(--mono); font-size: 12px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+@media (hover: hover) { .match:hover { border-color: var(--line-2); background: var(--char-3); } .match:hover::before { transform: none; } }
+.empty.more { font: 400 12px/1.4 var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
 .desk-h, .matches .idle { display: none; }
 
-/* Section label: a strip of torn tape */
-h2 {
-  width: fit-content; margin: 32px 0 12px; padding: 6px 12px 5px;
-  font-family: var(--mono); font-size: 11px; font-weight: 700; line-height: 1.2; letter-spacing: .16em; text-transform: uppercase;
-  color: var(--ink); background: var(--yellow); clip-path: var(--torn); transform: rotate(-2deg); transform-origin: left center;
-}
-.recent { list-style: none; margin: 0; padding: 0; border: 2px solid var(--line); border-radius: 12px; overflow: hidden; background: var(--surface); }
-.recent li { display: grid; grid-template-columns: 12px 1fr auto; gap: 3px 12px; align-items: center; padding: 12px 14px; border-top: 2px dashed var(--line); }
-.recent li:first-child { border-top: 0; }
-/* Paint-drop dots */
-.recent .dot { width: 10px; height: 10px; border-radius: 50% 50% 50% 8%; transform: rotate(-30deg); }
-.recent .who { font-weight: 700; font-size: 14px; overflow-wrap: anywhere; }
-.recent .what { grid-column: 2 / span 2; font-size: 12.5px; color: var(--muted); }
-.recent .when { font-family: var(--mono); font-size: 11px; color: var(--dim); }
-.recent .none { display: block; padding: 16px 14px; color: var(--dim); font-size: 14px; }
+/* Section label: a mono eyebrow with a hairline */
+h2 { margin: 34px 0 4px; }
+.recent { list-style: none; margin: 0; padding: 0; }
+.recent li { display: grid; grid-template-columns: 8px 1fr auto; gap: 3px 12px; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.recent .dot { width: 8px; height: 8px; }
+.recent .who { font-weight: 600; font-size: 14.5px; overflow-wrap: anywhere; }
+.recent .what { grid-column: 2 / span 2; font-size: 13px; color: var(--muted); }
+.recent .when { font: 400 11px/1 var(--mono); color: var(--dim); }
+.recent .none { display: block; padding: 16px 0; color: var(--dim); font-size: 14px; }
+.recent li:has(.none) { border-bottom: 0; }
 .dot.ok { background: var(--good); } .dot.bad { background: var(--bad); } .dot.warn { background: var(--warn); } .dot.neutral { background: var(--dim); }
 
-.foot { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 26px; padding-top: 18px; border-top: 2px dashed var(--line); }
-.foot .sync-text { flex: 1; min-width: 150px; font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+.foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 26px; padding-top: 16px; border-top: 1px solid var(--line); }
+.foot .sync-text { flex: 1 1 100%; margin-bottom: 4px; font: 400 11.5px/1.4 var(--mono); color: var(--muted); }
 
 /* Pickup desk on a laptop: camera, count and recent scans on the left; a big name search and a longer list on
-   the right. Entry mode keeps the phone layout at every width. */
+   the right, on a concrete utility panel under a black header strip. Entry mode keeps the phone layout at every width. */
 @media (min-width: 900px) {
   body.pickup #main {
     max-width: 1180px; padding-left: 28px; padding-right: 28px;
@@ -403,122 +447,160 @@ h2 {
   body.pickup #main > h2 { grid-area: rh; }
   body.pickup #main > .recent { grid-area: recent; }
   body.pickup #main > .foot { grid-area: foot; }
-  body.pickup .desk { grid-area: desk; position: relative; isolation: isolate; min-width: 0; padding: 22px 24px 26px; border: 2px solid var(--line-strong); border-radius: 18px; background: var(--surface); }
-  /* A cyan splat over the desk's top corner (kept inside the right edge, so the page never scrolls sideways) */
-  body.pickup .desk::before {
-    content: ''; position: absolute; z-index: -1; right: 6px; top: -46px; width: 190px; height: 190px; opacity: .16; pointer-events: none;
-    background: var(--mode); -webkit-mask: var(--m-splat) center / contain no-repeat; mask: var(--m-splat) center / contain no-repeat; transform: rotate(-12deg);
+  body.pickup .desk {
+    grid-area: desk; position: relative; min-width: 0; padding: 0 26px 30px; color: var(--ink); --muted: var(--ink-2); --dim: #5c5b55;
+    background: var(--xh-ink) no-repeat 10px calc(100% - 10px) / 20px, var(--xh-ink) no-repeat right 10px bottom 10px / 20px, var(--circ-ink-tr) no-repeat right 52px / 300px auto, var(--concrete) var(--concrete-tex);
   }
-  body.pickup .desk-h { display: block; margin: 0 0 16px; background: var(--mode); }
+  body.pickup .desk :focus-visible { outline-color: var(--ink); }
+  body.pickup .desk-h { display: flex; position: relative; overflow: hidden; min-height: 52px; margin: 0 -26px 22px; padding: 0 26px; background: var(--ink); color: var(--concrete-2); }
+  body.pickup .desk-h::before { content: ''; flex: none; width: 8px; height: 8px; background: var(--mode); }
+  /* A cyan slash through the header strip, like the one on the guest's pass */
+  body.pickup .desk-h::after { flex: none; min-width: 0; width: 3px; height: 74px; margin: 0 64px 0 auto; background: var(--mode); transform: rotate(24deg); box-shadow: 0 0 12px var(--mode); }
   body.pickup .search { margin-top: 0; }
-  body.pickup .search input { padding: 18px 20px; font-size: 21px; font-weight: 600; border-color: var(--line-strong); }
-  body.pickup .matches { margin-top: 14px; gap: 10px; }
-  body.pickup .match { padding: 15px 18px; }
+  body.pickup .search input { min-height: 64px; padding: 16px 20px; font-size: 21px; font-weight: 500; color: var(--ink); background: rgba(244, 243, 239, .94); border-color: rgba(20, 20, 22, .42); }
+  body.pickup .search input::placeholder { color: #6b6a64; }
+  body.pickup .search input:hover { border-color: var(--ink); }
+  body.pickup .search input:focus { outline: 2px solid var(--ink); border-color: var(--ink); background: var(--paper); }
+  body.pickup .matches { margin-top: 14px; gap: 8px; }
+  body.pickup .match { padding: 15px 18px 15px 20px; color: var(--ink); background: rgba(244, 243, 239, .6); border-color: var(--ink-line); }
+  body.pickup .match::before { background: var(--ink); }
+  body.pickup .match:active { border-color: var(--ink); }
   body.pickup .match .m-name { font-size: 21px; }
-  body.pickup .match .m-mail { font-size: 14.5px; }
+  body.pickup .match .m-mail { font-size: 14.5px; color: var(--ink); opacity: .82; }
+  body.pickup .match .m-mail.none { color: var(--dim); opacity: 1; }
   body.pickup .match .m-sub { font-size: 12.5px; }
   body.pickup .match .m-status { font-size: 12px; }
+  body.pickup .desk .st-ok { color: #17561f; } body.pickup .desk .st-in { color: var(--ink-2); } body.pickup .desk .st-warn { color: #7a4d00; } body.pickup .desk .st-bad { color: #a3140c; }
   body.pickup .matches .idle { display: block; margin-top: 4px; }
 }
+@media (min-width: 900px) and (hover: hover) { body.pickup .match:hover { border-color: var(--ink); background: rgba(244, 243, 239, .9); } }
 
 /* ---------- Full-screen result ----------
-   Flat, loud colour first; the paint (an ink splat and a drip off the top edge) stays in the background.
-   The page scrolls if a long result doesn't fit a small phone. */
+   Flat, loud colour first; the kinetic art (ink speed streaks, crosshairs, circuit traces) stays faint in the
+   background. The page scrolls if a long result doesn't fit a small phone. */
 .result {
   position: fixed; inset: 0; z-index: 50; isolation: isolate; display: flex; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain;
   padding: max(58px, calc(env(safe-area-inset-top) + 40px)) 22px max(26px, env(safe-area-inset-bottom));
-  animation: pop .18s ease-out; --rc: var(--text); --pop: var(--pink);
+  animation: pop .16s var(--ease); --rc: var(--text);
 }
-@keyframes pop { from { opacity: 0; transform: scale(1.03); } to { opacity: 1; transform: none; } }
-.result::before {
-  content: ''; position: absolute; z-index: -1; width: 380px; height: 380px; top: -70px; right: -150px; pointer-events: none; opacity: .1;
-  background: var(--ink); -webkit-mask: var(--m-splat) center / contain no-repeat; mask: var(--m-splat) center / contain no-repeat; transform: rotate(14deg);
-}
-.result::after {
-  content: ''; position: absolute; z-index: -1; left: 0; right: 0; top: 0; height: 56px; pointer-events: none;
-  background: var(--ink); -webkit-mask: var(--m-drip) left top / 100% 100% no-repeat; mask: var(--m-drip) left top / 100% 100% no-repeat;
-}
-.result.ok { background: var(--go); color: var(--ink); --rc: var(--go); --pop: var(--pink); }
-.result.bad { background: var(--red); color: var(--ink); --rc: var(--red); --pop: var(--yellow); }
-.result.warn { background: var(--yellow); color: var(--ink); --rc: var(--yellow); --pop: var(--pink); }
-.result.neutral, .result.checking { background: var(--surface-2); color: var(--text); --rc: var(--cyan); --pop: var(--pink); }
-.result.neutral::before, .result.checking::before { background: var(--cyan); opacity: .14; }
-.result.neutral::after, .result.checking::after { background: var(--pink); }
-.r-inner { width: 100%; max-width: 480px; margin: auto; }
+@keyframes pop { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+.result::before { content: ''; position: absolute; inset: 0; z-index: -1; pointer-events: none;
+  background: var(--xh-ink) no-repeat 12px 12px / 22px, var(--xh-ink) no-repeat right 12px bottom 12px / 22px, var(--circ-ink-tr) no-repeat right top / 320px auto; }
+.result::after { content: ''; position: absolute; left: 0; right: 0; top: 0; height: 300px; z-index: -1; pointer-events: none; background: var(--streak-ink) center -40px / 900px auto repeat-x; }
+.result.ok { background: var(--go); color: var(--ink); --rc: var(--go); }
+.result.bad { background: var(--stop); color: var(--ink); --rc: var(--stop); }
+.result.warn { background: var(--caution); color: var(--ink); --rc: var(--caution); }
+.result.neutral, .result.checking { background: var(--char) var(--matte); color: var(--text); --rc: var(--cyan); }
+.result.neutral::before, .result.checking::before { background: var(--xh-lite) no-repeat 12px 12px / 22px, var(--xh-lite) no-repeat right 12px bottom 12px / 22px, var(--circ-lite-tr) no-repeat right top / 320px auto; }
+.result.neutral::after, .result.checking::after { background-image: var(--streak-lite); }
+.r-inner { width: 100%; max-width: 560px; margin: auto; }
+@media (min-width: 900px) { .r-inner { max-width: 640px; } }
+/* The label: an ink tag, the icon in a square of the result's colour */
 .r-label {
-  display: inline-flex; align-items: center; gap: 9px; max-width: 100%; margin: 0; padding: 7px 13px 6px;
-  font-family: var(--mono); font-size: 13px; font-weight: 700; line-height: 1.3; letter-spacing: .12em; text-transform: uppercase;
-  color: var(--rc); background: var(--ink); clip-path: var(--torn); transform: rotate(-2deg); transform-origin: left center;
+  display: inline-flex; align-items: center; gap: 11px; max-width: 100%; min-height: 36px; margin: 0; padding: 4px 13px 4px 4px;
+  font: 700 12.5px/1.35 var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--rc); background: var(--ink);
 }
-.result.neutral .r-label, .result.checking .r-label { color: var(--ink); background: var(--cyan); }
-/* A shape as well as a colour, for anyone who can't tell green from red */
-.r-label::before { flex: none; display: inline-grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; font-family: var(--body); font-size: 13px; font-weight: 900; line-height: 1; letter-spacing: 0; color: var(--ink); background: var(--rc); }
+/* A shape as well as a colour, for anyone who can't tell green from red: an ink glyph in a square of the result's
+   colour, set inside the ink tag */
+.r-label::before { flex: none; align-self: stretch; display: grid; place-items: center; width: 28px; min-height: 28px; font: 900 16px/1 var(--body); letter-spacing: 0; color: var(--ink); background: var(--rc); }
 .result.ok .r-label::before { content: '✓'; content: '✓' / ''; }
 .result.bad .r-label::before { content: '✕'; content: '✕' / ''; }
 .result.warn .r-label::before { content: '!'; content: '!' / ''; }
-.result.neutral .r-label::before { content: '↺'; content: '↺' / ''; color: var(--cyan); background: var(--ink); }
+.result.neutral .r-label::before { content: '↺'; content: '↺' / ''; }
+.result.neutral .r-label, .result.checking .r-label { background: transparent; box-shadow: inset 0 0 0 1px var(--line-2); }
+.result.checking .r-label { padding-left: 13px; color: var(--muted); }
+.result.neutral .r-label { color: var(--cyan); }
 .result h1 {
-  font-family: var(--display); font-weight: 900; font-stretch: 62%; text-transform: uppercase;
-  font-size: clamp(76px, 27vw, 150px); line-height: .84; letter-spacing: .005em; margin: 16px 0 18px;
-  overflow-wrap: normal; word-break: keep-all; hyphens: none; text-shadow: .035em .035em 0 var(--pop);
+  font-family: var(--wide); font-stretch: 125%; font-weight: 900; text-transform: uppercase;
+  font-size: clamp(54px, 17vw, 116px); line-height: .9; letter-spacing: -.015em; margin: 20px 0 18px;
+  overflow-wrap: normal; word-break: keep-all; hyphens: none;
 }
-.result.checking h1 { text-shadow: none; color: var(--muted); }
-/* Check ID (Pickup, from a name search): a flat cyan screen, the guest's name as the headline, to hold up against
-   their photo ID before anything is recorded. */
-.result.idcheck { background: var(--cyan); color: var(--ink); --rc: var(--cyan); --pop: var(--pink); }
+.result.checking h1 { color: var(--muted); }
+/* Check ID (Pickup, from a name search): a concrete card in a thick orange frame, the guest's name as the headline,
+   to hold up against their photo ID before anything is recorded. */
+.result.idcheck { background: var(--concrete) var(--concrete-tex); color: var(--ink); --rc: var(--orange); box-shadow: inset 0 0 0 10px var(--orange); }
+.result.idcheck::before { background: var(--xh-ink) no-repeat 20px 20px / 22px, var(--xh-ink) no-repeat right 20px bottom 20px / 22px, var(--circ-ink-tr) no-repeat right 10px top 10px / 320px auto; }
+.result.idcheck::after { display: none; }
 .result.idcheck .r-label::before { content: '?'; content: '?' / ''; }
 /* Names get more line height than the result words: an accent on a capital (É) would touch the line above. */
-.result h1.name { font-size: clamp(56px, 19vw, 128px); line-height: 1; }
-.result h1.quiet { font-size: clamp(42px, 12.5vw, 76px); line-height: .92; text-shadow: none; }
+.result h1.name { font-size: clamp(42px, 13vw, 100px); line-height: 1.02; letter-spacing: -.01em; }
+.result h1.quiet { font-size: clamp(32px, 9.5vw, 58px); line-height: 1; }
 /* The guest's name on Hand over, under the big result word */
 .r-name {
-  margin: -4px 0 16px; font-family: var(--display); font-weight: 900; font-stretch: 62%; text-transform: uppercase;
-  font-size: clamp(40px, 12.5vw, 76px); line-height: 1; letter-spacing: .01em; overflow-wrap: normal; word-break: keep-all; hyphens: none;
+  margin: -4px 0 16px; padding-top: 14px; border-top: 2px solid currentColor;
+  font-family: var(--wide); font-stretch: 112%; font-weight: 800; text-transform: uppercase;
+  font-size: clamp(32px, 10vw, 54px); line-height: 1.04; letter-spacing: -.005em; overflow-wrap: normal; word-break: keep-all; hyphens: none;
 }
 .r-name:empty { display: none; }
-/* Two guests share this name: an ink sticker that can't be missed */
+/* Two guests share this name: an ink strip with a yellow warning that can't be missed */
 .r-warn {
-  display: flex; align-items: flex-start; gap: 10px; margin: 18px 0 0; padding: 13px 15px; border-radius: 10px;
-  font-size: 17px; font-weight: 800; line-height: 1.35; color: var(--yellow); background: var(--ink); box-shadow: 5px 5px 0 var(--pop); transform: rotate(-.6deg);
+  display: flex; align-items: center; gap: 14px; margin: 18px 0 0; padding: 12px 15px 12px 0;
+  font-size: 17px; font-weight: 700; line-height: 1.35; color: var(--caution); background: var(--ink);
 }
-.r-warn::before { content: '!'; content: '!' / ''; flex: none; display: inline-grid; place-items: center; width: 24px; height: 24px; margin-top: -1px; border-radius: 50%; font-size: 15px; font-weight: 900; color: var(--ink); background: var(--yellow); }
+.r-warn::before { content: '!'; content: '!' / ''; flex: none; align-self: stretch; display: grid; place-items: center; width: 42px; margin: -12px 0; font: 900 20px/1 var(--body); color: var(--ink); background: var(--caution); }
 .r-warn:empty { display: none; }
-.r-email.hl { display: inline-block; max-width: 100%; padding: 7px 11px 6px; border-radius: 8px; font-size: 16px; color: var(--cyan); background: var(--ink); }
-.r-pkg { margin: 0; font-size: 24px; font-weight: 800; line-height: 1.2; }
-/* The size to hand over: a big ink sticker, readable from the stock shelf */
+.r-email.hl { display: block; width: fit-content; max-width: 100%; padding: 8px 11px 7px; font-size: 16px; color: var(--caution); background: var(--ink); }
+.r-pkg { margin: 0; font-family: var(--wide); font-stretch: 112%; font-weight: 700; font-size: 20px; line-height: 1.25; text-transform: uppercase; letter-spacing: .02em; overflow-wrap: anywhere; }
+/* The size to hand over: a big ink block, readable from the stock shelf */
 .r-size {
-  display: inline-block; max-width: 100%; margin: 14px 0 0; padding: 10px 18px 4px; border-radius: 10px; overflow-wrap: anywhere;
-  font-family: var(--display); font-weight: 900; font-stretch: 62%; font-size: clamp(56px, 18vw, 96px); line-height: .9; word-spacing: .12em; text-transform: uppercase;
-  color: var(--rc); background: var(--ink); box-shadow: 5px 5px 0 var(--pop); transform: rotate(-1.5deg);
+  display: block; width: fit-content; max-width: 100%; margin: 14px 0 0; padding: 12px 18px 10px; overflow-wrap: anywhere;
+  font-family: var(--wide); font-stretch: 112%; font-weight: 900; font-size: clamp(46px, 14vw, 84px); line-height: .95; letter-spacing: -.01em; text-transform: uppercase;
+  color: var(--rc); background: var(--ink);
 }
 .r-size:empty { display: none; }
-.r-size.warn { padding: 12px 16px 11px; color: var(--yellow); font: 800 20px/1.2 var(--body); letter-spacing: .02em; text-transform: none; }
-.r-email { margin: 10px 0 0; font-family: var(--mono); font-size: 14px; font-weight: 700; overflow-wrap: anywhere; }
-.r-note { margin: 18px 0 0; padding: 14px 16px; border-radius: 8px; border-left: 5px solid var(--ink); background: rgba(11, 10, 13, .1); font-size: 16px; font-weight: 600; line-height: 1.45; overflow-wrap: anywhere; }
-.result.neutral .r-note { border-left-color: var(--cyan); background: rgba(246, 241, 232, .06); }
+.r-size.warn { padding: 12px 16px 11px; color: var(--caution); font: 700 19px/1.25 var(--body); letter-spacing: .01em; text-transform: none; }
+.r-email { margin: 12px 0 0; font: 700 14px/1.4 var(--mono); overflow-wrap: anywhere; }
+.r-note { margin: 18px 0 0; padding: 12px 15px; border-left: 3px solid currentColor; background: rgba(20, 20, 22, .08); font-size: 16px; font-weight: 500; line-height: 1.45; overflow-wrap: anywhere; }
+.result.neutral .r-note { border-left-color: var(--cyan); background: rgba(236, 235, 230, .05); }
 .r-note:empty { display: none; }
-.r-actions { display: grid; gap: 16px; margin-top: 28px; }
-.result .btn { width: 100%; padding: 19px 18px 18px; font-size: 22px; background: var(--ink); color: var(--paper); box-shadow: 5px 6px 0 var(--pop); }
-.result .btn:active { transform: translate(3px, 3px); box-shadow: 2px 2px 0 var(--pop); }
-.result .btn.ghost { background: transparent; color: inherit; box-shadow: inset 0 0 0 3px currentColor; transform: none; }
-.result .btn.ghost:active { transform: translateY(1px); box-shadow: inset 0 0 0 3px currentColor; }
-.result.neutral .btn:not(.ghost), .result.checking .btn:not(.ghost) { background: var(--yellow); color: var(--ink); box-shadow: 0 0 0 3px var(--ink), 5px 6px 0 3px var(--pink); }
-.result :focus-visible { outline-color: var(--ink); }
+.r-actions { display: grid; gap: 12px; margin-top: 26px; }
+.result .btn { --b: var(--ink); width: 100%; min-height: 62px; padding: 0 20px; font-size: 17px; color: var(--rc); }
+.result .btn::after { font-size: 20px; }
+.result .btn.ghost { --b: transparent; color: inherit; border: 2px solid currentColor; }
+.result.neutral .btn:not(.ghost), .result.checking .btn:not(.ghost) { --b: var(--orange); color: var(--ink); }
+.result.neutral .btn.ghost, .result.checking .btn.ghost { border: 1px solid var(--line-2); }
+.result :focus-visible { outline: 3px solid var(--ink); outline-offset: 3px; }
 .result.neutral :focus-visible, .result.checking :focus-visible { outline-color: var(--cyan); }
-.r-timer { height: 6px; border-radius: 6px; background: rgba(11, 10, 13, .18); margin-top: 18px; overflow: hidden; }
+@media (hover: hover) { .result .btn.ghost:hover { background: rgba(20, 20, 22, .08); border-color: currentColor; } .result.neutral .btn.ghost:hover { background: rgba(236, 235, 230, .05); border-color: var(--text); } }
+.r-timer { height: 4px; background: rgba(20, 20, 22, .2); margin-top: 18px; overflow: hidden; }
 .r-timer i { display: block; height: 100%; width: 100%; background: var(--ink); transform-origin: left; }
 .result.neutral .r-timer { background: var(--line); }
 .result.neutral .r-timer i { background: var(--cyan); }
 .r-timer.run i { animation: drain 3.5s linear forwards; }
 @keyframes drain { to { transform: scaleX(0); } }
+/* Short phones: tighter result type, so more of a long result fits without scrolling */
+@media (max-height: 700px) {
+  .result { padding-top: max(40px, calc(env(safe-area-inset-top) + 24px)); }
+  .result h1 { font-size: clamp(46px, 15vw, 96px); margin: 14px 0 12px; }
+  .result h1.name { font-size: clamp(36px, 11vw, 84px); }
+  .r-name { font-size: clamp(28px, 8.6vw, 48px); padding-top: 10px; margin-bottom: 12px; }
+  .r-size { font-size: clamp(40px, 12vw, 72px); margin-top: 10px; padding: 9px 15px 7px; }
+  .r-note { margin-top: 14px; padding: 10px 13px; font-size: 15px; }
+  .r-actions { gap: 10px; margin-top: 18px; }
+  .result .btn { min-height: 54px; }
+}
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
 </style>
 </head>
 <body>
 
 <section id="signin" class="wrap signin hidden">
-  <div class="brand">ON D<span>'</span> ROAD<em>Door</em></div>
-  <h1>Staff<br>sign-in</h1>
+  <div class="sig-head">
+    <div class="kin" aria-hidden="true"><div class="kin-field">
+      <i class="sk w" style="--x:8%;--y:47%;--w:42%"></i>
+      <i class="sk c" style="--x:46%;--y:45%;--w:30%;--h:3px;--d:80"></i>
+      <i class="sk n" style="--x:2%;--y:55%;--w:42%;--h:8px;--d:40"></i>
+      <i class="sk g" style="--x:-2%;--y:63%;--w:28%;--h:4px;--d:160"></i>
+      <i class="sk p" style="--x:63%;--y:55%;--w:10%;--h:8px;--d:220"></i>
+      <i class="sk c" style="--x:70%;--y:39%;--w:22%;--h:2px;--o:.7;--d:260"></i>
+      <i class="sk w" style="--x:52%;--y:65%;--w:34%;--o:.6;--d:120"></i>
+      <i class="sk p" style="--x:24%;--y:69%;--w:6%;--h:6px;--o:.8;--d:300"></i>
+      <i class="sk g" style="--x:76%;--y:61%;--w:18%;--h:3px;--o:.85;--d:200"></i>
+    </div></div>
+    <div class="brand"><b>ON D<span>'</span></b> <i>ROAD</i><em>Door</em></div>
+    <p class="eb" aria-hidden="true">Crew</p>
+    <h1><b>Staff</b><br><i>sign-in</i></h1>
+  </div>
   <p class="lead">Do this once with signal before doors open. The guest list is saved on this phone, so scanning keeps working if the signal drops.</p>
   <form id="signin-form" autocomplete="on">
     <label for="key">Staff password</label>
@@ -528,11 +610,12 @@ h2 {
     <button class="btn" type="submit">Start</button>
     <p id="signin-msg" class="msg" role="status"></p>
   </form>
+  <div class="sig-data" aria-hidden="true"><span>[ 18+ | Antigua ]</span><span>17°07’N · 61°50’W</span></div>
 </section>
 
 <section id="main" class="wrap hidden">
   <header class="bar">
-    <div class="brand">ON D<span>'</span> ROAD<em id="device-name">Door</em></div>
+    <div class="brand"><b>ON D<span>'</span></b> <i>ROAD</i><em id="device-name">Door</em></div>
     <div class="net ok" id="net"><i></i><span id="net-text">Online</span></div>
   </header>
   <div class="mode" role="radiogroup" aria-label="Scanner mode">
