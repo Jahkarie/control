@@ -2,7 +2,12 @@
 // Pass plain text only; everything is escaped here. Returns { html, text }.
 // Built for email clients: tables, inline styles and bgcolor attributes, square corners and hairline rules. The type uses
 // fonts already on the reader's device, never web fonts: a heavy wide face for the wordmark and headlines, a monospace
-// for bracket tags and codes.
+// for bracket tags and codes. The black header band carries the CASHCXDE ENT. watermark tile (brand.js), served by this
+// backend at /brand/wm.png when PUBLIC_URL (or Render's RENDER_EXTERNAL_URL) is known, over a solid fallback colour:
+// clients that drop background images (Outlook) just show the plain band.
+import { COPYRIGHT } from './brand.js';
+const PUBLIC_URL = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
+const WM_URL = PUBLIC_URL ? `${PUBLIC_URL}/brand/wm.png` : '';
 
 const C = {
   bg: '#0a0a0b', card: '#141416', band: '#0a0a0b', line: '#2c2c31', row: '#26262b',
@@ -67,6 +72,11 @@ const bracket = (text, color, bracketColor, size = 11) =>
  * @param {{src: string, alt: string, caption?: string}} [o.image]  Centered image on white, e.g. the QR entry pass
  * @param {{text: string, url: string, fallback?: boolean}} [o.cta]  Button; fallback shows the raw link too
  * @param {string} [o.fine]      Small print under everything
+ * @param {Array<{label: string, text: string}>} [o.callouts]  More concrete panels, after the callout
+ * @param {Array<{label: string, rows: string[]}>} [o.ticketList]  Ticket stubs in groups (no QR: the ticket page has it)
+ * @param {Array<[string, string]>} [o.links]  A list of [label, url] links, each on its own row
+ * @param {string} [o.brandTag]  The header's tag, '18+ | Antigua' by default
+ * @param {'main'|'tickets'} [o.site]  'tickets': the ticket site's footer (no "invite only")
  */
 export function renderEmail(o) {
   const tone = TONE[o.tone] || TONE.accent;
@@ -118,6 +128,19 @@ ${o.image.caption ? `<p style="margin:16px 0 0;font-family:${FONT};font-size:14p
 </td></tr>`);
   }
 
+  // Ticket stubs: a concrete ticket with the black wordmark bar, one row per ticket. No QR here.
+  for (const g of (o.ticketList || []).filter((x) => x && x.rows && x.rows.length)) {
+    rows.push(`<tr><td class="px" style="padding:24px 32px 0;">
+<table ${TABLE} width="100%" bgcolor="${C.concrete}" style="background-color:${C.concrete};">
+<tr><td bgcolor="${C.band}" style="background-color:${C.band};padding:12px 18px;">
+<table ${TABLE} width="100%"><tr>
+<td valign="middle" style="white-space:nowrap;line-height:20px;">${wordmark(14)}</td>
+<td align="right" valign="middle" style="font-family:${MONO};font-size:10px;line-height:14px;letter-spacing:2px;text-transform:uppercase;color:${C.muted};white-space:nowrap;">${esc(g.label)} &middot; ${g.rows.length}</td>
+</tr></table></td></tr>
+${g.rows.map((r, i) => `<tr><td style="padding:12px 18px;${i ? `border-top:1px dashed ${C.paperLine};` : ''}font-family:${FONT};font-size:15px;line-height:1.4;font-weight:700;color:${C.ink};">${esc(r)}</td></tr>`).join('')}
+</table></td></tr>`);
+  }
+
   if (details.length) {
     rows.push(`<tr><td class="px" style="padding:24px 32px 0;">
 <table ${TABLE} width="100%" style="border-top:1px solid ${C.line};border-bottom:1px solid ${C.line};">
@@ -128,13 +151,20 @@ ${details.map((d, i) => `<tr>
 </table></td></tr>`);
   }
 
-  // Utility info (how to pay) sits on a concrete panel, like the order panel on the site.
-  if (o.callout && o.callout.text) {
+  // Utility info (how to pay, a table's bottles) sits on a concrete panel, like the order panel on the site.
+  for (const c of [o.callout, ...(o.callouts || [])].filter((x) => x && x.text)) {
     rows.push(`<tr><td class="px" style="padding:24px 32px 0;">
 <table ${TABLE} width="100%" bgcolor="${C.concrete}" style="background-color:${C.concrete};"><tr><td style="padding:18px 20px 20px;">
-<p style="margin:0;">${bracket(o.callout.label, C.ink, C.ink2)}</p>
-<p style="margin:12px 0 0;font-family:${FONT};font-size:15px;line-height:1.6;color:${C.ink};">${nl2br(o.callout.text)}</p>
+<p style="margin:0;">${bracket(c.label, C.ink, C.ink2)}</p>
+<p style="margin:12px 0 0;font-family:${FONT};font-size:15px;line-height:1.6;color:${C.ink};">${nl2br(c.text)}</p>
 </td></tr></table></td></tr>`);
+  }
+
+  const links = (o.links || []).filter((l) => l && l[1]);
+  if (links.length) {
+    rows.push(`<tr><td class="px" style="padding:24px 32px 0;"><table ${TABLE} width="100%" style="border-top:1px solid ${C.line};">
+${links.map(([label, url]) => `<tr><td style="padding:14px 0;border-bottom:1px solid ${C.line};"><a href="${esc(url)}" target="_blank" style="font-family:${FONT};font-size:15px;line-height:1.4;font-weight:700;color:${C.text};text-decoration:none;">${esc(label)}&nbsp;<span style="color:${C.orange};">&rarr;</span></a></td></tr>`).join('')}
+</table></td></tr>`);
   }
 
   // Button: a square block of safety orange with dark text.
@@ -151,7 +181,11 @@ ${o.cta.fallback ? `<p style="margin:16px 0 0;font-family:${FONT};font-size:12px
   }
 
   const preheader = o.preheader || lines[0] || o.title;
-  const links = contactLinks();
+  const contacts = contactLinks();
+  const tickets = o.site === 'tickets';
+  const brandTag = (o.brandTag || '18+ | Antigua').split('|').map((x) => esc(x.trim())).join('&nbsp;|&nbsp;');
+  const wm = WM_URL ? ` background="${WM_URL}"` : '';
+  const wmStyle = WM_URL ? `background-image:url('${WM_URL}');background-repeat:repeat;` : '';
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -180,10 +214,10 @@ ${o.cta.fallback ? `<p style="margin:16px 0 0;font-family:${FONT};font-size:12px
 <table ${TABLE} width="100%" style="max-width:560px;">
 <tr><td bgcolor="${C.card}" style="background-color:${C.card};border:1px solid ${C.row};">
 <table ${TABLE} width="100%">
-<tr><td class="px" bgcolor="${C.band}" style="background-color:${C.band};padding:20px 32px 19px;">
+<tr><td class="px" bgcolor="${C.band}"${wm} style="background-color:${C.band};${wmStyle}padding:20px 32px 19px;">
 <table ${TABLE} width="100%"><tr>
 <td valign="middle" style="white-space:nowrap;line-height:24px;">${wordmark(20)}</td>
-<td class="hide-sm" align="right" valign="middle" style="font-family:${MONO};font-size:10px;line-height:14px;letter-spacing:2px;text-transform:uppercase;color:${C.muted};white-space:nowrap;">[&nbsp;18+&nbsp;|&nbsp;Antigua&nbsp;]</td>
+<td class="hide-sm" align="right" valign="middle" style="font-family:${MONO};font-size:10px;line-height:14px;letter-spacing:2px;text-transform:uppercase;color:${C.muted};white-space:nowrap;">[&nbsp;${brandTag}&nbsp;]</td>
 </tr></table>
 </td></tr>
 <tr><td style="font-size:0;line-height:0;"><table ${TABLE} width="100%"><tr>${bar(2, C.orange, ' width="56"')}${bar(2, C.line)}</tr></table></td></tr>
@@ -192,7 +226,7 @@ ${rows.join('\n')}
 </table>
 </td></tr>
 <tr><td style="padding:22px 2px 0;font-family:${FONT};font-size:11px;line-height:1.7;color:${C.dim};">
-${links.length ? `Questions? ${links.map(([label, url]) => `<a href="${esc(url)}" style="color:${C.muted};text-decoration:underline;">${esc(label)}</a>`).join(' &middot; ')}<br>` : ''}On D' Road &middot; Antigua Carnival<br>18+ only. Invite only. Please don't forward this email.
+${contacts.length ? `Questions? ${contacts.map(([label, url]) => `<a href="${esc(url)}" style="color:${C.muted};text-decoration:underline;">${esc(label)}</a>`).join(' &middot; ')}<br>` : ''}${tickets ? "On D' Road Tickets &middot; Antigua<br>18+ only. Bring photo ID." : "On D' Road &middot; Antigua Carnival<br>18+ only. Invite only. Please don't forward this email."}<br>${esc(COPYRIGHT)}
 </td></tr>
 </table>
 </td></tr>
@@ -209,11 +243,14 @@ ${links.length ? `Questions? ${links.map(([label, url]) => `<a href="${esc(url)}
     ...lines.flatMap((l) => [l, '']),
     ...(o.quote && o.quote.text ? [`Message from ${o.quote.from}:`, `"${o.quote.text}"`, ''] : []),
     ...(details.length ? [...details.map((d) => `${d[0]}: ${d[1]}`), ''] : []),
-    ...(o.callout && o.callout.text ? [`${o.callout.label}:`, o.callout.text, ''] : []),
+    ...(o.ticketList || []).filter((g) => g && g.rows && g.rows.length).flatMap((g) => [`${g.label}:`, ...g.rows.map((r) => `- ${r}`), '']),
+    ...[o.callout, ...(o.callouts || [])].filter((c) => c && c.text).flatMap((c) => [`${c.label}:`, c.text, '']),
+    ...(links.length ? [...links.map(([label, url]) => `${label}: ${url}`), ''] : []),
     ...(o.cta && o.cta.url ? [`${o.cta.text}: ${o.cta.url}`, ''] : []),
     ...(o.fine ? [o.fine, ''] : []),
-    ...(links.length ? [`Questions? ${links.map(([label, url]) => (url.startsWith('mailto:') ? label : `${label}: ${url}`)).join(' · ')}`] : []),
-    "On D' Road · Antigua Carnival · 18+ only. Invite only."
+    ...(contacts.length ? [`Questions? ${contacts.map(([label, url]) => (url.startsWith('mailto:') ? label : `${label}: ${url}`)).join(' · ')}`] : []),
+    tickets ? "On D' Road Tickets · Antigua · 18+ only." : "On D' Road · Antigua Carnival · 18+ only. Invite only.",
+    COPYRIGHT
   ].join('\n');
 
   return { html, text };

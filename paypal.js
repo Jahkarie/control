@@ -21,40 +21,63 @@ const TIMEOUT_MS = 20 * 1000; // a stuck PayPal call mustn't hold the order (and
 
 // What PayPal charges, in USD cents: USD prices as they are, XCD at 2.70 to the dollar, rounded up to the cent.
 export const usdCents = (cents, currency) => (currency === 'USD' ? cents : Math.ceil((cents * 10) / 27));
-const usd = (cents) => (cents / 100).toFixed(2);
+export const usd = (cents) => (cents / 100).toFixed(2);
+
+// ---------- Shared with the ticket site (tickets.js) ----------
+// Whether this email can pay online: everyone once PAYPAL_ENV=live, only PAYPAL_TESTERS in sandbox mode.
+export const PAYPAL_CONFIGURED = CONFIGURED;
+export const PAYPAL_CLIENT_ID = CLIENT_ID;
+export const paypalEnabledFor = (email) => CONFIGURED && (LIVE || TESTERS.includes(String(email || '').toLowerCase()));
+
+let token = null, tokenExpires = 0;
+async function accessToken() {
+  if (token && Date.now() < tokenExpires) return token;
+  const res = await fetch(`${API}/v1/oauth2/token`, {
+    method: 'POST',
+    headers: { Authorization: 'Basic ' + Buffer.from(`${CLIENT_ID}:${SECRET}`).toString('base64'), 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'grant_type=client_credentials',
+    signal: AbortSignal.timeout(TIMEOUT_MS)
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.access_token) throw new Error(`PayPal login failed (${res.status} ${data.error || ''}). Check PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET and PAYPAL_ENV.`);
+  token = data.access_token;
+  tokenExpires = Date.now() + (Number(data.expires_in) || 300) * 1000 - 60 * 1000;
+  return token;
+}
+
+// Calls PayPal's REST API. PayPal errors come back as { ok: false, ... }; only network failures throw.
+// No PayPal-Request-Id: PayPal would answer a retry (say, after a declined card) with the first, failed result.
+// Paying or refunding twice is prevented by PayPal itself (already captured / already refunded).
+export async function paypalApi(method, path, body) {
+  const headers = { Authorization: `Bearer ${await accessToken()}`, 'Content-Type': 'application/json' };
+  const res = await fetch(API + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(TIMEOUT_MS) });
+  const data = await res.json().catch(() => ({}));
+  return { ok: res.ok, status: res.status, data };
+}
+export const paypalIssue = (r) => r.data?.details?.[0]?.issue || r.data?.name || `HTTP ${r.status}`;
+export const captureOf = (ppOrder) => ppOrder?.purchase_units?.[0]?.payments?.captures?.[0] || null;
+export const orderPath = (id) => `/v2/checkout/orders/${encodeURIComponent(id)}`;
+
+// Refunds one capture in full. ref is only for the log. Returns { ok: true, id } or { ok: false, error }.
+export async function refundCapture(captureId, ref) {
+  if (!CONFIGURED) return { ok: false, error: 'PayPal keys are missing' };
+  let r;
+  try {
+    r = await paypalApi('POST', `/v2/payments/captures/${encodeURIComponent(captureId)}/refund`, {});
+  } catch (err) {
+    console.error('PayPal refund error:', ref, err.message);
+    return { ok: false, error: "couldn't reach PayPal" };
+  }
+  if (r.ok && ['COMPLETED', 'PENDING'].includes(r.data.status)) return { ok: true, id: r.data.id };
+  if (paypalIssue(r) === 'CAPTURE_FULLY_REFUNDED') return { ok: true, id: null }; // already refunded in PayPal itself
+  console.error('PayPal refund failed:', ref, r.status, JSON.stringify(r.data));
+  return { ok: false, error: paypalIssue(r) };
+}
 
 export function registerPayPal({ app, pool, requireAuth, requireApproved, requireAdmin, rateLimit, perUser, onPaid }) {
-  const enabledFor = (email) => CONFIGURED && (LIVE || TESTERS.includes(email));
+  const enabledFor = paypalEnabledFor;
   const fail = (res, err) => { console.error('PayPal error:', err); res.status(500).json({ error: 'Server error.' }); };
-
-  let token = null, tokenExpires = 0;
-  async function accessToken() {
-    if (token && Date.now() < tokenExpires) return token;
-    const res = await fetch(`${API}/v1/oauth2/token`, {
-      method: 'POST',
-      headers: { Authorization: 'Basic ' + Buffer.from(`${CLIENT_ID}:${SECRET}`).toString('base64'), 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: 'grant_type=client_credentials',
-      signal: AbortSignal.timeout(TIMEOUT_MS)
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.access_token) throw new Error(`PayPal login failed (${res.status} ${data.error || ''}). Check PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET and PAYPAL_ENV.`);
-    token = data.access_token;
-    tokenExpires = Date.now() + (Number(data.expires_in) || 300) * 1000 - 60 * 1000;
-    return token;
-  }
-
-  // Calls PayPal's REST API. PayPal errors come back as { ok: false, ... }; only network failures throw.
-  // No PayPal-Request-Id: PayPal would answer a retry (say, after a declined card) with the first, failed result.
-  // Paying or refunding twice is prevented by PayPal itself (already captured / already refunded).
-  async function api(method, path, body) {
-    const headers = { Authorization: `Bearer ${await accessToken()}`, 'Content-Type': 'application/json' };
-    const res = await fetch(API + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(TIMEOUT_MS) });
-    const data = await res.json().catch(() => ({}));
-    return { ok: res.ok, status: res.status, data };
-  }
-  const issue = (r) => r.data?.details?.[0]?.issue || r.data?.name || `HTTP ${r.status}`;
-  const captureOf = (ppOrder) => ppOrder?.purchase_units?.[0]?.payments?.captures?.[0] || null;
-  const orderPath = (id) => `/v2/checkout/orders/${encodeURIComponent(id)}`;
+  const api = paypalApi, issue = paypalIssue;
 
   // price_cents and currency are what this order owes (its tier price less any code), not the package's price today.
   const ORDER_SQL = `SELECT o.id, o.guest_email, o.status, o.reference_code, o.paypal_order_id, o.paypal_status, o.paypal_amount,
@@ -218,20 +241,7 @@ export function registerPayPal({ app, pool, requireAuth, requireApproved, requir
   });
 
   // Refunds a PayPal payment in full. Returns { ok: true, id } or { ok: false, error }.
-  async function refund(o) {
-    if (!CONFIGURED) return { ok: false, error: 'PayPal keys are missing' };
-    let r;
-    try {
-      r = await api('POST', `/v2/payments/captures/${encodeURIComponent(o.paypal_capture_id)}/refund`, {});
-    } catch (err) {
-      console.error('PayPal refund error:', o.reference_code, err.message);
-      return { ok: false, error: "couldn't reach PayPal" };
-    }
-    if (r.ok && ['COMPLETED', 'PENDING'].includes(r.data.status)) return { ok: true, id: r.data.id };
-    if (issue(r) === 'CAPTURE_FULLY_REFUNDED') return { ok: true, id: null }; // already refunded in PayPal itself
-    console.error('PayPal refund failed:', o.reference_code, r.status, JSON.stringify(r.data));
-    return { ok: false, error: issue(r) };
-  }
+  const refund = (o) => refundCapture(o.paypal_capture_id, o.reference_code);
 
   // Run by the payments job before it cancels unpaid orders. Confirms PayPal payments that went through without
   // reaching us, and keeps checking ones PayPal is still holding. payDays is the current pay_days setting.

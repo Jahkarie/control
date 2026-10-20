@@ -1,21 +1,27 @@
 // reset.js: wipes data so the event can start over (for example after testing). Two scopes:
 // - 'guests': guests (with their per-event invite bonuses), invites, login links, orders (with their check-ins and
-//   pickups) and the group email log, for every event. Keeps the setup: events (past ones stay, with nothing in
-//   them), packages, price tiers, promo codes, promoters and every setting.
-// - 'everything': all of that plus every event, package, price tier, promo code, promoter and setting (payments,
-//   contact, terms, FAQ, sponsors, size lock, site lock), so the site is back to its built-in defaults with one fresh
-//   current event, "On D' Road": that includes locked, since a missing site_lock means locked (see lock.js). Only
-//   preview_version stays, so a preview link that was reset before never works again.
+//   pickups) and the group email log, for every event, plus the ticket site's orders, their items, payments, tickets
+//   and door scans. Keeps the setup: events (past ones stay, with nothing in them), packages, price tiers, promo codes,
+//   promoters, the ticket events, their tickets and tables, the bottle and chaser menus, and every setting.
+// - 'everything': all of that plus every event, package, price tier, promo code, promoter, ticket event (with its
+//   products and price tiers), menu and setting (payments, contact, terms, FAQ, sponsors, size lock, both site locks),
+//   so both sites are back to their built-in defaults with one fresh current event, "On D' Road": that includes locked,
+//   since a missing site_lock / tickets_lock means locked (see lock.js). Only preview_version and
+//   tickets_preview_version stay, so a preview link that was reset before never works again.
 // The page asks the server for a one-time 6-digit number for a scope, and the reset only runs when that number is
 // typed back for the same scope within 10 minutes. One try per number, so a stray click or a forged request can't
 // wipe anything. Rows are DELETEd (not TRUNCATE ... CASCADE), so a table we don't know about can never go with them.
+import { WM_LITE } from './brand.js';
 import crypto from 'crypto';
 import { createDefaultEvent } from './events.js';
 
 const TTL_MS = 10 * 60 * 1000;
-const GUEST_TABLES = ['checkins', 'orders', 'login_links', 'invites', 'guest_event', 'guests', 'broadcasts'];
+const GUEST_TABLES = ['ticket_checkins', 'tickets', 'ticket_payments', 'ticket_order_items', 'ticket_orders',
+  'checkins', 'orders', 'login_links', 'invites', 'guest_event', 'guests', 'broadcasts'];
 // In this order: each table only points at tables after it.
-const SETUP_TABLES = ['package_tiers', 'promo_codes', 'packages', 'promoter_event', 'promoters', 'events', 'settings'];
+const SETUP_TABLES = ['ticket_tiers', 'ticket_products', 'ticket_events', 'chasers', 'chaser_groups', 'bottles',
+  'package_tiers', 'promo_codes', 'packages', 'promoter_event', 'promoters', 'events', 'settings'];
+const KEEP_SETTINGS = ['preview_version', 'tickets_preview_version'];
 const SCOPES = ['guests', 'everything'];
 
 // afterReset() runs after an 'everything' reset (server.js clears the site lock's cache and calls site.refresh, which
@@ -38,11 +44,21 @@ export function registerReset({ app, pool, requireAdmin, rateLimit, afterReset }
         (SELECT COUNT(*) FROM promo_codes)::int AS codes,
         (SELECT COUNT(*) FROM events)::int AS events,
         (SELECT COUNT(*) FROM promoters)::int AS promoters,
-        (SELECT COUNT(*) FROM settings)::int AS settings`);
+        (SELECT COUNT(*) FROM settings)::int AS settings,
+        (SELECT COUNT(*) FROM ticket_orders)::int AS ticket_orders,
+        (SELECT COUNT(*) FROM ticket_orders WHERE status IN ('PAID', 'DEPOSIT_PAID'))::int AS ticket_paid,
+        (SELECT COUNT(*) FROM tickets)::int AS tickets,
+        (SELECT COUNT(*) FROM ticket_checkins)::int AS ticket_checkins,
+        (SELECT COUNT(*) FROM ticket_events)::int AS ticket_events,
+        (SELECT COUNT(*) FROM ticket_products)::int AS ticket_products,
+        ((SELECT COUNT(*) FROM bottles) + (SELECT COUNT(*) FROM chasers))::int AS menu_items`);
+    // Money received: paid invite-only orders, and the ticket site's paid orders and paid deposits.
     const money = await db.query(
-      `SELECT COALESCE(o.currency, p.currency) AS currency, SUM(COALESCE(o.amount_cents, p.price_cents))::bigint AS cents
-       FROM orders o JOIN packages p ON p.id = o.package_id WHERE o.status = 'PAID'
-       GROUP BY 1 HAVING SUM(COALESCE(o.amount_cents, p.price_cents)) > 0 ORDER BY 1`);
+      `SELECT currency, SUM(cents)::bigint AS cents FROM (
+         SELECT COALESCE(o.currency, p.currency) AS currency, COALESCE(o.amount_cents, p.price_cents) AS cents
+         FROM orders o JOIN packages p ON p.id = o.package_id WHERE o.status = 'PAID'
+         UNION ALL SELECT currency, paid_cents FROM ticket_orders WHERE status IN ('PAID', 'DEPOSIT_PAID')) x
+       GROUP BY 1 HAVING SUM(cents) > 0 ORDER BY 1`);
     return { ...r.rows[0], received: money.rows.map((m) => ({ currency: m.currency, cents: Number(m.cents) })) };
   }
 
@@ -76,15 +92,15 @@ export function registerReset({ app, pool, requireAdmin, rateLimit, afterReset }
       // Check-ins and pickups go with their orders (checkins.order_id cascades), but delete them explicitly anyway.
       // Setup tables come after orders, which point at packages and tiers.
       for (const table of scope === 'everything' ? [...GUEST_TABLES, ...SETUP_TABLES] : GUEST_TABLES) {
-        await client.query(table === 'settings' ? "DELETE FROM settings WHERE key <> 'preview_version'" : `DELETE FROM ${table}`);
+        await client.query(table === 'settings' ? 'DELETE FROM settings WHERE NOT (key = ANY($1))' : `DELETE FROM ${table}`, table === 'settings' ? [KEEP_SETTINGS] : []);
       }
       // Past events keep their names and dates, but the attendance count was about guests who are gone now.
       if (scope === 'guests') await client.query('UPDATE events SET rsvp_confirmed = NULL');
       // Everything: one fresh current event, with the built-in defaults.
       if (scope === 'everything') await createDefaultEvent(client);
       await client.query('COMMIT');
-      console.log(`Reset (${scope}): deleted ${before.guests} guests, ${before.invites} invites, ${before.orders} orders (${before.paid} paid), ${before.checkins} door scans, ${before.broadcasts} group emails` +
-        (scope === 'everything' ? `, ${before.events} events, ${before.packages} packages, ${before.tiers} tiers, ${before.codes} codes, ${before.promoters} promoters and ${before.settings} settings.` : '.'));
+      console.log(`Reset (${scope}): deleted ${before.guests} guests, ${before.invites} invites, ${before.orders} orders (${before.paid} paid), ${before.checkins} door scans, ${before.broadcasts} group emails, ${before.ticket_orders} ticket orders (${before.tickets} tickets)` +
+        (scope === 'everything' ? `, ${before.events} events, ${before.packages} packages, ${before.tiers} tiers, ${before.codes} codes, ${before.promoters} promoters, ${before.ticket_events} ticket events, ${before.ticket_products} ticket products, ${before.menu_items} menu items and ${before.settings} settings.` : '.'));
       if (scope === 'everything' && afterReset) await Promise.resolve(afterReset()).catch((err) => console.error('After reset:', err.message));
       res.json({ success: true, scope, deleted: before });
     } catch (err) {
@@ -107,12 +123,12 @@ const PAGE = `<!DOCTYPE html>
 <style>
 /* Night Kinetic, admin edition: matte charcoal, one sharp accent (safety orange), hairline rules and square corners.
    Concrete is kept for utility surfaces (previews, dialogs, toasts). Calm and dense for daily work. */
-:root { --bg: #0a0a0b; --surface: #141416; --surface-2: #1a1a1d; --raise: #232327; --well: #0a0a0b; --line: rgba(236, 235, 230, .1); --line-strong: rgba(236, 235, 230, .24); --text: #ecebe6; --muted: #a6a59f; --dim: #8a8983; --accent: #ff5a1f; --accent-hi: #ff7440; --accent-ink: #141416; --good: #b6ff3b; --warn: #ffc02e; --bad: #ff7a6b; --cyan: #22e1ff; --concrete: #c9c8c3; --concrete-2: #e4e3df; --ink: #141416; --ink-2: #47463f; --display: 'Archivo', 'Helvetica Neue', Arial, sans-serif; --body: 'Archivo', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; --mono: 'Space Mono', ui-monospace, SFMono-Regular, Menlo, monospace; --chev: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8' fill='none' stroke='%23ecebe6' stroke-width='1.6'%3E%3Cpath d='M1 1.5l5 5 5-5'/%3E%3C/svg%3E"); --xh: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='28' height='28' viewBox='0 0 28 28' fill='none' stroke='%23141416' stroke-opacity='0.55' stroke-width='1'%3E%3Ccircle cx='14' cy='14' r='6.5'/%3E%3Cpath d='M14 0v28M0 14h28'/%3E%3C/svg%3E"); color-scheme: dark; }
+:root { --bg: #0a0a0b; --surface: #141416; --surface-2: #1a1a1d; --raise: #232327; --well: #0a0a0b; --line: rgba(236, 235, 230, .1); --line-strong: rgba(236, 235, 230, .24); --text: #ecebe6; --muted: #a6a59f; --dim: #8a8983; --accent: #ff5a1f; --accent-hi: #ff7440; --accent-ink: #141416; --good: #b6ff3b; --warn: #ffc02e; --bad: #ff7a6b; --cyan: #22e1ff; --concrete: #c9c8c3; --concrete-2: #e4e3df; --ink: #141416; --ink-2: #47463f; --display: 'Archivo', 'Helvetica Neue', Arial, sans-serif; --body: 'Archivo', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; --mono: 'Space Mono', ui-monospace, SFMono-Regular, Menlo, monospace; --chev: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8' fill='none' stroke='%23ecebe6' stroke-width='1.6'%3E%3Cpath d='M1 1.5l5 5 5-5'/%3E%3C/svg%3E"); --xh: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='28' height='28' viewBox='0 0 28 28' fill='none' stroke='%23141416' stroke-opacity='0.55' stroke-width='1'%3E%3Ccircle cx='14' cy='14' r='6.5'/%3E%3Cpath d='M14 0v28M0 14h28'/%3E%3C/svg%3E"); --wm: ${WM_LITE}; color-scheme: dark; }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 var(--body); -webkit-font-smoothing: antialiased; }
 ::selection { background: var(--accent); color: var(--accent-ink); }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.top { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; justify-content: space-between; gap: 10px 16px; flex-wrap: wrap; min-height: 60px; padding: 10px clamp(16px, 3vw, 32px); background: rgba(10, 10, 11, .9); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border-bottom: 1px solid var(--line); }
+.top { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; justify-content: space-between; gap: 10px 16px; flex-wrap: wrap; min-height: 60px; padding: 10px clamp(16px, 3vw, 32px); background: var(--wm) 0 0 / 260px 150px, rgba(10, 10, 11, .9); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border-bottom: 1px solid var(--line); }
 .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .brand .mark { flex: none; width: 30px; height: 18px; overflow: visible; }
 .brand b { font-family: var(--display); font-stretch: 125%; font-weight: 900; font-size: 16px; line-height: 1; letter-spacing: .01em; white-space: nowrap; }
@@ -184,9 +200,9 @@ button:disabled { opacity: .5; cursor: not-allowed; transform: none; }
     <h2 id="w-h">What to reset</h2>
     <div class="scopes" role="radiogroup" aria-label="What to reset">
       <label class="scope on"><input type="radio" name="scope" value="guests" checked><b>Guest data only</b>
-        <span>Deletes every guest and everything they did, in every event: orders, invites, door scans and group emails. Keeps your setup: events (past ones stay, empty), packages, prices and tiers, promo codes, promoters, and every setting (payments, event details, contact, terms, FAQ, sponsors, size lock, site lock).</span></label>
+        <span>Deletes every guest and everything they did, in every event: orders, invites, door scans and group emails. Also every ticket site order, with its tickets, payments and door scans. Keeps your setup: events (past ones stay, empty), packages, prices and tiers, promo codes, promoters, ticket events with their tickets and tables, the bottle and chaser menus, and every setting (payments, event details, contact, terms, FAQ, sponsors, size lock, both site locks).</span></label>
       <label class="scope"><input type="radio" name="scope" value="everything"><b>Everything</b>
-        <span>Also deletes your setup: every event (current and past), package, code and promoter, so the site goes back to a blank start with one new event, "On D' Road", the original terms and FAQ drafts, and locked again: only the trailer shows. Your preview link stays the same. You'd set up packages, prices and settings again.</span></label>
+        <span>Also deletes your setup: every event (current and past), package, code and promoter, every ticket event with its tickets and tables, and the bottle and chaser menus, so both sites go back to a blank start with one new event, "On D' Road", the original terms and FAQ drafts, and locked again: only the trailer shows, on the main site and the ticket site. Your preview links stay the same. You'd set up packages, prices and settings again.</span></label>
     </div>
     <ul class="counts" id="counts" aria-live="polite"><li><b>&hellip;</b><span>Loading</span></li></ul>
     <div id="money" class="warn hidden" role="status"></div>
@@ -223,13 +239,16 @@ function plural(n, one, many) { return n === 1 ? one : many; }
 function show(d) {
   last = d;
   var all = scope() === 'everything';
-  var rows = [[d.guests, 'guest', 'guests'], [d.invites, 'invite', 'invites'], [d.orders, 'order', 'orders'], [d.paid, 'paid order', 'paid orders'], [d.checkins, 'door scan', 'door scans'], [d.broadcasts, 'group email', 'group emails']];
-  if (all) rows = rows.concat([[d.events, 'event', 'events'], [d.packages, 'package', 'packages'], [d.tiers, 'price tier', 'price tiers'], [d.codes, 'promo code', 'promo codes'], [d.promoters, 'promoter', 'promoters'], [d.settings, 'saved setting', 'saved settings']]);
+  var rows = [[d.guests, 'guest', 'guests'], [d.invites, 'invite', 'invites'], [d.orders, 'order', 'orders'], [d.paid, 'paid order', 'paid orders'], [d.checkins, 'door scan', 'door scans'], [d.broadcasts, 'group email', 'group emails'],
+    [d.ticket_orders, 'ticket order', 'ticket orders'], [d.ticket_paid, 'paid ticket order', 'paid ticket orders'], [d.tickets, 'ticket', 'tickets'], [d.ticket_checkins, 'ticket scan', 'ticket scans']];
+  if (all) rows = rows.concat([[d.events, 'event', 'events'], [d.packages, 'package', 'packages'], [d.tiers, 'price tier', 'price tiers'], [d.codes, 'promo code', 'promo codes'], [d.promoters, 'promoter', 'promoters'],
+    [d.ticket_events, 'ticket event', 'ticket events'], [d.ticket_products, 'ticket or table type', 'ticket and table types'], [d.menu_items, 'menu item', 'menu items'], [d.settings, 'saved setting', 'saved settings']]);
   var ul = $('counts'); ul.replaceChildren();
   rows.forEach(function (x) { var li = el('li'); li.appendChild(el('b', String(x[0]))); li.appendChild(el('span', plural(x[0], x[1], x[2]))); ul.appendChild(li); });
   var m = $('money');
-  m.classList.toggle('hidden', !d.paid);
-  m.textContent = d.paid ? d.paid + ' ' + plural(d.paid, 'order is', 'orders are') + ' paid' + (d.received.length ? ' (' + d.received.map(money).join(' + ') + ' received)' : '') +
+  var paidAll = d.paid + (d.ticket_paid || 0);
+  m.classList.toggle('hidden', !paidAll);
+  m.textContent = paidAll ? paidAll + ' ' + plural(paidAll, 'order is', 'orders are') + ' paid' + (d.ticket_paid ? ' (' + d.ticket_paid + ' on the ticket site)' : '') + (d.received.length ? ' (' + d.received.map(money).join(' + ') + ' received)' : '') +
     '. Their records go too, including what you need for refunds. Download a copy first.' : '';
   $('go').textContent = all ? 'Delete everything' : 'Delete all guest data';
 }
@@ -248,7 +267,8 @@ Array.prototype.forEach.call(document.querySelectorAll('input[name=scope]'), fun
 $('backup').addEventListener('click', function () {
   var b = this; b.disabled = true; $('b-msg').textContent = '';
   // Every event's orders, invites, door scans and group emails, not only the current event's.
-  var parts = [['guests', '/api/admin/guests'], ['invites', '/api/admin/invites?event=all'], ['orders', '/api/admin/orders?event=all'], ['checkins', '/api/admin/checkins?event=all'], ['broadcasts', '/api/admin/broadcasts?event=all'], ['events', '/api/admin/events']];
+  var parts = [['guests', '/api/admin/guests'], ['invites', '/api/admin/invites?event=all'], ['orders', '/api/admin/orders?event=all'], ['checkins', '/api/admin/checkins?event=all'], ['broadcasts', '/api/admin/broadcasts?event=all'], ['events', '/api/admin/events'],
+    ['ticket_site', '/api/admin/tickets/export']];
   if (scope() === 'everything') parts = parts.concat([['packages', '/api/admin/packages?event=all'], ['pricing', '/api/admin/pricing'], ['promoters', '/api/admin/promoters'], ['payment_settings', '/api/admin/payment-settings'],
     ['event', '/api/admin/event'], ['site', '/api/admin/site'], ['pickup', '/api/admin/pickup']]);
   Promise.all(parts.map(function (x) { return call(x[1]); }))
@@ -285,7 +305,7 @@ $('go').addEventListener('click', function () {
   var b = this; b.disabled = true;
   call('/api/admin/reset', { scope: scope(), code: $('typed').value }).then(function (d) {
     var x = d.deleted;
-    say('msg', 'Done. Deleted ' + x.guests + ' ' + plural(x.guests, 'guest', 'guests') + ', ' + x.invites + ' ' + plural(x.invites, 'invite', 'invites') + ' and ' + x.orders + ' ' + plural(x.orders, 'order', 'orders') +
+    say('msg', 'Done. Deleted ' + x.guests + ' ' + plural(x.guests, 'guest', 'guests') + ', ' + x.invites + ' ' + plural(x.invites, 'invite', 'invites') + ', ' + x.orders + ' ' + plural(x.orders, 'order', 'orders') + ' and ' + x.ticket_orders + ' ' + plural(x.ticket_orders, 'ticket order', 'ticket orders') +
       (d.scope === 'everything' ? ', plus ' + x.events + ' ' + plural(x.events, 'event', 'events') + ', ' + x.packages + ' ' + plural(x.packages, 'package', 'packages') + ' and all settings.' : '.') +
       ' Add yourself back with Add to roster before you log in.', true);
   }).catch(function (e) { say('msg', e.message); }).then(function () { forgetNumber(); load(); });

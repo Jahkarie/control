@@ -9,9 +9,18 @@
 // Names are only shown in Pickup mode, and never saved in the recent-scans list.
 // Only the current event's passes work (see events.js): the list holds just those, and a pass from a past event scans
 // as OTHER_EVENT ("This pass is for <event>"), with nothing recorded.
+// Live QR (liveqr.js): a pass shows "ONDROAD:<reference>:<code>" and a ticket "ONDROAD-T:<ref>:<code>", the code changing
+// every 30 seconds. The door list carries each pass's and ticket's secret, so phones check the code offline too; a code
+// outside this step plus or minus 2 is STALE ("Old screenshot"). The old still pass (ONDROAD:<reference>:<email>) only
+// works while settings.door_allow_static = '1'. A guest whose phone is dead is found with Look up (name or reference),
+// goes through Check ID, and is let in by hand: logged as MANUAL with the phone's name.
+// Ticket events (tickets.js, the ticket site): staff pick what they're working at the top of the scanner, "On D' Road"
+// (the invite-only event, Entry and Pickup) or a ticket event (entry only). ticketDoor does the ticket side.
 import { CUR } from './events.js';
+import { qrSecret, codeOk, BROWSER_CODE } from './liveqr.js';
+import { WM_LITE, WM_INK } from './brand.js';
 
-export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLimit, requireAdmin }) {
+export function registerDoor({ app, pool, express, ADMIN_KEY, TOKEN_SECRET, safeEqual, rateLimit, requireAdmin, ticketDoor }) {
   const DOOR_KEY = process.env.DOOR_KEY || '';
   const json = express.json({ limit: '256kb' });
   const limit = rateLimit(600, 60 * 1000);
@@ -31,7 +40,7 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
   // full_name is the guest's name as on their ID, for the Pickup desk's name search and Check ID screen (Entry never
   // shows it). Cancelled orders don't carry it, so door phones only hold names of guests who still have a pass.
   // The guest join is on a lowercased email, one row per email, so a pass is never listed twice.
-  const PASS_SQL = `SELECT o.id, o.reference_code AS ref, LOWER(o.guest_email) AS email, o.status, o.event_id,
+  const PASS_SQL = `SELECT o.id, o.reference_code AS ref, LOWER(o.guest_email) AS email, o.status, o.event_id, o.qr_version,
       o.checked_in_at, o.checked_in_by, (o.cancel_requested_at IS NOT NULL) AS refund_requested,
       o.size, o.picked_up_at, o.picked_up_by,
       p.name AS package, p.requires_compliance AS costume, (TRIM(REPLACE(p.sizes, ',', '')) <> '') AS sized,
@@ -41,6 +50,14 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
       ON g.email = LOWER(o.guest_email)`;
   // A pass re-read after the first lookup: one that was cancelled meanwhile drops the name, as PASS_SQL would.
   const restate = (pass, now) => ({ ...pass, ...now, ...(now && now.status === 'CANCELLED' ? { full_name: null } : {}) });
+  // What a phone gets for a pass: the row, and the live QR's secret while it's paid (only paid passes have a live QR).
+  const passOut = (p) => {
+    const { qr_version: v, ...rest } = p;
+    return p.status === 'PAID' && TOKEN_SECRET ? { ...rest, secret: qrSecret(TOKEN_SECRET, p.ref, v || 1) } : rest;
+  };
+  // The old still pass (no live code) is accepted only while the organizers switch this on (no paid passes were out
+  // when the live QR came in, so it's off by default).
+  const allowStatic = async () => (await pool.query("SELECT value FROM settings WHERE key = 'door_allow_static'")).rows[0]?.value === '1';
 
   // A phone's clock can be off; never accept a scan time more than a few minutes in the future.
   const scanTime = (v) => {
@@ -48,8 +65,8 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
     if (Number.isNaN(d.getTime()) || d.getTime() > Date.now() + 5 * 60 * 1000) return new Date();
     return d;
   };
-  const KINDS = ['ENTRY', 'OVERRIDE', 'UNDO', 'PICKUP', 'PICKUP_UNDO'];
-  const REPLAY = { ENTRY: 'ADMIT', OVERRIDE: 'ADMIT', UNDO: 'UNDONE', DUPLICATE: 'ALREADY',
+  const KINDS = ['ENTRY', 'MANUAL', 'OVERRIDE', 'UNDO', 'PICKUP', 'PICKUP_UNDO'];
+  const REPLAY = { ENTRY: 'ADMIT', MANUAL: 'ADMIT', OVERRIDE: 'ADMIT', UNDO: 'UNDONE', DUPLICATE: 'ALREADY',
     PICKUP: 'HANDED', PICKUP_DUP: 'PICKED_ALREADY', PICKUP_UNDO: 'PICKUP_UNDONE' };
 
   const record = (orderId, kind, clientId, device, at) => pool.query(
@@ -59,6 +76,8 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
   // Applies one scan. Safe to repeat: a scan with the same client_id is only ever counted once,
   // so a phone can resend its offline queue without double counting.
   async function applyScan(ev) {
+    // A ticket of the ticket site (tickets.js).
+    if (ev?.ticket) return ticketDoor ? ticketDoor.applyScan(ev, scanTime(ev.scanned_at)) : { result: 'NOT_FOUND' };
     const kind = KINDS.includes(ev?.kind) ? ev.kind : 'ENTRY';
     const ref = String(ev?.ref || '').trim().toUpperCase().slice(0, 32);
     const email = String(ev?.email || '').trim().toLowerCase();
@@ -69,7 +88,7 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
 
     const found = await pool.query(`${PASS_SQL} WHERE o.reference_code = $1`, [ref]);
     if (!found.rowCount) return { result: 'NOT_FOUND' };
-    const pass = found.rows[0];
+    const pass = passOut(found.rows[0]);
     // A pass from another event: not valid here, and nothing about it (not even the email) goes back to the phone.
     const evs = (await pool.query(`SELECT id, name, status FROM events WHERE id = $1 OR status = 'current'`, [pass.event_id])).rows;
     if (!evs.some((e) => e.status === 'current' && e.id === pass.event_id)) {
@@ -80,7 +99,7 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
 
     if (clientId) {
       const seen = await pool.query('SELECT kind FROM checkins WHERE client_id = $1', [clientId]);
-      if (seen.rowCount) return { result: REPLAY[seen.rows[0].kind] || 'ADMIT', override: seen.rows[0].kind === 'OVERRIDE', pass, replay: true };
+      if (seen.rowCount) return { result: REPLAY[seen.rows[0].kind] || 'ADMIT', override: seen.rows[0].kind === 'OVERRIDE', manual: seen.rows[0].kind === 'MANUAL', pass, replay: true };
     }
 
     if (kind === 'UNDO') {
@@ -95,6 +114,11 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
     }
     if (pass.status === 'RESERVED') return { result: 'UNPAID', pass };
     if (pass.status !== 'PAID') return { result: 'CANCELLED', pass };
+    // A scan needs the live code (this step, plus or minus 2, at the scan time or now), unless staff checked the guest's
+    // photo ID themselves (MANUAL, or a pickup marked manual) or the old still pass is switched on.
+    const proof = kind === 'MANUAL' || kind === 'OVERRIDE' || (kind === 'PICKUP' && ev.manual === true)
+      || codeOk(pass.secret, ev.code, at.getTime(), Date.now()) || (!ev.code && await allowStatic());
+    if (!proof) return { result: 'STALE', pass: { ref: pass.ref } };
     if (kind === 'PICKUP') {
       // One package per order, even if two phones scan the same pass at the same moment. Still PAID when it's
       // saved, so an order refunded since the read above isn't handed out.
@@ -122,8 +146,8 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
       `UPDATE orders SET checked_in_at = $2, checked_in_by = $3 WHERE id = $1 AND checked_in_at IS NULL AND status = 'PAID'
        RETURNING checked_in_at, checked_in_by`, [pass.id, at, device]);
     if (won.rowCount) {
-      await record(pass.id, 'ENTRY', clientId, device, at);
-      return { result: 'ADMIT', pass: { ...pass, ...won.rows[0] } };
+      await record(pass.id, kind, clientId, device, at);
+      return { result: 'ADMIT', manual: kind === 'MANUAL', pass: { ...pass, ...won.rows[0] } };
     }
     const cur = (await pool.query('SELECT status FROM orders WHERE id = $1', [pass.id])).rows[0];
     if (!cur || cur.status !== 'PAID') return { result: 'CANCELLED', pass: restate(pass, cur) };
@@ -140,9 +164,20 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
   // The whole list, saved on each phone for offline scanning.
   app.get('/api/door/list', limit, requireDoor, async (req, res) => {
     try {
-      const [r, ev] = await Promise.all([pool.query(`${PASS_SQL} WHERE o.event_id = ${CUR} ORDER BY o.id ASC`),
-        pool.query("SELECT id, name FROM events WHERE status = 'current'")]);
-      res.json({ generated_at: new Date().toISOString(), event: ev.rows[0] || null, passes: r.rows });
+      const [r, ev, statics, tevs] = await Promise.all([pool.query(`${PASS_SQL} WHERE o.event_id = ${CUR} ORDER BY o.id ASC`),
+        pool.query("SELECT id, name FROM events WHERE status = 'current'"), allowStatic(), ticketDoor ? ticketDoor.events() : []]);
+      // ticket_events: the ticket events staff can pick at the top of the scanner (see tickets.js).
+      res.json({ generated_at: new Date().toISOString(), event: ev.rows[0] || null, passes: r.rows.map(passOut), allow_static: statics, ticket_events: tevs });
+    } catch (err) { fail(res, err); }
+  });
+
+  // A ticket event's list (the tickets of its paid orders, plus refunded and transferred ones so they scan as such).
+  app.get('/api/door/tickets', limit, requireDoor, async (req, res) => {
+    try {
+      const id = /^\d{1,9}$/.test(String(req.query.event || '')) ? Number(req.query.event) : 0;
+      const data = ticketDoor && id ? await ticketDoor.list(id) : null;
+      if (!data) return res.status(404).json({ error: 'That event is not on the door list.' });
+      res.json(data);
     } catch (err) { fail(res, err); }
   });
 
@@ -244,6 +279,8 @@ const PAGE = `<!DOCTYPE html>
   --circ-ink-tr: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='340' height='230' viewBox='0 0 340 230' fill='none' stroke='%23141416' stroke-opacity='0.3' stroke-width='1'%3E%3Cpath d='M340 30H252l-16 16h-62'/%3E%3Cpath d='M340 46H260l-16 16v38l-14 14h-30'/%3E%3Cpath d='M340 62h-62l-12 12v74'/%3E%3Cpath d='M340 100h-30l-12 12v66l-14 14h-44'/%3E%3Cpath d='M340 164h-10v66'/%3E%3Cpath d='M212 0v12l-14 14h-50'/%3E%3Cpath d='M284 0v8l-8 8h-28'/%3E%3Cpath d='M302 0v18l12 12'/%3E%3Cpath d='M340 196h-28l-10 10v24'/%3E%3Ccircle cx='170' cy='46' r='3.2'/%3E%3Ccircle cx='196' cy='114' r='3.2'/%3E%3Ccircle cx='266' cy='152' r='3.2'/%3E%3Ccircle cx='236' cy='192' r='3.2'/%3E%3Ccircle cx='144' cy='26' r='3.2'/%3E%3Ccircle cx='244' cy='16' r='2.6'/%3E%3Ccircle cx='302' cy='230' r='2.6'/%3E%3Crect x='210' y='124' width='36' height='24'/%3E%3Cpath d='M216 124v-6M224 124v-6M232 124v-6M240 124v-6M216 148v6M224 148v6M232 148v6M240 148v6'/%3E%3C/svg%3E");
   --circ-lite-tr: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='340' height='230' viewBox='0 0 340 230' fill='none' stroke='%23ecebe6' stroke-opacity='0.1' stroke-width='1'%3E%3Cpath d='M340 30H252l-16 16h-62'/%3E%3Cpath d='M340 46H260l-16 16v38l-14 14h-30'/%3E%3Cpath d='M340 62h-62l-12 12v74'/%3E%3Cpath d='M340 100h-30l-12 12v66l-14 14h-44'/%3E%3Cpath d='M340 164h-10v66'/%3E%3Cpath d='M212 0v12l-14 14h-50'/%3E%3Cpath d='M284 0v8l-8 8h-28'/%3E%3Cpath d='M302 0v18l12 12'/%3E%3Cpath d='M340 196h-28l-10 10v24'/%3E%3Ccircle cx='170' cy='46' r='3.2'/%3E%3Ccircle cx='196' cy='114' r='3.2'/%3E%3Ccircle cx='266' cy='152' r='3.2'/%3E%3Ccircle cx='236' cy='192' r='3.2'/%3E%3Ccircle cx='144' cy='26' r='3.2'/%3E%3Ccircle cx='244' cy='16' r='2.6'/%3E%3Ccircle cx='302' cy='230' r='2.6'/%3E%3Crect x='210' y='124' width='36' height='24'/%3E%3Cpath d='M216 124v-6M224 124v-6M232 124v-6M240 124v-6M216 148v6M224 148v6M232 148v6M240 148v6'/%3E%3C/svg%3E");
   --circ-lite-bl: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='340' height='230' viewBox='0 0 340 230' fill='none' stroke='%23ecebe6' stroke-opacity='0.1' stroke-width='1'%3E%3Cg transform='translate(340 230) scale(-1 -1)'%3E%3Cpath d='M340 30H252l-16 16h-62'/%3E%3Cpath d='M340 46H260l-16 16v38l-14 14h-30'/%3E%3Cpath d='M340 62h-62l-12 12v74'/%3E%3Cpath d='M340 100h-30l-12 12v66l-14 14h-44'/%3E%3Cpath d='M340 164h-10v66'/%3E%3Cpath d='M212 0v12l-14 14h-50'/%3E%3Cpath d='M284 0v8l-8 8h-28'/%3E%3Cpath d='M302 0v18l12 12'/%3E%3Cpath d='M340 196h-28l-10 10v24'/%3E%3Ccircle cx='170' cy='46' r='3.2'/%3E%3Ccircle cx='196' cy='114' r='3.2'/%3E%3Ccircle cx='266' cy='152' r='3.2'/%3E%3Ccircle cx='236' cy='192' r='3.2'/%3E%3Ccircle cx='144' cy='26' r='3.2'/%3E%3Ccircle cx='244' cy='16' r='2.6'/%3E%3Ccircle cx='302' cy='230' r='2.6'/%3E%3Crect x='210' y='124' width='36' height='24'/%3E%3Cpath d='M216 124v-6M224 124v-6M232 124v-6M240 124v-6M216 148v6M224 148v6M232 148v6M240 148v6'/%3E%3C/g%3E%3C/svg%3E");
+  /* The CASHCXDE ENT. watermark (brand.js): chalk for the header band, ink for the result screens */
+  --wm: ${WM_LITE}; --wm-ink: ${WM_INK};
   /* Entry is orange, Pickup is cyan: the switch, the count, the camera border and its frame all follow. */
   --mode: var(--orange);
   color-scheme: dark;
@@ -340,7 +377,7 @@ input:focus { outline: 2px solid var(--mode); outline-offset: 0; border-color: t
 .sig-data { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 16px; margin-top: 26px; padding-top: 14px; border-top: 1px solid var(--line); font: 400 11px/1.2 var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--dim); }
 
 /* ---------- Main ---------- */
-.bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; padding: 4px 0 14px; border-bottom: 1px solid var(--line); }
+.bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 -16px 18px; padding: 10px 16px 14px; border-bottom: 1px solid var(--line); background: var(--wm) 0 0 / 260px 150px; }
 .bar .brand { flex: 1 1 auto; min-width: 0; overflow: hidden; }
 .net { flex: none; display: inline-flex; align-items: center; gap: 8px; min-height: 30px; padding: 0 10px; border: 1px solid currentColor; font: 700 11px/1 var(--mono); letter-spacing: .1em; text-transform: uppercase; white-space: nowrap; }
 .net i { width: 7px; height: 7px; background: currentColor; }
@@ -357,6 +394,18 @@ input:focus { outline: 2px solid var(--mode); outline-offset: 0; border-color: t
 .count::before { content: ''; order: 1; flex: none; width: 3px; height: 52px; margin: 0 4px; background: var(--mode); transform: rotate(24deg); box-shadow: 0 0 12px var(--mode); }
 .count > span { order: 2; }
 .count span b { color: var(--text); font-weight: 700; }
+
+/* What staff are working: the invite-only event or a ticket event (only shown when there's a ticket event to pick). */
+.work { display: grid; gap: 8px; margin: 0 0 14px; }
+.work label { font: 400 11px/1.2 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
+.work select { width: 100%; min-height: 52px; padding: 0 44px 0 14px; font: 700 15px/1.2 var(--wide); font-stretch: 112%; letter-spacing: .03em; text-transform: uppercase; color: var(--text); background: var(--well) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8' fill='none' stroke='%23ecebe6' stroke-width='1.6'%3E%3Cpath d='M1 1.5l5 5 5-5'/%3E%3C/svg%3E") no-repeat right 16px center / 12px 8px; border: 1px solid var(--line-2); border-radius: 0; -webkit-appearance: none; appearance: none; cursor: pointer; }
+.work select:focus { outline: 2px solid var(--mode); outline-offset: 0; }
+.work select option { background: var(--char-2); color: var(--text); }
+/* Ticket mode: entry only (no Pickup), and the camera tag says which event */
+body.tix .mode { display: none; }
+body.tix .cam::after { content: '[ Tickets ]'; content: '[ Tickets ]' / ''; }
+.count .cars { display: block; margin-top: 4px; color: var(--muted); }
+.count .cars:empty { display: none; }
 
 /* Entry / Pickup switch: two hairline cells; the chosen one fills with its mode colour. */
 .mode { display: grid; grid-template-columns: 1fr 1fr; margin: 0 0 18px; border: 1px solid var(--line-2); background: var(--well); }
@@ -500,6 +549,10 @@ h2 { margin: 34px 0 4px; }
 .result::before { content: ''; position: absolute; inset: 0; z-index: -1; pointer-events: none;
   background: var(--xh-ink) no-repeat 12px 12px / 22px, var(--xh-ink) no-repeat right 12px bottom 12px / 22px, var(--circ-ink-tr) no-repeat right top / 320px auto; }
 .result::after { content: ''; position: absolute; left: 0; right: 0; top: 0; height: 300px; z-index: -1; pointer-events: none; background: var(--streak-ink) center -40px / 900px auto repeat-x; }
+/* The watermark drifts slowly over the result colour (a still screen would be a photo of an old result) */
+.r-wm { position: absolute; inset: -150px; z-index: -1; pointer-events: none; background: var(--wm-ink) 0 0 / 260px 150px; animation: wmdrift 40s linear infinite; }
+.result.neutral .r-wm, .result.checking .r-wm { background-image: var(--wm); }
+@keyframes wmdrift { to { transform: translate(260px, 150px); } }
 .result.ok { background: var(--go); color: var(--ink); --rc: var(--go); }
 .result.bad { background: var(--stop); color: var(--ink); --rc: var(--stop); }
 .result.warn { background: var(--caution); color: var(--ink); --rc: var(--caution); }
@@ -631,11 +684,15 @@ h2 { margin: 34px 0 4px; }
     <div class="brand"><b>ON D<span>'</span></b> <i>ROAD</i><em id="device-name">Door</em></div>
     <div class="net ok" id="net"><i></i><span id="net-text">Online</span></div>
   </header>
+  <div class="work hidden" id="work-row">
+    <label for="work">Working</label>
+    <select id="work"></select>
+  </div>
   <div class="mode" role="radiogroup" aria-label="Scanner mode">
     <label><input type="radio" name="mode" value="entry"><span>Entry</span></label>
     <label><input type="radio" name="mode" value="pickup"><span>Pickup</span></label>
   </div>
-  <div class="count"><b id="in-count">0</b><span>of <b id="paid-count">0</b> <span id="count-what">paid guests checked in</span></span></div>
+  <div class="count"><b id="in-count">0</b><span>of <b id="paid-count">0</b> <span id="count-what">paid guests checked in</span><span class="cars" id="car-count"></span></span></div>
 
   <div class="cam" id="cam">
     <video id="video" playsinline muted autoplay></video>
@@ -651,7 +708,7 @@ h2 { margin: 34px 0 4px; }
   <div class="desk" id="desk">
     <h2 class="desk-h" aria-hidden="true">Find a guest</h2>
     <form class="search" id="search-form" autocomplete="off" role="search">
-      <input id="q" placeholder="No QR? Search email or reference" aria-label="No QR? Search email or reference" type="search" enterkeyhint="search">
+      <input id="q" placeholder="Phone dead? Look up name, email or ref" aria-label="Phone dead? Look up name, email or ref" type="search" enterkeyhint="search">
     </form>
     <div id="matches" class="matches"></div>
   </div>
@@ -667,6 +724,7 @@ h2 { margin: 34px 0 4px; }
 </section>
 
 <div id="result" class="result hidden" role="alertdialog" aria-modal="true" aria-labelledby="r-title">
+  <div class="r-wm" aria-hidden="true"></div>
   <div class="r-inner">
     <p class="r-label" id="r-label"></p>
     <h1 id="r-title"></h1>
@@ -699,6 +757,17 @@ var recent = store.get('door_recent', []);
 var syncedAt = store.get('door_synced_at', null);
 // 'entry' checks guests in at the gate; 'pickup' hands out packages (and never checks anyone in).
 var MODE = store.get('door_mode', 'entry') === 'pickup' ? 'pickup' : 'entry';
+// What this phone is working: 'odr' (the invite-only event: Entry and Pickup) or a ticket event's id (entry only).
+var WORK = String(store.get('door_work', 'odr'));
+var TEVENTS = store.get('door_ticket_events', []);
+var ODR_NAME = store.get('door_event_name', '');
+// The ticket event's saved list: { event, tickets, generated_at }. Tickets carry their live-QR secret, like passes.
+var tix = store.get('door_tickets', null);
+var tickets = tix && tix.event && String(tix.event.id) === WORK ? tix.tickets || [] : [];
+// The old still pass (ONDROAD:<reference>:<email>) only counts while the organizers allow it (settings.door_allow_static).
+var ALLOW_STATIC = !!store.get('door_allow_static', false);
+function ticketMode() { return WORK !== 'odr'; }
+function saveTickets() { store.set('door_tickets', tix); }
 var online = navigator.onLine !== false;
 var syncing = false, busy = false, autoTimer = null;
 // True while a Pickup-mode name search is being dealt with (Check ID, then Hand over), so Next guest clears the search.
@@ -735,6 +804,9 @@ function fmtWhen(iso) { return iso ? new Date(iso).toLocaleString('en-US', { mon
 function newId() { return (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 12); }
 function savePasses() { store.set('door_passes', passes); }
 function saveQueue() { store.set('door_queue', queue); }
+
+// ---------- Live QR (liveqr.js): the code changes every 30 seconds; checked here too, so it works offline ----------
+${BROWSER_CODE}
 
 // ---------- Network ----------
 function api(path, body) {
@@ -783,9 +855,10 @@ function mergePass(p) {
 // Re-applies scans still waiting to sync on top of a freshly downloaded list.
 function reapplyQueue() {
   queue.forEach(function (ev) {
+    if (ev.ticket) return;
     var p = findPass({ ref: ev.ref });
     if (!p) return;
-    if (ev.kind === 'ENTRY' && !p.checked_in_at) { p.checked_in_at = ev.scanned_at; p.checked_in_by = ev.device; }
+    if ((ev.kind === 'ENTRY' || ev.kind === 'MANUAL') && !p.checked_in_at) { p.checked_in_at = ev.scanned_at; p.checked_in_by = ev.device; }
     if (ev.kind === 'UNDO') { p.checked_in_at = null; p.checked_in_by = null; }
     if (ev.kind === 'PICKUP' && !p.picked_up_at) { p.picked_up_at = ev.scanned_at; p.picked_up_by = ev.device; }
     if (ev.kind === 'PICKUP_UNDO') { p.picked_up_at = null; p.picked_up_by = null; }
@@ -801,19 +874,57 @@ function decide(p, target, kind) {
   if (kind === 'PICKUP') return { result: p.picked_up_at ? 'PICKED_ALREADY' : 'HANDED', pass: p };
   if (kind === 'OVERRIDE') return { result: 'ADMIT', override: true, pass: p };
   if (p.checked_in_at) return { result: 'ALREADY', pass: p };
-  return { result: 'ADMIT', pass: p };
+  return { result: 'ADMIT', manual: kind === 'MANUAL', pass: p };
+}
+// The same for a ticket of a ticket event.
+function findTicket(ref) {
+  for (var i = 0; i < tickets.length; i++) if (tickets[i].ref === ref) return tickets[i];
+  return null;
+}
+function mergeTicket(t) {
+  if (!t || !t.event_id || !tix || String(t.event_id) !== String(tix.event.id)) return;
+  for (var i = 0; i < tickets.length; i++) if (tickets[i].ref === t.ref) { tickets[i] = t; saveTickets(); return; }
+  tickets.push(t); saveTickets();
+}
+function reapplyTicketQueue() {
+  queue.forEach(function (ev) {
+    if (!ev.ticket) return;
+    var t = findTicket(ev.ref);
+    if (!t) return;
+    if ((ev.kind === 'ENTRY' || ev.kind === 'MANUAL') && !t.checked_in_at) { t.checked_in_at = ev.scanned_at; t.checked_in_by = ev.device; }
+    if (ev.kind === 'UNDO') { t.checked_in_at = null; t.checked_in_by = null; }
+  });
+}
+function decideTicket(t, kind) {
+  if (!t) return { result: 'NOT_FOUND' };
+  if (kind === 'UNDO') return { result: 'UNDONE', pass: t };
+  if (t.status === 'TRANSFERRED') return { result: 'TRANSFERRED', pass: t };
+  if (t.status !== 'VALID') return { result: 'CANCELLED', pass: t };
+  if (kind === 'OVERRIDE') return { result: 'ADMIT', override: true, pass: t };
+  if (t.checked_in_at) return { result: 'ALREADY', pass: t };
+  return { result: 'ADMIT', manual: kind === 'MANUAL', pass: t };
 }
 
-// Reads what the camera saw. Current passes hold ONDROAD:<reference>:<email>.
-// Older passes held ONDROAD:<email>:<status>, so those are looked up by email.
+// Reads what the camera saw. Live passes hold ONDROAD:<reference>:<code> and tickets ONDROAD-T:<ref>:<code> (the code
+// changes every 30 seconds). The old still pass held ONDROAD:<reference>:<email>, and older ones ONDROAD:<email>:<status>
+// (looked up by email): those, and a bare reference, are "static" and only count while ALLOW_STATIC is on.
 function parse(text) {
   var t = String(text || '').trim();
-  if (/^ODR-[0-9A-F]{8}$/i.test(t)) return { ref: t.toUpperCase() };
+  if (t.slice(0, 10).toUpperCase() === 'ONDROAD-T:') {
+    var tp = t.split(':'), tref = String(tp[1] || '').trim().toUpperCase();
+    if (!/^[0-9A-Z]{10,16}$/.test(tref)) return null;
+    return { tkt: true, ref: tref, code: String(tp[2] || '').trim().toUpperCase() };
+  }
+  if (/^ODR-[0-9A-F]{8}$/i.test(t)) return { ref: t.toUpperCase(), still: true };
   if (t.slice(0, 8).toUpperCase() !== 'ONDROAD:') return null;
   var parts = t.split(':');
   if (parts.length < 3) return null;
-  if (/^ODR-[0-9A-F]{8}$/i.test(parts[1])) return { ref: parts[1].toUpperCase(), email: parts.slice(2).join(':').trim().toLowerCase() };
-  if (parts[1].indexOf('@') > 0) return { email: parts[1].trim().toLowerCase() };
+  if (/^ODR-[0-9A-F]{8}$/i.test(parts[1])) {
+    var third = parts.slice(2).join(':').trim();
+    if (third.indexOf('@') > 0) return { ref: parts[1].toUpperCase(), email: third.toLowerCase(), still: true };
+    return { ref: parts[1].toUpperCase(), code: third.toUpperCase() };
+  }
+  if (parts[1].indexOf('@') > 0) return { email: parts[1].trim().toLowerCase(), still: true };
   return null;
 }
 
@@ -822,27 +933,64 @@ function handle(target, kind) {
   kind = kind || 'ENTRY';
   var pickup = kind === 'PICKUP' || kind === 'PICKUP_UNDO';
   if (!target) { show({ result: 'INVALID' }, false, pickup); return Promise.resolve(); }
+  // A pass in ticket mode, or a ticket in On D' Road mode: switch first. Nothing is looked up or recorded.
+  if (ticketMode() && !target.tkt) { show({ result: 'SWITCH_TO_PASSES' }, false, false); return Promise.resolve(); }
+  if (!ticketMode() && target.tkt) { show({ result: 'SWITCH_TO_TICKETS' }, false, pickup); return Promise.resolve(); }
+  if (target.tkt) return handleTicket(target, kind);
+  // A scan needs the live code; staff checking photo ID (Look up, Check ID) don't.
+  var manual = kind === 'MANUAL' || !!target.manual;
+  var needsCode = (kind === 'ENTRY' || kind === 'PICKUP') && !manual;
+  if (needsCode && target.still && !ALLOW_STATIC) { show({ result: 'STALE', still: true }, false, pickup); return Promise.resolve(); }
   var local = findPass(target);
   var ref = target.ref || (local && local.ref) || '';
   if (!ref) { show(decide(null, target, kind), !online, pickup); return Promise.resolve(); }
-  var ev = { client_id: newId(), ref: ref, email: target.ref ? (target.email || '') : '', kind: kind, scanned_at: new Date().toISOString(), device: DEVICE };
+  var ev = { client_id: newId(), ref: ref, email: target.ref ? (target.email || '') : '', code: target.code || '', kind: kind, scanned_at: new Date().toISOString(), device: DEVICE };
+  if (manual && kind === 'PICKUP') ev.manual = true;
   showChecking();
   return api('/api/door/checkin', ev).then(function (r) {
-    if (r.pass) mergePass(r.pass);
+    if (r.pass && r.result !== 'STALE') mergePass(r.pass);
     show(r, false, pickup);
   }, function (err) {
     if (err.auth) { hideResult(); signOut(err.message); return; }
-    // No signal (or the server hiccuped): decide from the list saved on this phone.
+    // No signal (or the server hiccuped): decide from the list saved on this phone, checking the live code here.
     var d = decide(local, target, kind);
-    if (d.result === 'ADMIT' || d.result === 'UNDONE' || d.result === 'HANDED' || d.result === 'PICKUP_UNDONE') {
-      queue.push(ev); saveQueue();
-      if (d.result === 'ADMIT' && !d.override) { local.checked_in_at = ev.scanned_at; local.checked_in_by = DEVICE; }
-      if (d.result === 'UNDONE') { local.checked_in_at = null; local.checked_in_by = null; }
-      if (d.result === 'HANDED') { local.picked_up_at = ev.scanned_at; local.picked_up_by = DEVICE; }
-      if (d.result === 'PICKUP_UNDONE') { local.picked_up_at = null; local.picked_up_by = null; }
-      savePasses();
-    }
-    show(d, true, pickup);
+    var check = needsCode && !target.still && (d.result === 'ADMIT' || d.result === 'HANDED') ? liveCheck(local && local.secret, target.code, Date.now()) : Promise.resolve(true);
+    return check.then(function (ok) {
+      if (!ok) d = { result: 'STALE' };
+      if (d.result === 'ADMIT' || d.result === 'UNDONE' || d.result === 'HANDED' || d.result === 'PICKUP_UNDONE') {
+        queue.push(ev); saveQueue();
+        if (d.result === 'ADMIT' && !d.override) { local.checked_in_at = ev.scanned_at; local.checked_in_by = DEVICE; }
+        if (d.result === 'UNDONE') { local.checked_in_at = null; local.checked_in_by = null; }
+        if (d.result === 'HANDED') { local.picked_up_at = ev.scanned_at; local.picked_up_by = DEVICE; }
+        if (d.result === 'PICKUP_UNDONE') { local.picked_up_at = null; local.picked_up_by = null; }
+        savePasses();
+      }
+      show(d, true, pickup);
+    });
+  }).then(function () { renderNet(); renderCounts(); });
+}
+// A ticket of the ticket event being worked (checked in once; car passes too, on their own).
+function handleTicket(target, kind) {
+  var local = findTicket(target.ref);
+  var ev = { ticket: true, event_id: Number(WORK), client_id: newId(), ref: target.ref, code: target.code || '', kind: kind, scanned_at: new Date().toISOString(), device: DEVICE };
+  showChecking();
+  return api('/api/door/checkin', ev).then(function (r) {
+    if (r.pass && r.pass.event_id) mergeTicket(r.pass);
+    show(r, false, false);
+  }, function (err) {
+    if (err.auth) { hideResult(); signOut(err.message); return; }
+    var d = decideTicket(local, kind);
+    var check = kind === 'ENTRY' && d.result === 'ADMIT' ? liveCheck(local.secret, target.code, Date.now()) : Promise.resolve(true);
+    return check.then(function (ok) {
+      if (!ok) d = { result: 'STALE' };
+      if (d.result === 'ADMIT' || d.result === 'UNDONE') {
+        queue.push(ev); saveQueue();
+        if (d.result === 'ADMIT' && !d.override) { local.checked_in_at = ev.scanned_at; local.checked_in_by = DEVICE; }
+        if (d.result === 'UNDONE') { local.checked_in_at = null; local.checked_in_by = null; }
+        saveTickets();
+      }
+      show(d, true, false);
+    });
   }).then(function () { renderNet(); renderCounts(); });
 }
 
@@ -858,7 +1006,11 @@ var RESULTS = {
   UNDONE: { cls: 'neutral', label: 'Check-in removed', title: 'Undone', tone: 'neutral' },
   HANDED: { cls: 'ok', label: 'Package collected', title: 'Hand over', tone: 'ok' },
   PICKED_ALREADY: { cls: 'bad', label: 'Package already handed out', title: 'Already collected', tone: 'bad' },
-  PICKUP_UNDONE: { cls: 'neutral', label: 'Pickup removed', title: 'Undone', tone: 'neutral' }
+  PICKUP_UNDONE: { cls: 'neutral', label: 'Pickup removed', title: 'Undone', tone: 'neutral' },
+  STALE: { cls: 'bad', label: 'Not the live code', title: 'Old screenshot', tone: 'bad' },
+  SWITCH_TO_PASSES: { cls: 'warn', label: "On D' Road pass", title: 'Switch mode', tone: 'bad' },
+  SWITCH_TO_TICKETS: { cls: 'warn', label: 'Ticket site ticket', title: 'Switch mode', tone: 'bad' },
+  TRANSFERRED: { cls: 'bad', label: 'Ticket was transferred', title: 'Re-issued', tone: 'bad' }
 };
 var PICKUP_RESULTS = { HANDED: 1, PICKED_ALREADY: 1, PICKUP_UNDONE: 1 };
 
@@ -920,6 +1072,28 @@ function show(r, offline, pickup) {
 
   // Check ID: a package found by a Pickup name search, before it's handed over. Nothing is recorded or logged
   // until Hand over, which saves the pickup exactly like scanning the pass. Back keeps the search and its list.
+  if (r.result === 'CHECK_ID' && p && r.entry) {
+    // Look up at the gate (their phone is dead): the name as on their ID, then a manual check-in, logged as MANUAL.
+    var nm = r.ticket ? String(p.name || '').trim() : nameOf(p);
+    $('result').className = 'result idcheck';
+    $('r-label').textContent = (r.ticket ? 'Tickets' : 'Entry') + ' · Check ID';
+    $('r-title').textContent = nm || 'No name on file';
+    $('r-title').className = nm ? 'name' : 'quiet';
+    fitTitle();
+    $('r-pkg').textContent = r.ticket ? p.label : p.package;
+    size.textContent = ''; size.className = 'r-size';
+    $('r-email').textContent = r.ticket ? p.ref : p.email;
+    $('r-note').textContent = nm ? 'Check their photo ID says ' + nm + '. Let them in only if it does: this is logged with this phone.' : 'No name on file. Ask for their email and check their photo ID.';
+    timer.className = 'r-timer hidden';
+    primary.classList.remove('hidden');
+    primary.textContent = p.kind === 'CAR' ? 'Let the car in' : 'Let them in';
+    primary.onclick = function () { if (r.ticket) handleTicket({ ref: p.ref, tkt: true }, 'MANUAL'); else handle({ ref: p.ref }, 'MANUAL'); };
+    secondary.textContent = 'Back';
+    secondary.classList.remove('hidden');
+    secondary.onclick = function () { searchFlow = false; hideResult(); backToMatch(p.ref); };
+    primary.focus();
+    return;
+  }
   if (r.result === 'CHECK_ID' && p) {
     var who = nameOf(p);
     $('result').className = 'result idcheck';
@@ -944,7 +1118,7 @@ function show(r, offline, pickup) {
     timer.className = 'r-timer hidden';
     primary.classList.remove('hidden');
     primary.textContent = 'Hand over';
-    primary.onclick = function () { handle({ ref: p.ref }, 'PICKUP'); };
+    primary.onclick = function () { handle({ ref: p.ref, manual: true }, 'PICKUP'); };
     secondary.textContent = 'Back';
     secondary.classList.remove('hidden');
     secondary.onclick = function () { searchFlow = false; hideResult(); backToMatch(p.ref); };
@@ -953,12 +1127,16 @@ function show(r, offline, pickup) {
   }
 
   var cfg = RESULTS[r.result] || RESULTS.INVALID;
+  // A ticket (the ticket site) shows its label, never a name; a car pass says so, big.
+  var isTicket = !!(p && p.label !== undefined && p.package === undefined) || (ticketMode() && r.result !== 'SWITCH_TO_PASSES');
+  var car = isTicket && p && p.kind === 'CAR' && r.result === 'ADMIT';
   $('result').className = 'result ' + cfg.cls;
-  $('r-label').textContent = (pickup && !PICKUP_RESULTS[r.result] ? 'Pickup · ' : '') + (r.override ? 'Override · ' : '') + cfg.label + (offline ? ' · saved offline' : '');
-  $('r-title').textContent = cfg.title;
+  $('r-label').textContent = (pickup && !PICKUP_RESULTS[r.result] ? 'Pickup · ' : '') + (r.override ? 'Override · ' : '') + (r.manual && r.result === 'ADMIT' ? 'Checked by ID · ' : '')
+    + (car ? 'Valid car pass' : cfg.label) + (offline ? ' · saved offline' : '');
+  $('r-title').textContent = car ? 'Car pass' : cfg.title;
   fitTitle();
-  $('r-pkg').textContent = p ? p.package : '';
-  $('r-email').textContent = p ? p.email : '';
+  $('r-pkg').textContent = p ? (isTicket ? p.label || '' : p.package || '') : '';
+  $('r-email').textContent = p && !isTicket ? p.email || '' : p && isTicket && r.result !== 'STALE' ? p.ref || '' : '';
   // The size to hand over, big enough to read from the stock shelf.
   size.textContent = '';
   size.className = 'r-size';
@@ -969,12 +1147,20 @@ function show(r, offline, pickup) {
   var note = '';
   if (r.result === 'ADMIT') {
     if (r.override) note = 'Let in again by staff override. This is logged.';
+    if (r.manual) note = 'Let in after an ID check. This is logged with this phone.';
+    if (car) note = 'Let one car in. A car pass does not let a person in.';
+    else if (isTicket && !r.override && !r.manual) note = 'One person. 18+: ask for photo ID.';
     if (p && p.costume) note += (note ? ' ' : '') + 'Costume required: check their outfit.';
     if (p && p.refund_requested) note += (note ? ' ' : '') + 'They asked for a refund. Tell the organizer.';
   }
   if (r.result === 'ALREADY' && p) note = 'Checked in at ' + fmtTime(p.checked_in_at) + (p.checked_in_by ? ' by ' + p.checked_in_by : '') + '. Only let them in if you know it is a re-entry.';
   if (r.result === 'UNPAID') note = pickup ? 'Their reservation was never paid. No package until they pay.' : 'Their reservation was never paid, so this pass does not get them in.';
-  if (r.result === 'CANCELLED') note = pickup ? 'This order was cancelled or refunded. No package for this pass.' : 'This order was cancelled or refunded. The pass no longer works.';
+  if (r.result === 'CANCELLED') note = pickup ? 'This order was cancelled or refunded. No package for this pass.' : isTicket ? 'This ticket was refunded or cancelled. It does not get them in.' : 'This order was cancelled or refunded. The pass no longer works.';
+  if (r.result === 'STALE') note = r.still ? "That's a saved copy of an old pass, not the live one. Ask them to open their pass on their phone: the code on it changes every 30 seconds."
+    : 'Old screenshot: ask for the live ' + (isTicket ? 'ticket' : 'pass') + '. They open it on their phone; the code changes every 30 seconds, so a screenshot stops working after about a minute.';
+  if (r.result === 'SWITCH_TO_PASSES') note = "That's an On D' Road pass, switch mode: pick On D' Road under Working at the top.";
+  if (r.result === 'SWITCH_TO_TICKETS') note = "That's a ticket from the ticket site, switch mode: pick its event under Working at the top." + (TEVENTS.length ? '' : ' No ticket event is on today.');
+  if (r.result === 'TRANSFERRED') note = 'This ticket was transferred to someone else and re-issued, so this QR no longer works. Ask for the new ticket.';
   if (r.result === 'HANDED' && p) {
     // The name big, so staff can hold the screen next to the photo ID.
     var name = nameOf(p);
@@ -986,10 +1172,10 @@ function show(r, offline, pickup) {
   }
   if (r.result === 'PICKED_ALREADY' && p) note = (p.picked_up_at ? 'Handed out ' + fmtWhen(p.picked_up_at) + (p.picked_up_by ? ' by ' + p.picked_up_by : '') + '. ' : '') + 'One package per pass. If they say they never got it, contact the organizer.';
   if (r.result === 'PICKUP_UNDONE') note = 'Their package is no longer marked as collected.';
-  if (r.result === 'NOT_FOUND') note = offline ? 'Not in the list saved on this phone. If they paid recently, get signal, tap Sync now and scan again.' : 'No order has this code. Try searching their email.';
+  if (r.result === 'NOT_FOUND') note = offline ? 'Not in the list saved on this phone. If they paid recently, get signal, tap Sync now and scan again.' : isTicket ? 'No ticket has this code. Try Look up.' : 'No order has this code. Try searching their email.';
   if (r.result === 'MISMATCH') note = 'This code belongs to a different guest. Check their ID.';
   if (r.result === 'INVALID') note = "That QR code is not an On D' Road pass. Ask them to open the pass in their account.";
-  if (r.result === 'OTHER_EVENT') note = 'This pass is for ' + (r.event_name || 'another event') + ', not this event. ' + (pickup ? 'No package for this pass.' : 'It does not get them in.');
+  if (r.result === 'OTHER_EVENT') note = 'This ' + (isTicket ? 'ticket' : 'pass') + ' is for ' + (r.event_name || 'another event') + ', not this event. ' + (pickup ? 'No package for this pass.' : 'It does not get them in.');
   if (r.result === 'UNDONE') note = 'They are no longer marked as checked in.';
   $('r-note').textContent = note;
 
@@ -1001,12 +1187,12 @@ function show(r, offline, pickup) {
   if (r.result === 'ADMIT' && !r.override && p) {
     secondary.textContent = 'Undo';
     secondary.classList.remove('hidden');
-    secondary.onclick = function () { handle({ ref: p.ref }, 'UNDO'); };
+    secondary.onclick = function () { if (isTicket) handleTicket({ ref: p.ref, tkt: true }, 'UNDO'); else handle({ ref: p.ref }, 'UNDO'); };
   }
   if (r.result === 'ALREADY' && p) {
     secondary.textContent = 'Let them in anyway';
     secondary.classList.remove('hidden');
-    secondary.onclick = function () { handle({ ref: p.ref }, 'OVERRIDE'); };
+    secondary.onclick = function () { if (isTicket) handleTicket({ ref: p.ref, tkt: true }, 'OVERRIDE'); else handle({ ref: p.ref }, 'OVERRIDE'); };
   }
   if (r.result === 'HANDED' && p) {
     secondary.textContent = 'Undo';
@@ -1022,7 +1208,9 @@ function show(r, offline, pickup) {
     autoTimer = setTimeout(nextGuest, 3500);
   }
   feedback(cfg.tone);
-  var item = { t: new Date().toISOString(), result: r.result, override: !!r.override, offline: !!offline, email: p ? p.email : '', ref: p ? p.ref : '' };
+  var item = { t: new Date().toISOString(), result: r.result, override: !!r.override, manual: !!r.manual, offline: !!offline, email: p && !isTicket ? p.email : '', ref: p ? p.ref : '' };
+  if (isTicket && p && p.label) item.note = p.label;
+  if (car) item.result = 'CAR';
   if (pickup) { item.pickup = true; if (r.result === 'HANDED' && p && p.size) item.note = 'Size ' + p.size; }
   addRecent(item);
   primary.focus();
@@ -1091,11 +1279,11 @@ function unlockAudio() {
 }
 
 // ---------- Recent ----------
-var LABELS = { ADMIT: 'Admitted', ALREADY: 'Blocked: already in', UNPAID: 'Blocked: not paid', CANCELLED: 'Blocked: cancelled', NOT_FOUND: 'Not on list', MISMATCH: 'Blocked: wrong guest', INVALID: 'Not a pass', UNDONE: 'Check-in undone', CONFLICT: 'Admitted twice', OTHER_EVENT: 'Blocked: another event', OTHER_VOID: 'Let in offline, but the pass is for another event',
+var LABELS = { CAR: 'Car let in', STALE: 'Blocked: old screenshot', SWITCH_TO_PASSES: "Wrong mode: an On D' Road pass", SWITCH_TO_TICKETS: 'Wrong mode: a ticket', TRANSFERRED: 'Blocked: transferred', ADMIT: 'Admitted', ALREADY: 'Blocked: already in', UNPAID: 'Blocked: not paid', CANCELLED: 'Blocked: cancelled', NOT_FOUND: 'Not on list', MISMATCH: 'Blocked: wrong guest', INVALID: 'Not a pass', UNDONE: 'Check-in undone', CONFLICT: 'Admitted twice', OTHER_EVENT: 'Blocked: another event', OTHER_VOID: 'Let in offline, but the pass is for another event',
   HANDED: 'Package handed over', PICKED_ALREADY: 'Blocked: package already collected', PICKUP_UNDONE: 'Pickup undone', PICKUP_CONFLICT: 'Handed out twice', PICKUP_VOID: 'Handed out, but the order was cancelled' };
 // Pickup-mode scans that ended like an entry scan.
 var PICKUP_LABELS = { UNPAID: 'No package: not paid', CANCELLED: 'No package: cancelled', MISMATCH: 'No package: wrong guest', OTHER_EVENT: 'No package: another event' };
-var DOTS = { ADMIT: 'ok', UNDONE: 'neutral', UNPAID: 'warn', CONFLICT: 'warn', HANDED: 'ok', PICKUP_UNDONE: 'neutral', PICKUP_CONFLICT: 'warn' };
+var DOTS = { CAR: 'ok', SWITCH_TO_PASSES: 'warn', SWITCH_TO_TICKETS: 'warn', ADMIT: 'ok', UNDONE: 'neutral', UNPAID: 'warn', CONFLICT: 'warn', HANDED: 'ok', PICKUP_UNDONE: 'neutral', PICKUP_CONFLICT: 'warn' };
 function addRecent(item) {
   recent.unshift(item);
   recent = recent.slice(0, 30);
@@ -1110,7 +1298,7 @@ function renderRecent() {
     li.appendChild(el('i', undefined, 'dot ' + (DOTS[it.result] || 'bad')));
     li.appendChild(el('span', it.email || it.ref || 'Unknown code', 'who'));
     li.appendChild(el('span', fmtTime(it.t), 'when'));
-    var what = (it.override ? 'Admitted by override' : (it.pickup && PICKUP_LABELS[it.result]) || LABELS[it.result] || it.result) + (it.offline ? ' · offline' : '') + (it.note ? ' · ' + it.note : '');
+    var what = (it.override ? 'Admitted by override' : it.manual && it.result === 'ADMIT' ? 'Admitted after ID check' : (it.pickup && PICKUP_LABELS[it.result]) || LABELS[it.result] || it.result) + (it.offline ? ' · offline' : '') + (it.note ? ' · ' + it.note : '');
     li.appendChild(el('span', what, 'what'));
     ul.appendChild(li);
   });
@@ -1124,10 +1312,25 @@ function renderNet() {
 }
 function renderCounts() {
   var paid = 0, inn = 0, pickup = MODE === 'pickup';
+  if (ticketMode()) {
+    // People and car passes are counted apart: a car pass isn't a person.
+    var cars = 0, carsIn = 0;
+    tickets.forEach(function (t) {
+      if (t.status !== 'VALID') return;
+      if (t.kind === 'CAR') { cars++; if (t.checked_in_at) carsIn++; } else { paid++; if (t.checked_in_at) inn++; }
+    });
+    $('in-count').textContent = inn;
+    $('paid-count').textContent = paid;
+    $('count-what').textContent = 'tickets checked in';
+    $('car-count').textContent = cars ? carsIn + ' of ' + cars + ' car passes in' : '';
+    $('sync-text').textContent = tix && tix.generated_at ? 'Ticket list updated ' + fmtTime(tix.generated_at) : 'Ticket list not downloaded yet';
+    return;
+  }
   passes.forEach(function (p) { if (p.status === 'PAID') { paid++; if (pickup ? p.picked_up_at : p.checked_in_at) inn++; } });
   $('in-count').textContent = inn;
   $('paid-count').textContent = paid;
   $('count-what').textContent = pickup ? 'paid packages collected' : 'paid guests checked in';
+  $('car-count').textContent = '';
   $('sync-text').textContent = syncedAt ? 'Guest list updated ' + fmtTime(syncedAt) : 'Guest list not downloaded yet';
 }
 
@@ -1138,10 +1341,11 @@ function pushQueue() {
   return api('/api/door/sync', { events: batch }).then(function (data) {
     (data.results || []).forEach(function (r, i) {
       var ev = batch[i];
-      if (r.pass) mergePass(r.pass);
+      if (ev && ev.ticket) { if (r.pass && r.pass.event_id) mergeTicket(r.pass); }
+      else if (r.pass && r.result !== 'STALE') mergePass(r.pass);
       // Admitted offline here, but another phone had already checked them in.
-      if (ev && ev.kind === 'ENTRY' && r.result === 'ALREADY' && !r.replay && r.pass) {
-        recent.unshift({ t: new Date().toISOString(), result: 'CONFLICT', email: r.pass.email, ref: r.pass.ref, note: 'first in at ' + fmtTime(r.pass.checked_in_at) + (r.pass.checked_in_by ? ' (' + r.pass.checked_in_by + ')' : '') });
+      if (ev && (ev.kind === 'ENTRY' || ev.kind === 'MANUAL') && r.result === 'ALREADY' && !r.replay && r.pass) {
+        recent.unshift({ t: new Date().toISOString(), result: 'CONFLICT', email: ev.ticket ? '' : r.pass.email, ref: r.pass.ref, note: 'first in at ' + fmtTime(r.pass.checked_in_at) + (r.pass.checked_in_by ? ' (' + r.pass.checked_in_by + ')' : '') });
       }
       // Handed out offline here, but the package had already gone (another phone, or marked in admin).
       if (ev && ev.kind === 'PICKUP' && r.result === 'PICKED_ALREADY' && !r.replay && r.pass) {
@@ -1170,11 +1374,8 @@ function syncNow(manual) {
   $('sync-btn').disabled = true;
   if (manual) $('sync-text').textContent = 'Syncing...';
   return pushQueue().then(function () { return api('/api/door/list'); }).then(function (data) {
-    passes = data.passes || [];
-    reapplyQueue();
-    syncedAt = data.generated_at || new Date().toISOString();
-    savePasses();
-    store.set('door_synced_at', syncedAt);
+    takeList(data);
+    return ticketMode() ? syncTickets() : null;
   }).catch(function (err) {
     if (err.auth) signOut(err.message);
   }).then(function () {
@@ -1184,6 +1385,28 @@ function syncNow(manual) {
   });
 }
 $('sync-btn').addEventListener('click', function () { syncNow(true); });
+// The On D' Road list (with the ticket events on the door today and the still-pass setting).
+function takeList(data) {
+  passes = data.passes || [];
+  reapplyQueue();
+  syncedAt = data.generated_at || new Date().toISOString();
+  savePasses();
+  store.set('door_synced_at', syncedAt);
+  TEVENTS = data.ticket_events || [];
+  ALLOW_STATIC = !!data.allow_static;
+  ODR_NAME = data.event && data.event.name ? data.event.name : '';
+  store.set('door_ticket_events', TEVENTS); store.set('door_allow_static', ALLOW_STATIC); store.set('door_event_name', ODR_NAME);
+  renderWork();
+}
+// The ticket event's list. A transfer shows up here: the old ref comes back TRANSFERRED, the new one VALID.
+function syncTickets() {
+  var want = WORK;
+  return api('/api/door/tickets?event=' + encodeURIComponent(want)).then(function (data) {
+    if (WORK !== want) return;
+    tix = data; tickets = data.tickets || [];
+    reapplyTicketQueue(); saveTickets();
+  }, function (err) { if (err.auth) throw err; });
+}
 
 // ---------- Manual search ----------
 function statusOf(p) {
@@ -1195,21 +1418,61 @@ function statusOf(p) {
 function renderMatches() {
   var q = $('q').value.trim().toLowerCase();
   var box = $('matches'); box.replaceChildren();
+  if (ticketMode()) { renderTicketMatches(q, box); return; }
   if (MODE === 'pickup') { renderPickupMatches(q, box); return; }
   if (q.length < 2) return;
-  var list = passes.filter(function (p) { return p.ref.toLowerCase().indexOf(q) >= 0 || p.email.indexOf(q) >= 0; });
+  // Look up at the gate: name, email or reference. A tap goes to Check ID (their name) before anyone is let in.
+  var words = foldWords(q);
+  var list = passes.filter(function (p) {
+    var hay = fold(nameOf(p) + ' ' + p.email + ' ' + p.ref);
+    return words.every(function (w) { return hay.indexOf(w) >= 0; });
+  });
   list.sort(function (a, b) { return (RANK[b.status] || 0) - (RANK[a.status] || 0); });
   if (!list.length) { box.appendChild(el('p', 'No match in the guest list on this phone.', 'empty')); return; }
   list.slice(0, 8).forEach(function (p) {
-    var b = el('button', undefined, 'match');
+    var b = el('button', undefined, 'match pick'), who = nameOf(p), st = statusOf(p);
     b.type = 'button';
-    var st = statusOf(p);
-    b.appendChild(el('span', p.email, 'm-email'));
+    b.setAttribute('data-ref', p.ref);
+    b.appendChild(el('span', who || p.email, who ? 'm-name' : 'm-email'));
     b.appendChild(el('span', st[0], 'm-status ' + st[1]));
-    b.appendChild(el('span', p.package + (MODE === 'pickup' && p.size ? ' · Size ' + p.size : '') + ' · ' + p.ref, 'm-sub'));
-    b.addEventListener('click', function () { unlockAudio(); $('q').value = ''; box.replaceChildren(); $('q').blur(); handle({ ref: p.ref }, scanKind()); });
+    b.appendChild(el('span', who ? p.email : 'No name on file', who ? 'm-mail' : 'm-mail none'));
+    b.appendChild(el('span', p.package + ' · ' + p.ref, 'm-sub'));
+    b.addEventListener('click', function () { lookup(p, false); });
     box.appendChild(b);
   });
+}
+// Ticket mode's Look up: the holder's or the buyer's name, or the ticket reference.
+function renderTicketMatches(q, box) {
+  var words = q.length < 2 ? [] : foldWords(q);
+  if (!words.length) return;
+  var list = tickets.filter(function (t) {
+    var hay = fold((t.name || '') + ' ' + (t.buyer || '') + ' ' + t.ref);
+    return words.every(function (w) { return hay.indexOf(w) >= 0; });
+  });
+  var rank = { VALID: 3, TRANSFERRED: 1, CANCELLED: 1 };
+  list.sort(function (a, b) { return (rank[b.status] || 0) - (rank[a.status] || 0); });
+  if (!list.length) { box.appendChild(el('p', 'No match in the ticket list on this phone. Try the reference, or tap Sync now.', 'empty')); return; }
+  list.slice(0, 8).forEach(function (t) {
+    var b = el('button', undefined, 'match pick'), who = String(t.name || '').trim();
+    var st = t.status === 'TRANSFERRED' ? ['Transferred', 'st-bad'] : t.status !== 'VALID' ? ['Cancelled', 'st-bad'] : t.checked_in_at ? ['In ' + fmtTime(t.checked_in_at), 'st-in'] : [t.kind === 'CAR' ? 'Car pass' : 'Valid', 'st-ok'];
+    b.type = 'button';
+    b.setAttribute('data-ref', t.ref);
+    b.appendChild(el('span', who || t.ref, who ? 'm-name' : 'm-email'));
+    b.appendChild(el('span', st[0], 'm-status ' + st[1]));
+    b.appendChild(el('span', t.label, 'm-mail'));
+    b.appendChild(el('span', t.ref, 'm-sub'));
+    b.addEventListener('click', function () { lookup(t, true); });
+    box.appendChild(b);
+  });
+}
+// A guest found by Look up: Check ID first when they would get in; otherwise straight to the usual screen.
+function lookup(p, isTicket) {
+  unlockAudio();
+  $('q').blur();
+  searchFlow = true;
+  var d = isTicket ? decideTicket(p, 'MANUAL') : decide(p, { ref: p.ref }, 'MANUAL');
+  if (d.result === 'ADMIT') { show({ result: 'CHECK_ID', pass: p, entry: true, ticket: isTicket }, false, false); return; }
+  if (isTicket) handleTicket({ ref: p.ref, tkt: true }, 'MANUAL'); else handle({ ref: p.ref }, 'MANUAL');
 }
 // Pickup: every word typed must be in the guest's name, email or reference, in any order, so "oneil mary" finds
 // Mary-Ann O'Neil. The name leads each row, with the email under it.
@@ -1246,7 +1509,9 @@ function pickFromSearch(ref) {
   searchFlow = true;
   var p = findPass({ ref: ref });
   if (p && decide(p, { ref: ref }, 'PICKUP').result === 'HANDED') { show({ result: 'CHECK_ID', pass: p }, false, true); return; }
-  handle({ ref: ref }, 'PICKUP');
+  // Found by search, not scanned: there's no live code, so it goes as a manual pickup (the server still refuses an
+  // unpaid, cancelled or already collected package).
+  handle({ ref: ref, manual: true }, 'PICKUP');
 }
 $('q').addEventListener('input', renderMatches);
 if (wideMq) {
@@ -1335,23 +1600,51 @@ $('cam-stop').addEventListener('click', stopCamera);
 // Pickup is for handing out packages before the event: a scan marks the package collected and shows the size.
 // It never checks anyone in, so a phone left in Pickup mode can't use up a guest's entry.
 var modeInputs = Array.prototype.slice.call(document.querySelectorAll('input[name=mode]'));
-function scanKind() { return MODE === 'pickup' ? 'PICKUP' : 'ENTRY'; }
+function scanKind() { return MODE === 'pickup' && !ticketMode() ? 'PICKUP' : 'ENTRY'; }
 function camText() {
-  return MODE === 'pickup' ? "Point the camera at the guest's pass to hand out their package. This does not check them in." : "Point the camera at the QR code on the guest's pass.";
+  if (ticketMode()) return "Point the camera at the live QR on the guest's ticket.";
+  return MODE === 'pickup' ? "Point the camera at the guest's pass to hand out their package. This does not check them in." : "Point the camera at the live QR on the guest's pass.";
 }
 function setMode(m) {
   MODE = m === 'pickup' ? 'pickup' : 'entry';
   store.set('door_mode', MODE);
-  document.body.classList.toggle('pickup', MODE === 'pickup');
+  document.body.classList.toggle('pickup', MODE === 'pickup' && !ticketMode());
   modeInputs.forEach(function (i) { i.checked = i.value === MODE; });
   $('cam-msg').textContent = camText();
-  $('cam-hint').textContent = MODE === 'pickup' ? 'Pickup · hold the pass inside the frame' : 'Hold the pass inside the frame';
-  var ph = MODE === 'pickup' ? 'Search name, email or reference' : 'No QR? Search email or reference';
+  $('cam-hint').textContent = ticketMode() ? 'Tickets · hold the live ticket inside the frame' : MODE === 'pickup' ? 'Pickup · hold the pass inside the frame' : 'Hold the pass inside the frame';
+  var ph = ticketMode() ? 'Phone dead? Look up name or ticket ref' : MODE === 'pickup' ? 'Search name, email or reference' : 'Phone dead? Look up name, email or ref';
   $('q').placeholder = ph;
   $('q').setAttribute('aria-label', ph);
   renderCounts(); renderMatches();
 }
 modeInputs.forEach(function (i) { i.addEventListener('change', function () { if (i.checked) setMode(i.value); }); });
+
+// ---------- What this phone is working ----------
+// "On D' Road" (the invite-only event) or one of the ticket events on the door today (the ticket site; entry only).
+function renderWork() {
+  var sel = $('work'), list = TEVENTS.slice();
+  if (ticketMode() && !list.some(function (e) { return String(e.id) === WORK; })) {
+    if (tix && tix.event && String(tix.event.id) === WORK) list.push(tix.event); else { setWork('odr'); return; }
+  }
+  $('work-row').classList.toggle('hidden', !list.length);
+  sel.replaceChildren();
+  var o = el('option', "On D' Road" + (ODR_NAME && ODR_NAME !== "On D' Road" ? ' · ' + ODR_NAME : ''));
+  o.value = 'odr'; sel.appendChild(o);
+  list.forEach(function (e) { var x = el('option', 'Tickets · ' + e.name + (e.when ? ' · ' + e.when : '')); x.value = String(e.id); sel.appendChild(x); });
+  sel.value = WORK;
+}
+function setWork(v) {
+  var changed = String(v) !== WORK;
+  WORK = String(v);
+  store.set('door_work', WORK);
+  document.body.classList.toggle('tix', ticketMode());
+  tickets = tix && tix.event && String(tix.event.id) === WORK ? tix.tickets || [] : [];
+  if (changed) { $('q').value = ''; }
+  setMode(MODE);
+  renderWork();
+  if (changed && ticketMode() && KEY) syncNow(true);
+}
+$('work').addEventListener('change', function () { setWork(this.value); });
 
 // ---------- Sign in / out ----------
 function showMain() {
@@ -1376,7 +1669,7 @@ $('signout').addEventListener('click', function () {
   var what = queue.some(function (e) { return e.kind === 'PICKUP' || e.kind === 'PICKUP_UNDO'; }) ? ' scans' : ' check-ins';
   if (queue.length && !window.confirm(queue.length + what + ' have not synced yet. They stay on this phone and sync after you sign back in. Sign out anyway?')) return;
   passes = queue.length ? passes : [];
-  if (!queue.length) { savePasses(); store.del('door_synced_at'); syncedAt = null; recent = []; store.set('door_recent', recent); }
+  if (!queue.length) { savePasses(); store.del('door_synced_at'); syncedAt = null; recent = []; store.set('door_recent', recent); tix = null; tickets = []; store.del('door_tickets'); }
   signOut('Signed out.');
 });
 $('signin-form').addEventListener('submit', function (e) {
@@ -1388,13 +1681,10 @@ $('signin-form').addEventListener('submit', function (e) {
   api('/api/door/list').then(function (data) {
     DEVICE = device;
     store.set('door_key', KEY); store.set('door_device', DEVICE);
-    passes = data.passes || [];
-    reapplyQueue();
-    syncedAt = data.generated_at || new Date().toISOString();
-    savePasses(); store.set('door_synced_at', syncedAt);
+    takeList(data);
     $('key').value = '';
     showMain();
-    if (queue.length) syncNow();
+    if (queue.length || ticketMode()) syncNow();
   }, function (err) {
     KEY = '';
     $('signin-msg').textContent = err.auth ? 'Wrong staff password.' : 'No connection. You need signal once to sign in and download the guest list.';
@@ -1407,6 +1697,8 @@ setInterval(function () { if (KEY && !busy) syncNow(); }, 20000);
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/door-sw.js', { scope: '/door' }).catch(function () {});
 
+document.body.classList.toggle('tix', ticketMode());
+renderWork();
 setMode(MODE);
 if (KEY && DEVICE) { showMain(); syncNow(); } else { showSignin(); }
 </script>

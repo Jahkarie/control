@@ -1,8 +1,10 @@
 // payments.js: payment instructions, pay-by deadline, auto-expiry and reminder emails.
+import { WM_LITE } from './brand.js';
 import { renderEmail } from './emails.js';
 import { promoLabel } from './pricing.js';
 import { getSizeLock, isSizeLocked } from './pickup.js';
 import { CUR } from './events.js';
+import { qrSecret } from './liveqr.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ANTIGUA_MS = 4 * 60 * 60 * 1000; // Antigua is UTC-4 all year (no daylight saving)
@@ -17,7 +19,7 @@ export const dueSql = (p) => `COALESCE(o.pay_by, CASE WHEN COALESCE(o.pay_days, 
 // The "How to pay" text: the general instructions, then the package's own cash details.
 const howToPay = (instructions, payNote) => [instructions, payNote].map((t) => (t || '').trim()).filter(Boolean).join('\n\n');
 
-export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, requireAuth, requireAdmin, escapeHtml, beforeExpire }) {
+export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, TOKEN_SECRET, requireAuth, requireAdmin, escapeHtml, beforeExpire }) {
   // pay_rule 'days': pay within pay_days days of reserving (0 = no deadline).
   // pay_rule 'weekday': pay by the next pay_weekday (0 = Sunday) at pay_time, Antigua time.
   async function getSettings() {
@@ -125,6 +127,8 @@ export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, 
   // owes (tier, code) and pickup. price_cents is the order's amount too, for older copies of the guest site.
   // Only the current event's order: a pass from a past event is history (see events.js).
   // promo_kind is the code's kind ('TRACK' = a tracking code, full price), so the guest site words it right.
+  // A paid order also carries qr_secret: the guest site turns it into the pass's live QR (liveqr.js), which changes every
+  // 30 seconds. Only the guest's own session gets it, and only while the order is PAID.
   app.get('/api/my-order', requireAuth, async (req, res) => {
     try {
       const [{ instructions, payDays }, sizeLock] = await Promise.all([getSettings(), getSizeLock(pool)]);
@@ -132,12 +136,13 @@ export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, 
         `SELECT o.id, o.status, o.reference_code, o.created_at, o.cancel_requested_at, o.size, o.pay_days, ${dueSql('$2')} AS due,
                 COALESCE(o.amount_cents, p.price_cents) AS amount_cents, COALESCE(o.list_cents, p.price_cents) AS list_cents,
                 o.discount_cents, COALESCE(o.currency, p.currency) AS currency, o.promo_code, o.tier_name, o.paid_via,
-                o.picked_up_at, o.paypal_order_id IS NOT NULL AS paypal_started, pc.kind AS promo_kind, pc.value AS promo_value,
+                o.picked_up_at, o.paypal_order_id IS NOT NULL AS paypal_started, pc.kind AS promo_kind, pc.value AS promo_value, o.qr_version,
                 p.name AS package_name, p.includes, p.sizes AS package_sizes, p.pay_note
          FROM orders o JOIN packages p ON p.id = o.package_id LEFT JOIN promo_codes pc ON pc.code = o.promo_code
          WHERE o.guest_email = $1 AND o.status <> 'CANCELLED' AND o.event_id = ${CUR} ORDER BY o.id DESC LIMIT 1`, [req.userEmail, payDays]);
       if (!r.rowCount) return res.json(null);
-      const { due, promo_kind: kind, promo_value: value, ...o } = r.rows[0];
+      const { due, promo_kind: kind, promo_value: value, qr_version: qrVersion, ...o } = r.rows[0];
+      if (o.status === 'PAID' && TOKEN_SECRET) o.qr_secret = qrSecret(TOKEN_SECRET, o.reference_code, qrVersion || 1);
       o.promo_kind = o.promo_code ? kind || null : null;
       const open = o.status === 'RESERVED';
       o.price_cents = o.amount_cents;
@@ -207,12 +212,12 @@ export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, 
 <style>
 /* Night Kinetic, admin edition: matte charcoal, one sharp accent (safety orange), hairline rules and square corners.
    Concrete is kept for utility surfaces (previews, dialogs, toasts). Calm and dense for daily work. */
-:root { --bg: #0a0a0b; --surface: #141416; --surface-2: #1a1a1d; --raise: #232327; --well: #0a0a0b; --line: rgba(236, 235, 230, .1); --line-strong: rgba(236, 235, 230, .24); --text: #ecebe6; --muted: #a6a59f; --dim: #8a8983; --accent: #ff5a1f; --accent-hi: #ff7440; --accent-ink: #141416; --good: #b6ff3b; --warn: #ffc02e; --bad: #ff7a6b; --cyan: #22e1ff; --concrete: #c9c8c3; --concrete-2: #e4e3df; --ink: #141416; --ink-2: #47463f; --display: 'Archivo', 'Helvetica Neue', Arial, sans-serif; --body: 'Archivo', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; --mono: 'Space Mono', ui-monospace, SFMono-Regular, Menlo, monospace; --chev: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8' fill='none' stroke='%23ecebe6' stroke-width='1.6'%3E%3Cpath d='M1 1.5l5 5 5-5'/%3E%3C/svg%3E"); --xh: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='28' height='28' viewBox='0 0 28 28' fill='none' stroke='%23141416' stroke-opacity='0.55' stroke-width='1'%3E%3Ccircle cx='14' cy='14' r='6.5'/%3E%3Cpath d='M14 0v28M0 14h28'/%3E%3C/svg%3E"); color-scheme: dark; }
+:root { --bg: #0a0a0b; --surface: #141416; --surface-2: #1a1a1d; --raise: #232327; --well: #0a0a0b; --line: rgba(236, 235, 230, .1); --line-strong: rgba(236, 235, 230, .24); --text: #ecebe6; --muted: #a6a59f; --dim: #8a8983; --accent: #ff5a1f; --accent-hi: #ff7440; --accent-ink: #141416; --good: #b6ff3b; --warn: #ffc02e; --bad: #ff7a6b; --cyan: #22e1ff; --concrete: #c9c8c3; --concrete-2: #e4e3df; --ink: #141416; --ink-2: #47463f; --display: 'Archivo', 'Helvetica Neue', Arial, sans-serif; --body: 'Archivo', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; --mono: 'Space Mono', ui-monospace, SFMono-Regular, Menlo, monospace; --chev: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8' fill='none' stroke='%23ecebe6' stroke-width='1.6'%3E%3Cpath d='M1 1.5l5 5 5-5'/%3E%3C/svg%3E"); --xh: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='28' height='28' viewBox='0 0 28 28' fill='none' stroke='%23141416' stroke-opacity='0.55' stroke-width='1'%3E%3Ccircle cx='14' cy='14' r='6.5'/%3E%3Cpath d='M14 0v28M0 14h28'/%3E%3C/svg%3E"); --wm: ${WM_LITE}; color-scheme: dark; }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 var(--body); -webkit-font-smoothing: antialiased; }
 ::selection { background: var(--accent); color: var(--accent-ink); }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.top { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; justify-content: space-between; gap: 10px 16px; flex-wrap: wrap; min-height: 60px; padding: 10px clamp(16px, 3vw, 32px); background: rgba(10, 10, 11, .9); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border-bottom: 1px solid var(--line); }
+.top { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; justify-content: space-between; gap: 10px 16px; flex-wrap: wrap; min-height: 60px; padding: 10px clamp(16px, 3vw, 32px); background: var(--wm) 0 0 / 260px 150px, rgba(10, 10, 11, .9); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border-bottom: 1px solid var(--line); }
 .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .brand .mark { flex: none; width: 30px; height: 18px; overflow: visible; }
 .brand b { font-family: var(--display); font-stretch: 125%; font-weight: 900; font-size: 16px; line-height: 1; letter-spacing: .01em; white-space: nowrap; }

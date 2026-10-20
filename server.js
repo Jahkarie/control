@@ -16,7 +16,8 @@ import { registerReset } from './reset.js';
 import { createLock } from './lock.js';
 import { CUR, INVITES_LEFT_SQL, migrateEvents, registerEvents } from './events.js';
 import { registerPromoters } from './promoter.js';
-import QRCode from 'qrcode';
+import { registerTickets, ensureTicketSchema, createTicketDoor, TICKETS_URL } from './tickets.js';
+import { WM_LITE, WM_PNG } from './brand.js';
 
 const { Pool } = pkg;
 // DATE columns (guests.birth_date) come back as their 'YYYY-MM-DD' text. pg would otherwise turn them into a JS Date
@@ -274,9 +275,10 @@ const rateLimit = (max, windowMs, keyOf = (req) => req.ip) => {
 const app = express();
 app.set('trust proxy', 1); // Render sits behind a proxy
 
-// Accept the configured frontend plus the production domain (and any extras, comma-separated).
-const ALLOWED_ORIGINS = [FRONTEND_URL, 'https://ondroad.xyz', 'https://www.ondroad.xyz',
-  ...(process.env.EXTRA_ORIGINS || '').split(',').map((o) => o.trim().replace(/\/$/, '')).filter(Boolean)];
+// Accept the configured frontend plus the production domains, the ticket site (and any extras, comma-separated, such
+// as the static sites' *.onrender.com addresses).
+const ALLOWED_ORIGINS = [...new Set([FRONTEND_URL, 'https://ondroad.xyz', 'https://www.ondroad.xyz', 'https://tickets.ondroad.xyz', TICKETS_URL,
+  ...(process.env.EXTRA_ORIGINS || '').split(',').map((o) => o.trim().replace(/\/$/, '')).filter(Boolean)])];
 // cors() reflects the request's Access-Control-Request-Headers, so the guest site's x-preview header (site lock) passes.
 app.use(cors({ origin: ALLOWED_ORIGINS }));
 // The site lock (see lock.js): while it's on, every guest API answers 423 SITE_LOCKED unless the owner's preview header
@@ -285,17 +287,31 @@ const lock = createLock({ pool, TOKEN_SECRET, safeEqual, SITE_URL: process.env.F
 app.use(lock.guard);
 // Door check-in (staff scanner at /door). Registered before the 10kb body limit because
 // a phone coming back online can upload a batch of offline check-ins at once.
-registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLimit, requireAdmin });
+// The ticket site's side of the door (tickets.js): ticket events, their lists and check-ins.
+const ticketDoor = createTicketDoor({ pool, TOKEN_SECRET });
+registerDoor({ app, pool, express, ADMIN_KEY, TOKEN_SECRET, safeEqual, rateLimit, requireAdmin, ticketDoor });
 // Contact details and terms (see site.js). Also before the 10kb limit: the terms can be longer than that.
 const site = registerSite({ app, pool, express, requireAdmin, lock });
+// The ticket site (see tickets.js): its own lock (registered here, so it guards /api/tickets/* before any route), its API
+// and /admin/tickets. Before the 10kb limit too: its routes bring their own body parsers. mail is set up further down,
+// so it's reached through a wrapper.
+const tickets = registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, requireAdmin, rateLimit, renderEmail,
+  mail: { send: (...a) => mail.send(...a) }, normalizeEmail, isValidEmail, cleanName, cleanBirthDate,
+  SITE_URL: process.env.FRONTEND_URL ? FRONTEND_URL : 'https://ondroad.xyz', PUBLIC_URL: (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '') });
+// The emails' watermark tile (see brand.js and emails.js).
+app.get('/brand/wm.png', (req, res) => res.type('png').set('Cache-Control', 'public, max-age=604800').send(WM_PNG));
 app.use(express.json({ limit: '10kb' }));
 // The site lock's admin routes: GET/POST /api/admin/site-lock and POST /api/admin/site-lock/preview-reset.
 lock.register({ app, requireAdmin });
 
 // Payment instructions, pay-by deadline, auto-expiry and reminders (see payments.js).
 // Registered before the other routes on purpose: it replaces /api/my-order below.
-const mail = registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, requireAuth, requireAdmin, escapeHtml,
-  beforeExpire: (payDays) => paypal.syncDue(payDays) });
+// The same job runs the ticket site's checks (holds, PayPal, balance reminders and deadlines; see tickets.js).
+const mail = registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, TOKEN_SECRET, requireAuth, requireAdmin, escapeHtml,
+  beforeExpire: async (payDays) => {
+    await paypal.syncDue(payDays).catch((err) => console.error('PayPal check error:', err.message));
+    await tickets.sweep().catch((err) => console.error('Ticket job error:', err.message));
+  } });
 // Event details in guests' accounts and email updates to groups of guests (see event.js).
 registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, requireAuth, requireAdmin, mail });
 // Paying online with PayPal (see paypal.js). Off until the PAYPAL_* settings are added.
@@ -308,7 +324,7 @@ registerPricing({ app, pool, requireAuth, requireApproved, requireAdmin, rateLim
 registerPickup({ app, pool, requireAdmin });
 // Clearing guest data (or everything) to start over (see reset.js). A full reset also clears the email footer's contact
 // details, and deletes the site lock settings, so the site is locked again (the lock's cache is cleared too).
-registerReset({ app, pool, requireAdmin, rateLimit, afterReset: () => { lock.forget(); return site.refresh(); } });
+registerReset({ app, pool, requireAdmin, rateLimit, afterReset: () => { lock.forget(); tickets.lock.forget(); return site.refresh(); } });
 const ADMIN_EMAIL = normalizeEmail(process.env.ADMIN_EMAIL); // optional: gets refund requests and new sign-up requests
 // The backend's own address, for links in emails (pass images, the admin's "Review requests" button). '' if unknown.
 const PUBLIC_URL = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
@@ -458,6 +474,8 @@ async function ensureSchema() {
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS pay_by TIMESTAMPTZ;
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS picked_up_at TIMESTAMPTZ;
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS picked_up_by TEXT;
+    -- The live QR's version (liveqr.js): bumping it would re-issue the pass's secret.
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS qr_version INTEGER NOT NULL DEFAULT 1;
     ALTER TABLE guests ADD COLUMN IF NOT EXISTS full_name TEXT;
     ALTER TABLE guests ADD COLUMN IF NOT EXISTS birth_date DATE;
     ALTER TABLE guests ADD COLUMN IF NOT EXISTS instagram TEXT;
@@ -489,6 +507,8 @@ async function ensureSchema() {
   `);
   // The first current event, and event_id on rows from before events (see events.js). Safe on every boot.
   await migrateEvents(pool);
+  // The ticket site's tables (see tickets.js).
+  await ensureTicketSchema(pool);
   // Each order stores what it costs. Orders from before that keep the package price.
   await pool.query(
     `UPDATE orders o SET list_cents = p.price_cents, amount_cents = p.price_cents, currency = p.currency
@@ -1295,43 +1315,23 @@ async function sendOrderReceivedEmail(to, o, instructions) {
   }));
 }
 
-// ---------- Entry pass QR in email ----------
-// Same text as the QR on the guest site, which the door scanner reads.
-const passText = (ref, email) => `ONDROAD:${ref}:${String(email).toLowerCase()}`;
-const passPng = (ref, email) => QRCode.toBuffer(passText(ref, email), { width: 440, margin: 2, errorCorrectionLevel: 'M' });
-// The emailed image URL is signed so pass images can't be fetched by guessing references.
-const passSig = (ref) => sign('pass:' + ref).slice(0, 22);
+// ---------- The live pass (see liveqr.js) ----------
+// Passes show a live QR on the guest site ("ONDROAD:<reference>:<code>", the code changing every 30 seconds), worked out
+// in the browser from the secret /api/my-order sends to the paid guest. Emails carry no QR any more, only a button to
+// the live pass. The still images that used to be emailed are retired: their old links answer 410.
+app.get('/api/pass/:ref.png', (req, res) => res.status(410).type('text/plain').send('Open your live pass on your phone.'));
 
-// Only paid orders have a pass: after a refund the emailed image stops loading.
-app.get('/api/pass/:ref.png', rateLimit(300, 15 * 60 * 1000), async (req, res) => {
-  const ref = String(req.params.ref || '').toUpperCase();
-  if (!safeEqual(String(req.query.s || ''), passSig(ref))) return res.status(404).end();
-  try {
-    const r = await pool.query("SELECT guest_email FROM orders WHERE reference_code = $1 AND status = 'PAID'", [ref]);
-    if (!r.rowCount) return res.status(404).end();
-    res.type('png').set('Cache-Control', 'private, max-age=3600').send(await passPng(ref, r.rows[0].guest_email));
-  } catch (err) {
-    serverError(res, err);
-  }
-});
-
-// "You're confirmed" email with the entry pass. free: a free pass (promo code or free package), so nothing was paid.
+// "You're confirmed" email. free: a free pass (promo code or free package), so nothing was paid.
 async function sendPaidEmail(to, packageName, ref, { free } = {}) {
-  let attachments;
-  try {
-    attachments = [{ filename: `ondroad-pass-${ref}.png`, content: await passPng(ref, to) }];
-  } catch (err) {
-    console.error('Pass QR failed:', ref, err.message); // still send the confirmation without it
-  }
   return mail.send(to, "You're confirmed — On D' Road", renderEmail({
     tone: 'good', tag: free ? 'Free pass' : 'Payment confirmed', title: "You're in",
-    preheader: free ? 'Your free pass is confirmed. Your entry pass is ready.' : 'Payment received. Your entry pass is ready.',
+    preheader: free ? 'Your free pass is confirmed. Open your pass on your phone.' : 'Payment received. Open your pass on your phone.',
     lines: [free ? 'Your free pass is confirmed.' : 'Payment received. Your spot is confirmed.',
-      'Your entry pass is below and attached to this email. Save it to your phone so you can show it at the entrance even without signal. Final event details, location and package pickup info will follow closer to the date.'],
-    image: PUBLIC_URL ? { src: `${PUBLIC_URL}/api/pass/${ref}.png?s=${passSig(ref)}`, alt: `Entry pass ${ref}`, caption: 'Show this at the entrance. One scan, one person.' } : null,
+      'Your entry pass is in your account. Open it on your phone at the entrance: the QR on it changes every 30 seconds. Final event details, location and package pickup info will follow closer to the date.'],
     details: [['Package', packageName], ['Reference', ref, true]],
-    cta: { text: 'View my pass', url: FRONTEND_URL }
-  }), attachments);
+    cta: { text: 'Open your pass', url: FRONTEND_URL },
+    fine: "Screenshots won't work at the door; open your pass on your phone."
+  }));
 }
 
 app.post('/api/admin/orders/:id/mark-paid', requireAdmin, async (req, res) => {
@@ -1663,6 +1663,8 @@ const ADMIN_PAGE = `<!DOCTYPE html>
   --display: 'Archivo', 'Helvetica Neue', Arial, sans-serif; --body: 'Archivo', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; --mono: 'Space Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
   --chev: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8' fill='none' stroke='%23ecebe6' stroke-width='1.6'%3E%3Cpath d='M1 1.5l5 5 5-5'/%3E%3C/svg%3E");
   --xh: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='28' height='28' viewBox='0 0 28 28' fill='none' stroke='%23141416' stroke-opacity='0.55' stroke-width='1'%3E%3Ccircle cx='14' cy='14' r='6.5'/%3E%3Cpath d='M14 0v28M0 14h28'/%3E%3C/svg%3E");
+  /* The CASHCXDE ENT. watermark (brand.js), faint in the header band */
+  --wm: ${WM_LITE};
   color-scheme: dark;
 }
 * { box-sizing: border-box; }
@@ -1676,7 +1678,7 @@ a { color: inherit; }
 /* ---------- Top bar ---------- */
 .top {
   position: sticky; top: 0; z-index: 30; display: flex; align-items: center; justify-content: space-between; gap: 10px 20px; flex-wrap: wrap;
-  min-height: 60px; padding: 10px clamp(16px, 3vw, 32px); background: rgba(10, 10, 11, .9); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  min-height: 60px; padding: 10px clamp(16px, 3vw, 32px); background: var(--wm) 0 0 / 260px 150px, rgba(10, 10, 11, .92); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
   border-bottom: 1px solid var(--line);
 }
 .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
@@ -1730,6 +1732,11 @@ a { color: inherit; }
 .alert.lock-line::before { content: ''; width: 9px; height: 9px; background: var(--accent); }
 .alert.lock-line b { font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
 .alert.lock-line span span { color: var(--muted); }
+/* The ticket site's line: cyan while open, orange while locked */
+.alert.tix-line { border-left-color: var(--cyan); border-color: rgba(34, 225, 255, .28); background: rgba(34, 225, 255, .05); }
+.alert.tix-line::before { background: var(--cyan); }
+.alert.tix-line.locked { border-left-color: var(--accent); border-color: rgba(255, 90, 31, .3); background: rgba(255, 90, 31, .06); }
+.alert.tix-line.locked::before { background: var(--accent); }
 
 /* ---------- KPI row: hairline cells with registration ticks ---------- */
 .kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); margin-bottom: 18px; }
@@ -1951,6 +1958,7 @@ dialog .btn.danger-solid:hover { background: #941c15; border-color: #941c15; }
     <a class="top-link" href="/admin/pickup">Sizes &amp; pickup</a>
     <a class="top-link" href="/admin/event">Event &amp; messages</a>
     <a class="top-link" href="/admin/site">Site, contact, terms &amp; FAQ</a>
+    <a class="top-link" href="/admin/tickets">Tickets &amp; tables</a>
     <a class="top-link" href="${FRONTEND_URL}" target="_blank" rel="noopener">View site &#8599;</a>
     <span id="clock" class="clock"></span>
   </nav>
@@ -1967,6 +1975,7 @@ dialog .btn.danger-solid:hover { background: #941c15; border-color: #941c15; }
   </div>
 
   <div id="lock-alert" class="alert lock-line hidden" role="status"><span><b>Site is locked</b><span id="lock-alert-when"></span></span><a class="btn small ghost" href="/admin/site">Manage</a></div>
+  <div id="tix-line" class="alert lock-line tix-line hidden" role="status"><span><b id="tix-state">Ticket site</b><span id="tix-sold"></span></span><a class="btn small ghost" href="/admin/tickets">Manage</a></div>
   <div id="alert" class="alert hidden"><span id="alert-text"></span><button class="btn small" id="alert-go" type="button">Review</button></div>
   <div id="req-alert" class="alert hidden"><span id="req-alert-text"></span><button class="btn small" id="req-alert-go" type="button">Review</button></div>
 
@@ -2061,6 +2070,7 @@ dialog .btn.danger-solid:hover { background: #941c15; border-color: #941c15; }
   </section>
   <section class="panel hidden" id="door-panel" role="tabpanel">
     <div class="toolbar">
+      <select id="door-source" class="hidden" aria-label="Door of"></select>
       <input id="door-search" class="grow" placeholder="Search email or reference" type="search">
       <select id="door-filter" aria-label="Door event filter"><option value="">All door activity</option><option value="ENTRY">Entries</option><option value="OVERRIDE">Overrides</option><option value="DUPLICATE">Blocked repeat scans</option><option value="UNDO">Undone</option><option value="PICKUP">Packages collected</option><option value="PICKUP_DUP">Blocked repeat pickups</option><option value="PICKUP_UNDO">Pickups undone</option></select>
       <a class="btn ghost" href="/door" target="_blank" rel="noopener">Open scanner</a>
@@ -2650,11 +2660,43 @@ function renderOrders() {
   labelCells(tbody);
 }
 
-const DOOR_EVENTS = { ENTRY: ['Entry', 'good'], OVERRIDE: ['Override', 'warn'], DUPLICATE: ['Blocked repeat', 'bad'], UNDO: ['Undone', 'neutral'],
+const DOOR_EVENTS = { ENTRY: ['Entry', 'good'], MANUAL: ['Let in after ID check', 'warn'], OVERRIDE: ['Override', 'warn'], DUPLICATE: ['Blocked repeat', 'bad'], UNDO: ['Undone', 'neutral'],
   PICKUP: ['Package collected', 'good'], PICKUP_DUP: ['Blocked repeat pickup', 'bad'], PICKUP_UNDO: ['Pickup undone', 'neutral'] };
+// The Door tab shows the invite-only event's door log, or a ticket event's (picked in #door-source).
+let ticketEvents = [], ticketScans = null;
+function renderDoorSource() {
+  const sel = $('door-source'), v = sel.value;
+  sel.classList.toggle('hidden', !ticketEvents.length);
+  sel.replaceChildren();
+  const o = el('option', "On D' Road"); o.value = ''; sel.appendChild(o);
+  ticketEvents.forEach((e) => { const x = el('option', 'Tickets · ' + e.name); x.value = String(e.id); sel.appendChild(x); });
+  sel.value = ticketEvents.some((e) => String(e.id) === v) ? v : '';
+}
+$('door-source').addEventListener('change', async () => {
+  const v = $('door-source').value;
+  ticketScans = null;
+  if (v) { try { ticketScans = await api('/api/admin/ticket-checkins?event=' + encodeURIComponent(v)); } catch (e) { toast(e.message, true); } }
+  renderDoor();
+});
 function renderDoor() {
   const q = $('door-search').value.trim().toLowerCase(), f = $('door-filter').value;
   const tbody = $('doorlist'); tbody.replaceChildren();
+  if (ticketScans) {
+    const tl = ticketScans.filter((c) => (!f || c.kind === f) && (String(c.ref).toLowerCase().includes(q) || String(c.order_ref).toLowerCase().includes(q) || String(c.label).toLowerCase().includes(q)));
+    if (!tl.length) return emptyRow(tbody, 6, ticketScans.length ? 'No door activity matches.' : 'No ticket scans yet for this event.');
+    tl.forEach((c) => {
+      const tr = el('tr');
+      td(tr, c.ticket_kind === 'CAR' ? 'Car pass' : 'Ticket', 'strong');
+      const ev = DOOR_EVENTS[c.kind] || [c.kind, 'neutral'];
+      td(tr, '').appendChild(pill(ev[0], ev[1]));
+      td(tr, c.label);
+      td(tr, timeOf(c.scanned_at), 'mono');
+      td(tr, c.device || '');
+      td(tr, c.ref + ' · ' + c.order_ref, 'mono');
+      tbody.appendChild(tr);
+    });
+    return labelCells(tbody);
+  }
   const list = checkins.filter((c) => (!f || c.kind === f) && (String(c.email).toLowerCase().includes(q) || String(c.ref).toLowerCase().includes(q)));
   if (!list.length) return emptyRow(tbody, 6, checkins.length ? 'No door activity matches.' : 'No check-ins yet. They show up here as staff scan passes at the door.');
   list.forEach((c) => {
@@ -2698,6 +2740,16 @@ async function refreshLock() {
     $('lock-alert').classList.toggle('hidden', !d.locked);
     $('lock-alert-when').textContent = d.locked && d.site_unlock_at ? ' · Opens ' + timeOf(d.site_unlock_at) + ' Antigua time' : ' · Guests see only the trailer';
   } catch (e) { /* the status line is only a reminder */ }
+  // The ticket site's line: locked or open, and the tickets paid for today.
+  try {
+    const [t, evs] = await Promise.all([api('/api/admin/tickets/summary'), api('/api/admin/tickets/events')]);
+    $('tix-line').classList.remove('hidden');
+    $('tix-line').classList.toggle('locked', !!t.locked);
+    $('tix-state').textContent = 'Ticket site: ' + (t.locked ? 'locked' : 'open');
+    $('tix-sold').textContent = ' · ' + plural(t.sold_today, 'ticket', 'tickets') + ' sold today' + (t.on_sale ? ' · ' + plural(t.on_sale, 'event', 'events') + ' on sale' : '');
+    ticketEvents = evs.filter((e) => e.status !== 'DRAFT');
+    renderDoorSource();
+  } catch (e) { /* only a reminder */ }
 }
 
 async function refresh() {
