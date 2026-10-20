@@ -1,13 +1,16 @@
 // pricing.js: price tiers and promo codes.
 // A package can have tiers (Early bird, Standard, Late...). Guests pay the first tier that hasn't ended or sold out;
 // when every tier has, the package's sales are closed. A package without tiers costs its own price.
-// Promo codes take a percent or an amount off, or make the pass free. Each order stores what it costs (tier, list
-// price, discount, amount, code; see /api/orders in server.js), so changing a tier or a code never changes existing
-// orders. An order that a code makes free is confirmed straight away (paid_via = 'COMP').
+// Promo codes take a percent or an amount off, make the pass free, or (TRACK) take nothing off and only record who
+// brought the guest, for promoters (see promoter.js). Each order stores what it costs (tier, list price, discount,
+// amount, code; see /api/orders in server.js), so changing a tier or a code never changes existing orders. An order
+// that a code makes free is confirmed straight away (paid_via = 'COMP').
+// Packages and codes belong to an event (event_id); guests only ever see and use the current event's (see events.js).
 // The package_tiers and promo_codes tables are created by ensureSchema() in server.js.
+import { CUR } from './events.js';
 
 const HOUR_MS = 60 * 60 * 1000;
-const KINDS = ['PERCENT', 'AMOUNT', 'FREE'];
+const KINDS = ['PERCENT', 'AMOUNT', 'FREE', 'TRACK'];
 
 export const cleanCode = (v) => String(v || '').trim().toUpperCase();
 export const CODE_RE = /^[A-Z0-9][A-Z0-9-]{2,23}$/;
@@ -83,14 +86,17 @@ export function withStates(tiers, now = new Date()) {
 
 // Checks a code for a package. With lock: true it locks the code's row (call it inside a transaction), so two
 // guests can't both take its last use. Uses = orders with this code that aren't cancelled, not counting
-// excludeOrderId (the guest's own order, when they re-apply a code). Returns { promo } or { error } (guest-facing).
+// excludeOrderId (the guest's own order, when they re-apply a code). Only the current event's codes work, and a
+// promoter's code stops working while the promoter is turned off. Returns { promo } or { error } (guest-facing).
 export async function checkPromo(db, code, packageId, { lock = false, excludeOrderId = null } = {}) {
   const c = cleanCode(code);
   if (!CODE_RE.test(c)) return { error: "That code isn't valid." };
   const r = await db.query(
-    `SELECT code, kind, value, package_id, max_uses, expires_at, active, note FROM promo_codes WHERE code = $1${lock ? ' FOR UPDATE' : ''}`, [c]);
+    `SELECT c.code, c.kind, c.value, c.package_id, c.max_uses, c.expires_at, c.active, c.note, c.promoter_id, pr.active AS promoter_active
+     FROM promo_codes c LEFT JOIN promoters pr ON pr.id = c.promoter_id
+     WHERE c.code = $1 AND c.event_id = ${CUR}${lock ? ' FOR UPDATE OF c' : ''}`, [c]);
   const p = r.rows[0];
-  if (!p || !p.active) return { error: "That code isn't valid." };
+  if (!p || !p.active || (p.promoter_id !== null && !p.promoter_active)) return { error: "That code isn't valid." };
   if (p.expires_at && new Date(p.expires_at) <= new Date()) return { error: 'That code has expired.' };
   if (p.package_id !== null && p.package_id !== Number(packageId)) return { error: "That code doesn't work for this package." };
   const u = await db.query(
@@ -123,14 +129,18 @@ export function discountFor(promo, listCents) {
   return Math.max(0, Math.min(list, off));
 }
 
-// Pure. "20% off", "XCD 50.00 off" (in the given currency; no currency gives "50.00 off") or "Free pass".
+// Pure. "20% off", "XCD 50.00 off" (in the given currency; no currency gives "50.00 off"), "Free pass" or, for a
+// tracking code (full price), "Code applied". Guest-facing, so a tracking code never mentions a discount.
 export function promoLabel(promo, currency) {
   const value = Number(promo?.value) || 0;
   if (promo?.kind === 'PERCENT') return `${value}% off`;
   if (promo?.kind === 'AMOUNT') return `${currency ? currency + ' ' : ''}${(value / 100).toFixed(2)} off`;
   if (promo?.kind === 'FREE') return 'Free pass';
+  if (promo?.kind === 'TRACK') return 'Code applied';
   return '';
 }
+// What a code does, for the admin pages: a tracking code is "Tracking only (full price)".
+export const adminCodeLabel = (promo, currency) => (promo?.kind === 'TRACK' ? 'Tracking only (full price)' : promoLabel(promo, currency));
 
 // ---------- Admin input ----------
 
@@ -204,7 +214,7 @@ export function registerPricing({ app, pool, requireAuth, requireApproved, requi
         return res.status(403).json({ error: "You're not approved yet. We'll email you when you are.", code: 'NOT_APPROVED' });
       }
       const pkg = packageId
-        ? await pool.query('SELECT id, price_cents, currency, active FROM packages WHERE id = $1', [packageId]) : { rows: [] };
+        ? await pool.query(`SELECT id, price_cents, currency, active FROM packages WHERE id = $1 AND event_id = ${CUR}`, [packageId]) : { rows: [] };
       const p = pkg.rows[0];
       const price = p && p.active ? priceOf(p, (await loadTiers(pool, [p.id])).get(p.id)) : null;
       if (!price || price.closed) return invalid(res, "That package isn't available.");
@@ -228,12 +238,14 @@ export function registerPricing({ app, pool, requireAuth, requireApproved, requi
     try {
       client = await pool.connect();
       await client.query('BEGIN');
+      // Held while the code is applied, so a new event can't start halfway (see events.js).
+      await client.query("SELECT 1 FROM events WHERE status = 'current' FOR SHARE");
       // Locked, so a PayPal checkout (which locks it too) can't start on the old amount meanwhile.
       const r = await client.query(
         `SELECT o.id, o.guest_email, o.reference_code, o.package_id, o.paypal_order_id,
                 COALESCE(o.list_cents, p.price_cents) AS list_cents, COALESCE(o.currency, p.currency) AS currency, p.name AS package_name
          FROM orders o JOIN packages p ON p.id = o.package_id
-         WHERE o.guest_email = $1 AND o.status = 'RESERVED' ORDER BY o.id DESC LIMIT 1 FOR UPDATE OF o`, [req.userEmail]);
+         WHERE o.guest_email = $1 AND o.status = 'RESERVED' AND o.event_id = ${CUR} ORDER BY o.id DESC LIMIT 1 FOR UPDATE OF o`, [req.userEmail]);
       const o = r.rows[0];
       if (!o) {
         await client.query('ROLLBACK');
@@ -280,13 +292,17 @@ export function registerPricing({ app, pool, requireAuth, requireApproved, requi
 
   app.get('/api/admin/pricing', requireAdmin, async (req, res) => {
     try {
-      const [pk, codes] = await Promise.all([
-        pool.query('SELECT id, name, currency, price_cents, active FROM packages ORDER BY sort_order ASC, id ASC'),
+      // The current event's packages and codes. Past events keep theirs, read-only (see events.js).
+      const [pk, codes, promoters, ev] = await Promise.all([
+        pool.query(`SELECT id, name, currency, price_cents, active FROM packages WHERE event_id = ${CUR} ORDER BY sort_order ASC, id ASC`),
         pool.query(
           `SELECT c.code, c.kind, c.value, c.package_id, p.name AS package_name, p.currency, c.max_uses, c.expires_at,
-                  c.active, c.note, c.created_at,
+                  c.active, c.note, c.created_at, c.promoter_id, pr.name AS promoter_name, pr.active AS promoter_active,
                   (SELECT COUNT(*) FROM orders o WHERE o.promo_code = c.code AND o.status <> 'CANCELLED')::int AS uses
-           FROM promo_codes c LEFT JOIN packages p ON p.id = c.package_id ORDER BY c.created_at DESC, c.code`)
+           FROM promo_codes c LEFT JOIN packages p ON p.id = c.package_id LEFT JOIN promoters pr ON pr.id = c.promoter_id
+           WHERE c.event_id = ${CUR} ORDER BY c.created_at DESC, c.code`),
+        pool.query('SELECT id, name, active FROM promoters ORDER BY active DESC, LOWER(name), id'),
+        pool.query("SELECT id, name FROM events WHERE status = 'current'")
       ]);
       const tiers = await loadTiers(pool, pk.rows.map((p) => p.id));
       const now = new Date();
@@ -301,7 +317,9 @@ export function registerPricing({ app, pool, requireAuth, requireApproved, requi
             sold: t.sold, sort_order: t.sort_order, state: t.state
           }))
         })),
-        codes: codes.rows.map(({ currency, ...c }) => ({ ...c, label: promoLabel(c, c.package_id ? currency : anyCurrency) }))
+        codes: codes.rows.map(({ currency, ...c }) => ({ ...c, label: adminCodeLabel(c, c.package_id ? currency : anyCurrency) })),
+        promoters: promoters.rows,
+        event: ev.rows[0] || null
       });
     } catch (err) { fail(res, err); }
   });
@@ -316,7 +334,7 @@ export function registerPricing({ app, pool, requireAuth, requireApproved, requi
       const r = await pool.query(
         `INSERT INTO package_tiers (package_id, name, price_cents, ends_at, quantity, sort_order)
          SELECT p.id, $2::text, $3::int, $4::timestamptz, $5::int, (SELECT COALESCE(MAX(t.sort_order), 0) + 1 FROM package_tiers t WHERE t.package_id = p.id)
-         FROM packages p WHERE p.id = $1 RETURNING id`,
+         FROM packages p WHERE p.id = $1 AND p.event_id = ${CUR} RETURNING id`,
         [packageId || null, f.name, f.price_cents, f.ends_at, f.quantity]);
       if (!r.rowCount) return res.status(400).json({ error: "That package doesn't exist." });
       res.json({ success: true, id: r.rows[0].id });
@@ -332,7 +350,8 @@ export function registerPricing({ app, pool, requireAuth, requireApproved, requi
     if (!id || !cols.length) return res.status(400).json({ error: 'Nothing to update.' });
     try {
       const r = await pool.query(
-        `UPDATE package_tiers SET ${cols.map((c, n) => `${c} = $${n + 1}`).join(', ')} WHERE id = $${cols.length + 1}`,
+        `UPDATE package_tiers SET ${cols.map((c, n) => `${c} = $${n + 1}`).join(', ')} WHERE id = $${cols.length + 1}
+           AND package_id IN (SELECT id FROM packages WHERE event_id = ${CUR})`,
         [...cols.map((c) => f[c]), id]);
       if (!r.rowCount) return res.status(404).json({ error: "That tier doesn't exist anymore." });
       res.json({ success: true });
@@ -349,7 +368,8 @@ export function registerPricing({ app, pool, requireAuth, requireApproved, requi
       client = await pool.connect();
       await client.query('BEGIN');
       const list = await client.query(
-        `SELECT id FROM package_tiers WHERE package_id = (SELECT package_id FROM package_tiers WHERE id = $1)
+        `SELECT id FROM package_tiers WHERE package_id = (SELECT t.package_id FROM package_tiers t JOIN packages p ON p.id = t.package_id
+                                                          WHERE t.id = $1 AND p.event_id = ${CUR})
          ORDER BY sort_order, id FOR UPDATE`, [id]);
       const ids = list.rows.map((t) => t.id);
       const i = ids.indexOf(id);
@@ -385,7 +405,7 @@ export function registerPricing({ app, pool, requireAuth, requireApproved, requi
       await client.query('BEGIN');
       // Lock the package as a reservation does, so no new order can pick this tier while it's deleted.
       const t = await client.query(
-        'SELECT p.id FROM package_tiers t JOIN packages p ON p.id = t.package_id WHERE t.id = $1 FOR UPDATE OF p', [id]);
+        `SELECT p.id FROM package_tiers t JOIN packages p ON p.id = t.package_id WHERE t.id = $1 AND p.event_id = ${CUR} FOR UPDATE OF p`, [id]);
       if (!t.rowCount) {
         await client.query('ROLLBACK');
         return res.status(404).json({ error: "That tier doesn't exist anymore." });
@@ -412,7 +432,7 @@ export function registerPricing({ app, pool, requireAuth, requireApproved, requi
     if (!CODE_RE.test(code)) return res.status(400).json({ error: 'A code is 3 to 24 letters, numbers or dashes, starting with a letter or number.' });
     const kind = String(b.kind || '').toUpperCase();
     if (!KINDS.includes(kind)) return res.status(400).json({ error: 'Choose what the code gives.' });
-    const value = kind === 'FREE' ? 0 : toInt(b.value);
+    const value = kind === 'FREE' || kind === 'TRACK' ? 0 : toInt(b.value);
     if (kind === 'PERCENT' && !(Number.isInteger(value) && value >= 1 && value <= 100)) {
       return res.status(400).json({ error: 'Percent off must be a whole number from 1 to 100.' });
     }
@@ -421,16 +441,24 @@ export function registerPricing({ app, pool, requireAuth, requireApproved, requi
     }
     const packageId = blank(b.package_id) ? null : idOf(b.package_id);
     if (packageId === 0) return res.status(400).json({ error: "That package doesn't exist." });
+    const promoterId = blank(b.promoter_id) ? null : idOf(b.promoter_id);
+    if (promoterId === 0) return res.status(400).json({ error: "That promoter doesn't exist." });
     const { error, fields: f } = promoEdits({ max_uses: b.max_uses, expires_at: b.expires_at, note: b.note });
     if (error) return res.status(400).json({ error });
     try {
-      if (packageId !== null && !(await pool.query('SELECT 1 FROM packages WHERE id = $1', [packageId])).rowCount) {
+      // A code is for the current event, and only for its packages.
+      if (packageId !== null && !(await pool.query(`SELECT 1 FROM packages WHERE id = $1 AND event_id = ${CUR}`, [packageId])).rowCount) {
         return res.status(400).json({ error: "That package doesn't exist." });
       }
+      if (promoterId !== null && !(await pool.query('SELECT 1 FROM promoters WHERE id = $1', [promoterId])).rowCount) {
+        return res.status(400).json({ error: "That promoter doesn't exist." });
+      }
+      // Code names are unique across events, so an old event's code keeps saying what it took off.
       const r = await pool.query(
-        `INSERT INTO promo_codes (code, kind, value, package_id, max_uses, expires_at, note) VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (code) DO NOTHING RETURNING code`, [code, kind, value, packageId, f.max_uses, f.expires_at, f.note]);
-      if (!r.rowCount) return res.status(409).json({ error: `${code} already exists. Pick another code.` });
+        `INSERT INTO promo_codes (code, kind, value, package_id, max_uses, expires_at, note, promoter_id, event_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, ${CUR})
+         ON CONFLICT (code) DO NOTHING RETURNING code`, [code, kind, value, packageId, f.max_uses, f.expires_at, f.note, promoterId]);
+      if (!r.rowCount) return res.status(409).json({ error: `${code} already exists${(await pool.query(`SELECT 1 FROM promo_codes WHERE code = $1 AND event_id <> ${CUR}`, [code])).rowCount ? ' (from a past event)' : ''}. Pick another code.` });
       res.json({ success: true, code });
     } catch (err) { fail(res, err); }
   });
@@ -444,7 +472,7 @@ export function registerPricing({ app, pool, requireAuth, requireApproved, requi
     if (!cols.length) return res.status(400).json({ error: 'Nothing to update.' });
     try {
       const r = await pool.query(
-        `UPDATE promo_codes SET ${cols.map((c, n) => `${c} = $${n + 1}`).join(', ')} WHERE code = $${cols.length + 1}`,
+        `UPDATE promo_codes SET ${cols.map((c, n) => `${c} = $${n + 1}`).join(', ')} WHERE code = $${cols.length + 1} AND event_id = ${CUR}`,
         [...cols.map((c) => f[c]), code]);
       if (!r.rowCount) return res.status(404).json({ error: "That code doesn't exist anymore." });
       res.json({ success: true });
@@ -459,7 +487,7 @@ export function registerPricing({ app, pool, requireAuth, requireApproved, requi
       client = await pool.connect();
       await client.query('BEGIN');
       // A reservation using the code holds this lock until it's saved, so it can't slip in between.
-      const c = await client.query('SELECT 1 FROM promo_codes WHERE code = $1 FOR UPDATE', [code]);
+      const c = await client.query(`SELECT 1 FROM promo_codes WHERE code = $1 AND event_id = ${CUR} FOR UPDATE`, [code]);
       if (!c.rowCount) {
         await client.query('ROLLBACK');
         return res.status(404).json({ error: "That code doesn't exist anymore." });
@@ -483,12 +511,12 @@ export function registerPricing({ app, pool, requireAuth, requireApproved, requi
   app.get('/admin/pricing', requireAdmin, (req, res) => res.type('html').send(PAGE));
 }
 
-// ---------- "Prices & codes" admin page ----------
+// ---------- "Prices, codes & promoters" admin page ----------
 // Dates in the forms are datetime-local inputs read and shown as Antigua time; "-04:00" is added when sending.
 const PAGE = `<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex"><meta name="theme-color" content="#0a0a0b">
-<title>Prices &amp; codes | On D' Road</title>
+<title>Prices, codes &amp; promoters | On D' Road</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <style>
@@ -590,6 +618,33 @@ td.actions button + button { margin-left: 6px; }
 .row { display: flex; gap: 8px; }
 .row input { flex: 1; }
 .foot { display: flex; align-items: center; gap: 14px; margin-top: 16px; flex-wrap: wrap; }
+.evline { display: inline-block; font-family: var(--mono); font-size: 12px; letter-spacing: .06em; color: var(--text); }
+.evline:empty { display: none; }
+.pgrid { grid-template-columns: 1.4fr 1fr 1fr; }
+/* Promoters: one block each, split by hairlines */
+.prom { margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--line); }
+.prom.off { opacity: .72; }
+.prom-head { display: flex; align-items: center; gap: 10px 12px; flex-wrap: wrap; }
+.prom-head h3 { margin: 0; font-family: var(--display); font-stretch: 118%; font-size: 17px; font-weight: 800; letter-spacing: .01em; text-transform: uppercase; overflow-wrap: anywhere; }
+.prom-head .acts { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
+.prom .note { margin: 6px 0 0; color: var(--muted); font-size: 13.5px; }
+.pk { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); margin-top: 14px; }
+@media (max-width: 700px) { .pk { grid-template-columns: repeat(2, minmax(0, 1fr)); } .pgrid { grid-template-columns: 1fr 1fr; } }
+.pk div { background: var(--surface-2); padding: 12px 12px 10px; min-width: 0; }
+.pk b { display: block; font-family: var(--display); font-stretch: 125%; font-weight: 800; font-size: 24px; line-height: 1; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.pk b.money { font-family: var(--mono); font-stretch: 100%; font-size: 13px; line-height: 1.35; }
+.pk span { display: block; margin-top: 6px; font-family: var(--mono); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+.pk i { display: block; font-style: normal; font-size: 12px; color: var(--dim); margin-top: 3px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.chip { font-family: var(--mono); font-size: 12px; padding: 4px 8px; border: 1px solid var(--line-strong); color: var(--text); }
+.chip.off { color: var(--dim); text-decoration: line-through; }
+details.who { margin-top: 12px; }
+details.who summary { cursor: pointer; min-height: 32px; display: inline-flex; align-items: center; font-family: var(--mono); font-size: 11.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+details.who ul { list-style: none; margin: 6px 0 0; padding: 0; border-top: 1px solid var(--line); }
+details.who li { display: flex; justify-content: space-between; gap: 4px 12px; flex-wrap: wrap; padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 13.5px; }
+details.who li span { color: var(--muted); }
+details.who h4 { margin: 12px 0 0; font-family: var(--mono); font-size: 10.5px; font-weight: 400; letter-spacing: .12em; text-transform: uppercase; color: var(--dim); }
+.past-line { margin: 10px 0 0; color: var(--dim); font-size: 12.5px; }
 
 /* Phones: each table row becomes a block. Labels come from data-label. */
 @media (max-width: 700px) {
@@ -627,6 +682,7 @@ dialog button.ghost:hover { border-color: var(--ink); background: rgba(20, 20, 2
 dialog button.danger-solid { background: #b3261e; border-color: #b3261e; color: #fff; }
 dialog button.danger-solid:hover { background: #941c15; border-color: #941c15; }
 .dlg-fields { display: grid; gap: 14px; margin-top: 18px; }
+dialog .f small { color: var(--ink-2); }
 .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 24px; }
 /* Toast: a concrete slip with an orange edge */
 .toast { position: fixed; left: 50%; bottom: 24px; z-index: 80; transform: translate(-50%, 16px); width: max-content; max-width: calc(100vw - 32px); padding: 13px 18px 13px 16px; border-left: 3px solid var(--accent); background: var(--concrete-2); color: var(--ink); font-size: 14px; font-weight: 600; line-height: 1.4; opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s; box-shadow: 0 20px 50px -10px rgba(0, 0, 0, .8); }
@@ -638,8 +694,8 @@ dialog button.danger-solid:hover { background: #941c15; border-color: #941c15; }
   <a class="back" href="/admin">&larr; Back to overview</a>
 </header>
 <main class="wrap">
-  <h1>Prices &amp; codes</h1>
-  <p class="lead">Prices that change by date or when a tier sells out, and codes that take money off.</p>
+  <h1>Prices, codes &amp; promoters</h1>
+  <p class="lead">Prices that change by date or when a tier sells out, codes that take money off or track who brought a guest, and promoters. <span class="evline" id="evline"></span></p>
   <div class="explain"><b>How price tiers work</b>Guests pay the first tier that hasn't ended or sold out. When the last tier ends or sells out, the package closes; add a last tier with no end date and no limit to keep selling. Unpaid reservations that expire free their spot in that tier. Changing a tier's price doesn't change existing orders.</div>
   <div id="pkgs"><p class="empty">Loading...</p></div>
 
@@ -652,11 +708,13 @@ dialog button.danger-solid:hover { background: #941c15; border-color: #941c15; }
         <div class="f wide"><label for="c-code">Code</label>
           <div class="row"><input id="c-code" maxlength="24" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="SAVE20"><button class="ghost" type="button" id="c-random">Random</button></div></div>
         <div class="f"><label for="c-kind">Gives</label>
-          <select id="c-kind"><option value="PERCENT">Percent off</option><option value="AMOUNT">Amount off</option><option value="FREE">Free pass</option></select></div>
+          <select id="c-kind"><option value="PERCENT">Percent off</option><option value="AMOUNT">Amount off</option><option value="FREE">Free pass</option><option value="TRACK">Tracking only (full price)</option></select></div>
         <div class="f" id="c-value-f"><label for="c-value" id="c-value-l">Percent off</label>
           <input id="c-value" type="number" min="1" max="100" step="1" inputmode="numeric" placeholder="20"></div>
         <div class="f"><label for="c-pkg">Package</label>
           <select id="c-pkg"><option value="">Any package</option></select></div>
+        <div class="f"><label for="c-promoter">Promoter</label>
+          <select id="c-promoter"><option value="">None</option></select></div>
         <div class="f"><label for="c-max">Max uses</label>
           <input id="c-max" type="number" min="1" max="100000" step="1" inputmode="numeric" placeholder="No limit"></div>
         <div class="f wide"><label for="c-exp">Expires (Antigua time)</label>
@@ -664,10 +722,25 @@ dialog button.danger-solid:hover { background: #941c15; border-color: #941c15; }
         <div class="f wide"><label for="c-note">Note, only you see it</label>
           <input id="c-note" maxlength="200" placeholder="Example: DJ crew"></div>
       </div>
-      <small>3 to 24 letters, numbers or dashes; guests can type it in any case. Leave max uses and expiry blank for no limit. A use counts while the order isn't cancelled.</small>
+      <small>3 to 24 letters, numbers or dashes; guests can type it in any case. Leave max uses and expiry blank for no limit. A use counts while the order isn't cancelled. A tracking code takes nothing off: guests pay full price, and the order counts for its promoter. Codes are for this event only.</small>
       <div class="foot"><button type="submit" id="c-save">Create code</button><span id="c-msg" class="msg" role="status"></span></div>
     </form>
     <div id="code-list"></div>
+  </section>
+
+  <section class="card" id="promoters" aria-labelledby="pr-h">
+    <h2 id="pr-h">Promoters</h2>
+    <p>Each promoter gets a private link with their numbers for this event: their codes' uses, orders and money received, and the invites they send from it. Their page shows counts only, never guest names. Give them codes above (pick them as the code's promoter) and invites here.</p>
+    <form id="pr-form" class="add" novalidate>
+      <h3>New promoter</h3>
+      <div class="grid pgrid">
+        <div class="f wide"><label for="pr-name">Name</label><input id="pr-name" maxlength="60" autocomplete="off" placeholder="Example: Kai Thomas"></div>
+        <div class="f"><label for="pr-inv">Invites for this event</label><input id="pr-inv" type="number" min="0" max="500" step="1" inputmode="numeric" placeholder="0"></div>
+        <div class="f wide"><label for="pr-note">Note, only you see it</label><input id="pr-note" maxlength="300" placeholder="Example: Runs the Friday fete crew"></div>
+      </div>
+      <div class="foot"><button type="submit" id="pr-save">Add promoter</button><span id="pr-msg" class="msg" role="status"></span></div>
+    </form>
+    <div id="pr-list"></div>
   </section>
 </main>
 
@@ -688,7 +761,8 @@ dialog button.danger-solid:hover { background: #941c15; border-color: #941c15; }
 const $ = (id) => document.getElementById(id);
 const AST = 4 * 36e5; // Antigua is UTC-4 all year
 const STATES = { CURRENT: ['On sale', 'good'], UPCOMING: ['Upcoming', 'neutral'], ENDED: ['Ended', 'neutral'], SOLD_OUT: ['Sold out', 'warn'] };
-let data = { packages: [], codes: [] };
+let data = { packages: [], codes: [], promoters: [] };
+let promo = { promoters: [], event: null };
 let firstLoad = true;
 
 async function api(path, body) {
@@ -948,7 +1022,7 @@ function codeCurrency() {
 }
 function syncKind() {
   const kind = $('c-kind').value, v = $('c-value');
-  $('c-value-f').classList.toggle('hidden', kind === 'FREE');
+  $('c-value-f').classList.toggle('hidden', kind === 'FREE' || kind === 'TRACK');
   if (kind === 'PERCENT') {
     $('c-value-l').textContent = 'Percent off';
     v.step = '1'; v.max = '100'; v.placeholder = '20'; v.inputMode = 'numeric';
@@ -965,7 +1039,10 @@ $('c-pkg').addEventListener('change', syncKind);
 $('c-random').addEventListener('click', () => {
   const ABC = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
   const kind = $('c-kind').value, n = Number($('c-value').value);
-  const prefix = kind === 'FREE' ? 'FREE' : 'SAVE' + (Number.isInteger(n) && n > 0 && n <= 99999 ? n : '');
+  // A tracking code starts with its promoter's first name, like KAI-7KQ2XD.
+  const pr = data.promoters.find((x) => String(x.id) === $('c-promoter').value);
+  const first = pr ? pr.name.toUpperCase().split(' ')[0].split('').filter((ch) => ABC.includes(ch) || '01IOL'.includes(ch)).join('').slice(0, 10) : '';
+  const prefix = kind === 'FREE' ? 'FREE' : kind === 'TRACK' ? (first.length >= 2 ? first : 'PROMO') : 'SAVE' + (Number.isInteger(n) && n > 0 && n <= 99999 ? n : '');
   const bytes = crypto.getRandomValues(new Uint8Array(6));
   $('c-code').value = prefix + '-' + Array.from(bytes, (b) => ABC[b % ABC.length]).join('');
   $('c-code').focus();
@@ -978,7 +1055,8 @@ $('code-form').addEventListener('submit', async (e) => {
   const kind = $('c-kind').value;
   const body = {
     code: $('c-code').value.trim().toUpperCase(), kind: kind, package_id: $('c-pkg').value || null,
-    max_uses: $('c-max').value.trim(), expires_at: fromInput($('c-exp').value), note: $('c-note').value
+    max_uses: $('c-max').value.trim(), expires_at: fromInput($('c-exp').value), note: $('c-note').value,
+    promoter_id: $('c-promoter').value || null
   };
   if (kind === 'PERCENT') body.value = $('c-value').value.trim();
   if (kind === 'AMOUNT') {
@@ -1002,6 +1080,12 @@ function renderCodes() {
   sel.firstChild.value = '';
   data.packages.forEach((p) => { const o = el('option', p.name + (p.active ? '' : ' (hidden)')); o.value = String(p.id); sel.appendChild(o); });
   sel.value = Array.from(sel.options).some((o) => o.value === was) ? was : '';
+  // Promoter choices (active ones; a code for a promoter who's off wouldn't work).
+  const ps = $('c-promoter'), pwas = ps.value;
+  ps.replaceChildren(el('option', 'None'));
+  ps.firstChild.value = '';
+  data.promoters.filter((x) => x.active).forEach((x) => { const o = el('option', x.name); o.value = String(x.id); ps.appendChild(o); });
+  ps.value = Array.from(ps.options).some((o) => o.value === pwas) ? pwas : '';
   syncKind();
 
   const box = $('code-list');
@@ -1019,6 +1103,7 @@ function renderCodes() {
     const tr = el('tr');
     const code = td(tr, '', c.code, 'code');
     if (c.note) code.appendChild(el('span', c.note, 'subtext'));
+    if (c.promoter_name) code.appendChild(el('span', 'Promoter: ' + c.promoter_name + (c.promoter_active ? '' : ' (off, so the code doesn’t work)'), 'subtext' + (c.promoter_active ? '' : ' bad')));
     td(tr, 'Gives', c.label);
     td(tr, 'Package', c.package_name || 'Any package');
     const used = td(tr, 'Used', c.uses + (c.max_uses === null ? '' : ' / ' + c.max_uses), 'num');
@@ -1069,10 +1154,110 @@ function renderCodes() {
   table.appendChild(tb); wrap.appendChild(table); box.appendChild(wrap);
 }
 
+// ---------- Promoters ----------
+function receivedText(list) { return list && list.length ? list.map((m) => money(m.cents, m.currency)).join(' + ') : 'XCD 0.00'; }
+async function copyText(text, done) {
+  try { await navigator.clipboard.writeText(text); toast(done); }
+  catch (e) { await ask({ title: 'Copy this link', text: text, ok: 'Done' }); }
+}
+function promoterBlock(p) {
+  const box = el('div', undefined, 'prom' + (p.active ? '' : ' off'));
+  box.id = 'promoter-' + p.id;
+  const head = el('div', undefined, 'prom-head');
+  head.appendChild(el('h3', p.name));
+  head.appendChild(pill(p.active ? 'Active' : 'Off', p.active ? 'good' : 'neutral'));
+  const acts = el('div', undefined, 'acts');
+  acts.appendChild(actionBtn('Edit', 'ghost', async () => {
+    const v = await ask({ title: 'Edit ' + p.name, ok: 'Save', fields: [
+      { name: 'name', label: 'Name', value: p.name, maxLength: 60 },
+      { name: 'invites', label: 'Invites for ' + (promo.event ? promo.event.name : 'this event'), type: 'number', min: 0, max: 500, step: 1, inputMode: 'numeric', value: p.invites.allowance,
+        hint: p.invites.sent ? p.invites.sent + ' sent so far.' : 'None sent yet.' },
+      { name: 'note', label: 'Note, only you see it', value: p.note, maxLength: 300 }
+    ] });
+    if (!v) return false;
+    await api('/api/admin/promoters/' + p.id, { name: v.name, invites: v.invites.trim() === '' ? 0 : v.invites.trim(), note: v.note });
+    return 'Promoter saved.';
+  }, 'Edit ' + p.name));
+  const copy = el('button', 'Copy link', 'small ghost'); copy.type = 'button';
+  copy.setAttribute('aria-label', 'Copy the private link of ' + p.name);
+  copy.disabled = !p.active;
+  copy.addEventListener('click', () => copyText(p.link, 'Link for ' + p.name + ' copied.'));
+  acts.appendChild(copy);
+  acts.appendChild(actionBtn('Reset link', 'ghost', async () => {
+    const v = await ask({ title: 'Reset the link of ' + p.name + '?', text: 'Their current link stops working right away. You then send them the new one.', ok: 'Reset link', danger: true });
+    if (!v) return false;
+    const r = await api('/api/admin/promoters/' + p.id + '/reset-link', {});
+    await load();
+    await copyText(r.link, 'New link copied. The old one no longer works.');
+    return false;
+  }, 'Reset the link of ' + p.name));
+  acts.appendChild(actionBtn(p.active ? 'Turn off' : 'Turn on', p.active ? 'danger' : 'ghost', async () => {
+    if (p.active) {
+      const v = await ask({ title: 'Turn ' + p.name + ' off?', text: 'Their link stops working and their codes stop applying. Orders already made stay as they are. You can turn them on again.', ok: 'Turn off', danger: true });
+      if (!v) return false;
+    }
+    await api('/api/admin/promoters/' + p.id, { active: !p.active });
+    return p.active ? p.name + ' is off.' : p.name + ' is on.';
+  }, (p.active ? 'Turn off ' : 'Turn on ') + p.name));
+  head.appendChild(acts);
+  box.appendChild(head);
+  if (p.note) box.appendChild(el('p', p.note, 'note'));
+  const k = el('div', undefined, 'pk');
+  const cell = (value, label, sub, isMoney) => { const d = el('div'); d.appendChild(el('b', value, isMoney ? 'money' : '')); d.appendChild(el('span', label)); if (sub) d.appendChild(el('i', sub)); k.appendChild(d); };
+  const uses = p.codes.reduce((n, c) => n + c.uses, 0);
+  cell(String(p.orders.paid), 'Paid', p.orders.reserved + ' reserved · ' + p.orders.cancelled + ' cancelled');
+  cell(receivedText(p.received), 'Received', 'Paid orders, their codes', true);
+  cell(String(uses), 'Code uses', plural(p.codes.length, 'code', 'codes'));
+  cell(p.invites.left + ' / ' + p.invites.allowance, 'Invites left', p.invites.sent + ' sent · ' + p.invites.accepted + ' joined · ' + p.invites.approved + ' approved · ' + p.invites.paid + ' paid');
+  box.appendChild(k);
+  if (p.codes.length) {
+    const chips = el('div', undefined, 'chips');
+    p.codes.forEach((c) => { const ch = el('span', c.code + ' · ' + c.label + ' · ' + c.uses + (c.max_uses === null ? '' : '/' + c.max_uses), 'chip' + (c.active ? '' : ' off')); chips.appendChild(ch); });
+    box.appendChild(chips);
+  }
+  const people = p.people || { invited: [], orders: [] };
+  if (people.invited.length || people.orders.length || p.pending.length) {
+    const d = el('details', undefined, 'who');
+    d.appendChild(el('summary', 'Guests (only you see this)'));
+    const list = (title, rows) => { if (!rows.length) return; d.appendChild(el('h4', title)); const ul = el('ul'); rows.forEach((r) => { const li = el('li'); li.appendChild(el('b', r[0])); li.appendChild(el('span', r[1])); ul.appendChild(li); }); d.appendChild(ul); };
+    list('Through their codes', people.orders.map((o) => [o.full_name || o.email, o.code + ' · ' + (o.status === 'PAID' ? 'Paid ' + money(o.amount_cents, o.currency) : o.status === 'RESERVED' ? 'Reserved' : 'Cancelled') + ' · ' + o.email]));
+    list('Joined through their invites', people.invited.map((g) => [g.full_name || g.email, (g.approval === 'APPROVED' ? 'Approved' : g.approval === 'DECLINED' ? 'Declined' : g.approval === 'PENDING' ? 'Waiting for approval' : 'Removed') + (g.paid ? ' · Paid' : '') + ' · ' + g.email]));
+    list('Invites waiting', p.pending.map((i) => [i.email, 'Sent ' + when(i.created_at)]));
+    box.appendChild(d);
+  }
+  if (p.past && p.past.length) box.appendChild(el('p', 'Before: ' + p.past.map((e) => e.name + ' (' + plural(e.paid, 'paid order', 'paid orders') + ', ' + e.invites_accepted + ' joined)').join(' · '), 'past-line'));
+  return box;
+}
+function renderPromoters() {
+  const box = $('pr-list');
+  box.replaceChildren();
+  if (!promo.promoters.length) { const p = el('p', 'No promoters yet.', 'empty'); p.style.marginTop = '18px'; box.appendChild(p); return; }
+  promo.promoters.forEach((p) => box.appendChild(promoterBlock(p)));
+}
+$('pr-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const b = $('pr-save'), msg = $('pr-msg');
+  msg.textContent = ''; msg.className = 'msg';
+  const name = $('pr-name').value.trim();
+  if (!name) { msg.textContent = 'Give the promoter a name.'; msg.className = 'msg err'; $('pr-name').focus(); return; }
+  b.disabled = true;
+  try {
+    await api('/api/admin/promoters', { name: name, note: $('pr-note').value, invites: $('pr-inv').value.trim() || 0 });
+    ['pr-name', 'pr-inv', 'pr-note'].forEach((id) => { $(id).value = ''; });
+    msg.textContent = name + ' is added. Copy their link below.'; msg.className = 'msg ok';
+    await load();
+  } catch (err) { msg.textContent = err.message; msg.className = 'msg err'; }
+  finally { b.disabled = false; }
+});
+
 async function load() {
-  data = await api('/api/admin/pricing');
+  const r = await Promise.all([api('/api/admin/pricing'), api('/api/admin/promoters').catch(() => ({ promoters: [], event: null }))]);
+  data = r[0]; promo = r[1];
+  data.promoters = data.promoters || [];
+  $('evline').textContent = data.event ? '[ ' + data.event.name + ' ]' : '';
   renderPackages();
   renderCodes();
+  renderPromoters();
   // Links like /admin/pricing#p3 (from the Packages tab) land on that package once it's drawn.
   if (firstLoad) {
     firstLoad = false;

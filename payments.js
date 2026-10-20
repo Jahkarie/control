@@ -2,6 +2,7 @@
 import { renderEmail } from './emails.js';
 import { promoLabel } from './pricing.js';
 import { getSizeLock, isSizeLocked } from './pickup.js';
+import { CUR } from './events.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ANTIGUA_MS = 4 * 60 * 60 * 1000; // Antigua is UTC-4 all year (no daylight saving)
@@ -76,7 +77,7 @@ export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, 
       //    last 30 minutes, or a PayPal payment PayPal is still processing, gets more time.
       const expired = await pool.query(
         `UPDATE orders o SET status = 'CANCELLED' FROM packages p
-         WHERE p.id = o.package_id AND o.status = 'RESERVED'
+         WHERE p.id = o.package_id AND o.status = 'RESERVED' AND o.event_id = ${CUR}
            AND ${DUE} < NOW()
            AND (o.paypal_started_at IS NULL OR o.paypal_started_at < NOW() - INTERVAL '30 minutes')
            AND o.paypal_status IS DISTINCT FROM 'PENDING'
@@ -96,7 +97,7 @@ export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, 
       {
         const due = await pool.query(
           `UPDATE orders o SET reminder_sent_at = NOW() FROM packages p
-           WHERE p.id = o.package_id AND o.status = 'RESERVED' AND o.reminder_sent_at IS NULL
+           WHERE p.id = o.package_id AND o.status = 'RESERVED' AND o.event_id = ${CUR} AND o.reminder_sent_at IS NULL
              AND ${DUE} - INTERVAL '24 hours' < NOW() AND ${DUE} > NOW()
              AND ${DUE} - o.created_at >= INTERVAL '48 hours'
            RETURNING o.guest_email, o.reference_code, ${DUE} AS due, p.name AS package_name, p.pay_note`, [payDays]);
@@ -122,6 +123,8 @@ export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, 
 
   // Replaces the existing /api/my-order (this is registered first): adds the deadline, how to pay, what the guest
   // owes (tier, code) and pickup. price_cents is the order's amount too, for older copies of the guest site.
+  // Only the current event's order: a pass from a past event is history (see events.js).
+  // promo_kind is the code's kind ('TRACK' = a tracking code, full price), so the guest site words it right.
   app.get('/api/my-order', requireAuth, async (req, res) => {
     try {
       const [{ instructions, payDays }, sizeLock] = await Promise.all([getSettings(), getSizeLock(pool)]);
@@ -132,9 +135,10 @@ export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, 
                 o.picked_up_at, o.paypal_order_id IS NOT NULL AS paypal_started, pc.kind AS promo_kind, pc.value AS promo_value,
                 p.name AS package_name, p.includes, p.sizes AS package_sizes, p.pay_note
          FROM orders o JOIN packages p ON p.id = o.package_id LEFT JOIN promo_codes pc ON pc.code = o.promo_code
-         WHERE o.guest_email = $1 AND o.status <> 'CANCELLED' ORDER BY o.id DESC LIMIT 1`, [req.userEmail, payDays]);
+         WHERE o.guest_email = $1 AND o.status <> 'CANCELLED' AND o.event_id = ${CUR} ORDER BY o.id DESC LIMIT 1`, [req.userEmail, payDays]);
       if (!r.rowCount) return res.json(null);
       const { due, promo_kind: kind, promo_value: value, ...o } = r.rows[0];
+      o.promo_kind = o.promo_code ? kind || null : null;
       const open = o.status === 'RESERVED';
       o.price_cents = o.amount_cents;
       // A code's row can't be deleted once used, but if it's gone, describe what it took off.

@@ -3,6 +3,8 @@
 // (for everyone, or only once a guest has paid). The admin can still change any guest's size.
 // Packages are handed out with the door scanner's Pickup mode (door.js) or marked collected on the
 // "Sizes & pickup" page, which also has the size counts to order stock from.
+// All of it is the current event's (see events.js); a past event's orders can't change here.
+import { CUR } from './events.js';
 
 export const SIZE_LOCKS = ['open', 'paid', 'all'];
 
@@ -40,14 +42,14 @@ export function registerPickup({ app, pool, requireAdmin }) {
         // Hidden packages only show while they still have orders.
         pool.query(
           `SELECT p.id, p.name, p.sizes FROM packages p
-           WHERE p.active = TRUE OR EXISTS (SELECT 1 FROM orders o WHERE o.package_id = p.id AND o.status <> 'CANCELLED')
+           WHERE p.event_id = ${CUR} AND (p.active = TRUE OR EXISTS (SELECT 1 FROM orders o WHERE o.package_id = p.id AND o.status <> 'CANCELLED'))
            ORDER BY p.sort_order ASC, p.id ASC`),
         pool.query(
           `SELECT package_id, NULLIF(TRIM(size), '') AS size,
                   COUNT(*) FILTER (WHERE status = 'PAID')::int AS paid,
                   COUNT(*) FILTER (WHERE status = 'RESERVED')::int AS reserved,
                   COUNT(*) FILTER (WHERE status = 'PAID' AND picked_up_at IS NOT NULL)::int AS collected
-           FROM orders WHERE status IN ('PAID', 'RESERVED') GROUP BY 1, 2`),
+           FROM orders WHERE status IN ('PAID', 'RESERVED') AND event_id = ${CUR} GROUP BY 1, 2`),
         // full_name: the guest's name as on their ID (null when they haven't given it), joined on a lowercased
         // email with one row per email, so an order is never listed twice.
         pool.query(
@@ -56,7 +58,7 @@ export function registerPickup({ app, pool, requireAdmin }) {
            FROM orders o JOIN packages p ON p.id = o.package_id
            LEFT JOIN (SELECT DISTINCT ON (LOWER(email)) LOWER(email) AS email, full_name FROM guests ORDER BY LOWER(email), id) g
              ON g.email = LOWER(o.guest_email)
-           WHERE o.status = 'PAID' ORDER BY o.id DESC`)
+           WHERE o.status = 'PAID' AND o.event_id = ${CUR} ORDER BY o.id DESC`)
       ]);
 
       const packages = pkgs.rows.map((p) => {
@@ -99,8 +101,9 @@ export function registerPickup({ app, pool, requireAdmin }) {
     if (!id) return res.status(404).json({ error: 'Order not found.' });
     try {
       const r = await pool.query(
-        'SELECT o.status, p.sizes FROM orders o JOIN packages p ON p.id = o.package_id WHERE o.id = $1', [id]);
+        `SELECT o.status, p.sizes, o.event_id = ${CUR} AS current FROM orders o JOIN packages p ON p.id = o.package_id WHERE o.id = $1`, [id]);
       if (!r.rowCount) return res.status(404).json({ error: 'Order not found.' });
+      if (!r.rows[0].current) return res.status(400).json({ error: 'This order is from a past event.' });
       if (r.rows[0].status === 'CANCELLED') return res.status(400).json({ error: 'This order is cancelled.' });
       const sizes = sizeList(r.rows[0].sizes);
       if (!sizes.length) return res.status(400).json({ error: "This package doesn't have sizes." });
@@ -123,10 +126,11 @@ export function registerPickup({ app, pool, requireAdmin }) {
       client = await pool.connect();
       await client.query('BEGIN');
       // Locked so a door phone handing out the same package at this moment waits for us.
-      const r = await client.query('SELECT status, picked_up_at, picked_up_by FROM orders WHERE id = $1 FOR UPDATE', [id]);
+      const r = await client.query(`SELECT status, picked_up_at, picked_up_by, event_id = ${CUR} AS current FROM orders WHERE id = $1 FOR UPDATE`, [id]);
       const o = r.rows[0];
       let error = null;
       if (!o) error = [404, { error: 'Order not found.' }];
+      else if (!o.current) error = [400, { error: 'This order is from a past event.' }];
       else if (undo && !o.picked_up_at) error = [409, { error: "This package isn't marked as collected." }];
       else if (!undo && o.status !== 'PAID') error = [400, { error: 'Only paid orders can collect a package.' }];
       else if (!undo && o.picked_up_at) {

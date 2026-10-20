@@ -7,6 +7,9 @@
 // Pickup mode also searches guests by name (as on their ID), and a package found that way goes through a Check ID
 // screen before it's handed over. On a laptop (900px+) Pickup mode turns into a desk: search and list beside the camera.
 // Names are only shown in Pickup mode, and never saved in the recent-scans list.
+// Only the current event's passes work (see events.js): the list holds just those, and a pass from a past event scans
+// as OTHER_EVENT ("This pass is for <event>"), with nothing recorded.
+import { CUR } from './events.js';
 
 export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLimit, requireAdmin }) {
   const DOOR_KEY = process.env.DOOR_KEY || '';
@@ -28,7 +31,7 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
   // full_name is the guest's name as on their ID, for the Pickup desk's name search and Check ID screen (Entry never
   // shows it). Cancelled orders don't carry it, so door phones only hold names of guests who still have a pass.
   // The guest join is on a lowercased email, one row per email, so a pass is never listed twice.
-  const PASS_SQL = `SELECT o.id, o.reference_code AS ref, LOWER(o.guest_email) AS email, o.status,
+  const PASS_SQL = `SELECT o.id, o.reference_code AS ref, LOWER(o.guest_email) AS email, o.status, o.event_id,
       o.checked_in_at, o.checked_in_by, (o.cancel_requested_at IS NOT NULL) AS refund_requested,
       o.size, o.picked_up_at, o.picked_up_by,
       p.name AS package, p.requires_compliance AS costume, (TRIM(REPLACE(p.sizes, ',', '')) <> '') AS sized,
@@ -67,6 +70,12 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
     const found = await pool.query(`${PASS_SQL} WHERE o.reference_code = $1`, [ref]);
     if (!found.rowCount) return { result: 'NOT_FOUND' };
     const pass = found.rows[0];
+    // A pass from another event: not valid here, and nothing about it (not even the email) goes back to the phone.
+    const evs = (await pool.query(`SELECT id, name, status FROM events WHERE id = $1 OR status = 'current'`, [pass.event_id])).rows;
+    if (!evs.some((e) => e.status === 'current' && e.id === pass.event_id)) {
+      const theirs = evs.find((e) => e.id === pass.event_id);
+      return { result: 'OTHER_EVENT', event_name: theirs ? theirs.name : null };
+    }
     if (email && email !== pass.email) return { result: 'MISMATCH', pass };
 
     if (clientId) {
@@ -131,8 +140,9 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
   // The whole list, saved on each phone for offline scanning.
   app.get('/api/door/list', limit, requireDoor, async (req, res) => {
     try {
-      const r = await pool.query(`${PASS_SQL} ORDER BY o.id ASC`);
-      res.json({ generated_at: new Date().toISOString(), passes: r.rows });
+      const [r, ev] = await Promise.all([pool.query(`${PASS_SQL} WHERE o.event_id = ${CUR} ORDER BY o.id ASC`),
+        pool.query("SELECT id, name FROM events WHERE status = 'current'")]);
+      res.json({ generated_at: new Date().toISOString(), event: ev.rows[0] || null, passes: r.rows });
     } catch (err) { fail(res, err); }
   });
 
@@ -151,13 +161,16 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, safeEqual, rateLim
     res.json({ results });
   });
 
-  // Door log for the Command Center.
+  // Door log for the Command Center: the current event's (?event=<id> for another one, ?event=all for every event).
   app.get('/api/admin/checkins', requireAdmin, async (req, res) => {
+    const all = req.query.event === 'all';
+    const id = /^\d{1,9}$/.test(String(req.query.event || '')) ? Number(req.query.event) : null;
     try {
       const r = await pool.query(
-        `SELECT c.id, c.kind, c.device, c.scanned_at, c.synced_at, o.reference_code AS ref, o.guest_email AS email, p.name AS package
+        `SELECT c.id, c.kind, c.device, c.scanned_at, c.synced_at, o.reference_code AS ref, o.guest_email AS email, p.name AS package, o.event_id
          FROM checkins c JOIN orders o ON o.id = c.order_id JOIN packages p ON p.id = o.package_id
-         ORDER BY c.scanned_at DESC, c.id DESC LIMIT 500`);
+         ${all ? '' : id ? 'WHERE o.event_id = $1' : `WHERE o.event_id = ${CUR}`}
+         ORDER BY c.scanned_at DESC, c.id DESC ${all ? '' : 'LIMIT 500'}`, id && !all ? [id] : []);
       res.json(r.rows);
     } catch (err) { fail(res, err); }
   });
@@ -841,6 +854,7 @@ var RESULTS = {
   NOT_FOUND: { cls: 'bad', label: 'Unknown code', title: 'Not on list', tone: 'bad' },
   MISMATCH: { cls: 'bad', label: 'Wrong guest', title: 'No match', tone: 'bad' },
   INVALID: { cls: 'bad', label: 'Not a pass', title: 'Not a pass', tone: 'bad' },
+  OTHER_EVENT: { cls: 'bad', label: 'Another event', title: 'Wrong event', tone: 'bad' },
   UNDONE: { cls: 'neutral', label: 'Check-in removed', title: 'Undone', tone: 'neutral' },
   HANDED: { cls: 'ok', label: 'Package collected', title: 'Hand over', tone: 'ok' },
   PICKED_ALREADY: { cls: 'bad', label: 'Package already handed out', title: 'Already collected', tone: 'bad' },
@@ -975,6 +989,7 @@ function show(r, offline, pickup) {
   if (r.result === 'NOT_FOUND') note = offline ? 'Not in the list saved on this phone. If they paid recently, get signal, tap Sync now and scan again.' : 'No order has this code. Try searching their email.';
   if (r.result === 'MISMATCH') note = 'This code belongs to a different guest. Check their ID.';
   if (r.result === 'INVALID') note = "That QR code is not an On D' Road pass. Ask them to open the pass in their account.";
+  if (r.result === 'OTHER_EVENT') note = 'This pass is for ' + (r.event_name || 'another event') + ', not this event. ' + (pickup ? 'No package for this pass.' : 'It does not get them in.');
   if (r.result === 'UNDONE') note = 'They are no longer marked as checked in.';
   $('r-note').textContent = note;
 
@@ -1076,10 +1091,10 @@ function unlockAudio() {
 }
 
 // ---------- Recent ----------
-var LABELS = { ADMIT: 'Admitted', ALREADY: 'Blocked: already in', UNPAID: 'Blocked: not paid', CANCELLED: 'Blocked: cancelled', NOT_FOUND: 'Not on list', MISMATCH: 'Blocked: wrong guest', INVALID: 'Not a pass', UNDONE: 'Check-in undone', CONFLICT: 'Admitted twice',
+var LABELS = { ADMIT: 'Admitted', ALREADY: 'Blocked: already in', UNPAID: 'Blocked: not paid', CANCELLED: 'Blocked: cancelled', NOT_FOUND: 'Not on list', MISMATCH: 'Blocked: wrong guest', INVALID: 'Not a pass', UNDONE: 'Check-in undone', CONFLICT: 'Admitted twice', OTHER_EVENT: 'Blocked: another event', OTHER_VOID: 'Let in offline, but the pass is for another event',
   HANDED: 'Package handed over', PICKED_ALREADY: 'Blocked: package already collected', PICKUP_UNDONE: 'Pickup undone', PICKUP_CONFLICT: 'Handed out twice', PICKUP_VOID: 'Handed out, but the order was cancelled' };
 // Pickup-mode scans that ended like an entry scan.
-var PICKUP_LABELS = { UNPAID: 'No package: not paid', CANCELLED: 'No package: cancelled', MISMATCH: 'No package: wrong guest' };
+var PICKUP_LABELS = { UNPAID: 'No package: not paid', CANCELLED: 'No package: cancelled', MISMATCH: 'No package: wrong guest', OTHER_EVENT: 'No package: another event' };
 var DOTS = { ADMIT: 'ok', UNDONE: 'neutral', UNPAID: 'warn', CONFLICT: 'warn', HANDED: 'ok', PICKUP_UNDONE: 'neutral', PICKUP_CONFLICT: 'warn' };
 function addRecent(item) {
   recent.unshift(item);
@@ -1131,6 +1146,10 @@ function pushQueue() {
       // Handed out offline here, but the package had already gone (another phone, or marked in admin).
       if (ev && ev.kind === 'PICKUP' && r.result === 'PICKED_ALREADY' && !r.replay && r.pass) {
         recent.unshift({ t: new Date().toISOString(), result: 'PICKUP_CONFLICT', pickup: true, email: r.pass.email, ref: r.pass.ref, note: 'first handed out ' + fmtWhen(r.pass.picked_up_at) + (r.pass.picked_up_by ? ' (' + r.pass.picked_up_by + ')' : '') });
+      }
+      // Scanned offline from an old list, but the pass belongs to another event. Not recorded on the server.
+      if (ev && r.result === 'OTHER_EVENT') {
+        recent.unshift({ t: new Date().toISOString(), result: ev.kind === 'PICKUP' ? 'PICKUP_VOID' : 'OTHER_VOID', pickup: ev.kind === 'PICKUP', ref: ev.ref, note: 'pass for ' + (r.event_name || 'another event') });
       }
       // Handed out offline here, but the order was refunded before this phone synced. Not recorded on the server.
       if (ev && ev.kind === 'PICKUP' && (r.result === 'CANCELLED' || r.result === 'UNPAID') && r.pass) {

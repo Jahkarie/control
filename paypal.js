@@ -9,6 +9,7 @@
 // PayPal doesn't take XCD, so XCD prices are charged in USD at the fixed rate of 2.70 XCD to 1 USD.
 
 import { dueSql } from './payments.js';
+import { CUR } from './events.js';
 
 const CLIENT_ID = process.env.PAYPAL_CLIENT_ID || '';
 const SECRET = process.env.PAYPAL_CLIENT_SECRET || '';
@@ -98,7 +99,7 @@ export function registerPayPal({ app, pool, requireAuth, requireApproved, requir
   app.get('/api/paypal/checkout', requireAuth, async (req, res) => {
     try {
       if (!enabledFor(req.userEmail)) return res.json({ enabled: false });
-      const r = await pool.query(`${ORDER_SQL} WHERE o.guest_email = $1 AND o.status = 'RESERVED' ORDER BY o.id DESC LIMIT 1`, [req.userEmail]);
+      const r = await pool.query(`${ORDER_SQL} WHERE o.guest_email = $1 AND o.status = 'RESERVED' AND o.event_id = ${CUR} ORDER BY o.id DESC LIMIT 1`, [req.userEmail]);
       if (!r.rowCount) return res.json({ enabled: false });
       const o = r.rows[0];
       res.json({ enabled: true, client_id: CLIENT_ID, currency: 'USD', amount: usd(usdCents(o.price_cents, o.currency)), pending: o.paypal_status === 'PENDING' });
@@ -112,8 +113,11 @@ export function registerPayPal({ app, pool, requireAuth, requireApproved, requir
     try {
       client = await pool.connect();
       await client.query('BEGIN');
+      // Held until the checkout is saved, so a new event can't start (and cancel this reservation) meanwhile.
+      await client.query("SELECT 1 FROM events WHERE status = 'current' FOR SHARE");
+      // Only the current event's reservation (unpaid ones of a past event were cancelled when it ended).
       const r = await client.query(
-        `${ORDER_SQL} WHERE o.guest_email = $1 AND o.status = 'RESERVED' ORDER BY o.id DESC LIMIT 1 FOR UPDATE OF o`, [req.userEmail]);
+        `${ORDER_SQL} WHERE o.guest_email = $1 AND o.status = 'RESERVED' AND o.event_id = ${CUR} ORDER BY o.id DESC LIMIT 1 FOR UPDATE OF o`, [req.userEmail]);
       if (!r.rowCount) {
         await client.query('ROLLBACK');
         return res.status(400).json({ error: 'You have no reservation to pay for.' });
@@ -171,7 +175,7 @@ export function registerPayPal({ app, pool, requireAuth, requireApproved, requir
     try {
       client = await pool.connect();
       await client.query('BEGIN');
-      const r = await client.query(`${ORDER_SQL} WHERE o.guest_email = $1 AND o.paypal_order_id = $2 FOR UPDATE OF o`, [req.userEmail, ppId]);
+      const r = await client.query(`${ORDER_SQL} WHERE o.guest_email = $1 AND o.paypal_order_id = $2 AND o.event_id = ${CUR} FOR UPDATE OF o`, [req.userEmail, ppId]);
       const o = r.rows[0];
       if (!o || o.status !== 'RESERVED') {
         await client.query('ROLLBACK');
@@ -234,7 +238,7 @@ export function registerPayPal({ app, pool, requireAuth, requireApproved, requir
   async function syncDue(payDays) {
     if (!CONFIGURED) return;
     const due = await pool.query(
-      `${ORDER_SQL} WHERE o.status = 'RESERVED' AND o.paypal_order_id IS NOT NULL
+      `${ORDER_SQL} WHERE o.status = 'RESERVED' AND o.paypal_order_id IS NOT NULL AND o.event_id = ${CUR}
          AND (o.paypal_status = 'PENDING' OR ${dueSql('$1')} < NOW())
        ORDER BY o.id LIMIT 50`, [payDays]);
     for (const row of due.rows) {

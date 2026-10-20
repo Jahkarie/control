@@ -1,18 +1,21 @@
 // reset.js: wipes data so the event can start over (for example after testing). Two scopes:
-// - 'guests': guests, invites, login links, orders (with their check-ins and pickups) and the group email log.
-//   Keeps the setup: packages, price tiers, promo codes and every setting.
-// - 'everything': all of that plus packages, price tiers, promo codes and every setting (payments, event, contact,
-//   terms, FAQ, sponsors, size lock, site lock), so the site is back to its built-in defaults: that includes locked,
-//   since a missing site_lock means locked (see lock.js). Only preview_version stays, so a preview link that was
-//   reset before never works again.
+// - 'guests': guests (with their per-event invite bonuses), invites, login links, orders (with their check-ins and
+//   pickups) and the group email log, for every event. Keeps the setup: events (past ones stay, with nothing in
+//   them), packages, price tiers, promo codes, promoters and every setting.
+// - 'everything': all of that plus every event, package, price tier, promo code, promoter and setting (payments,
+//   contact, terms, FAQ, sponsors, size lock, site lock), so the site is back to its built-in defaults with one fresh
+//   current event, "On D' Road": that includes locked, since a missing site_lock means locked (see lock.js). Only
+//   preview_version stays, so a preview link that was reset before never works again.
 // The page asks the server for a one-time 6-digit number for a scope, and the reset only runs when that number is
 // typed back for the same scope within 10 minutes. One try per number, so a stray click or a forged request can't
 // wipe anything. Rows are DELETEd (not TRUNCATE ... CASCADE), so a table we don't know about can never go with them.
 import crypto from 'crypto';
+import { createDefaultEvent } from './events.js';
 
 const TTL_MS = 10 * 60 * 1000;
-const GUEST_TABLES = ['checkins', 'orders', 'login_links', 'invites', 'guests', 'broadcasts'];
-const SETUP_TABLES = ['package_tiers', 'promo_codes', 'packages', 'settings'];
+const GUEST_TABLES = ['checkins', 'orders', 'login_links', 'invites', 'guest_event', 'guests', 'broadcasts'];
+// In this order: each table only points at tables after it.
+const SETUP_TABLES = ['package_tiers', 'promo_codes', 'packages', 'promoter_event', 'promoters', 'events', 'settings'];
 const SCOPES = ['guests', 'everything'];
 
 // afterReset() runs after an 'everything' reset (server.js clears the site lock's cache and calls site.refresh, which
@@ -33,6 +36,8 @@ export function registerReset({ app, pool, requireAdmin, rateLimit, afterReset }
         (SELECT COUNT(*) FROM packages)::int AS packages,
         (SELECT COUNT(*) FROM package_tiers)::int AS tiers,
         (SELECT COUNT(*) FROM promo_codes)::int AS codes,
+        (SELECT COUNT(*) FROM events)::int AS events,
+        (SELECT COUNT(*) FROM promoters)::int AS promoters,
         (SELECT COUNT(*) FROM settings)::int AS settings`);
     const money = await db.query(
       `SELECT COALESCE(o.currency, p.currency) AS currency, SUM(COALESCE(o.amount_cents, p.price_cents))::bigint AS cents
@@ -73,9 +78,13 @@ export function registerReset({ app, pool, requireAdmin, rateLimit, afterReset }
       for (const table of scope === 'everything' ? [...GUEST_TABLES, ...SETUP_TABLES] : GUEST_TABLES) {
         await client.query(table === 'settings' ? "DELETE FROM settings WHERE key <> 'preview_version'" : `DELETE FROM ${table}`);
       }
+      // Past events keep their names and dates, but the attendance count was about guests who are gone now.
+      if (scope === 'guests') await client.query('UPDATE events SET rsvp_confirmed = NULL');
+      // Everything: one fresh current event, with the built-in defaults.
+      if (scope === 'everything') await createDefaultEvent(client);
       await client.query('COMMIT');
       console.log(`Reset (${scope}): deleted ${before.guests} guests, ${before.invites} invites, ${before.orders} orders (${before.paid} paid), ${before.checkins} door scans, ${before.broadcasts} group emails` +
-        (scope === 'everything' ? `, ${before.packages} packages, ${before.tiers} tiers, ${before.codes} codes and ${before.settings} settings.` : '.'));
+        (scope === 'everything' ? `, ${before.events} events, ${before.packages} packages, ${before.tiers} tiers, ${before.codes} codes, ${before.promoters} promoters and ${before.settings} settings.` : '.'));
       if (scope === 'everything' && afterReset) await Promise.resolve(afterReset()).catch((err) => console.error('After reset:', err.message));
       res.json({ success: true, scope, deleted: before });
     } catch (err) {
@@ -175,9 +184,9 @@ button:disabled { opacity: .5; cursor: not-allowed; transform: none; }
     <h2 id="w-h">What to reset</h2>
     <div class="scopes" role="radiogroup" aria-label="What to reset">
       <label class="scope on"><input type="radio" name="scope" value="guests" checked><b>Guest data only</b>
-        <span>Deletes every guest and everything they did. Keeps your setup: packages, prices and tiers, promo codes, and every setting (payments, event details, contact, terms, FAQ, sponsors, size lock, site lock).</span></label>
+        <span>Deletes every guest and everything they did, in every event: orders, invites, door scans and group emails. Keeps your setup: events (past ones stay, empty), packages, prices and tiers, promo codes, promoters, and every setting (payments, event details, contact, terms, FAQ, sponsors, size lock, site lock).</span></label>
       <label class="scope"><input type="radio" name="scope" value="everything"><b>Everything</b>
-        <span>Also deletes your setup, so the site goes back to a blank start with the original terms and FAQ drafts, and locked again: only the trailer shows. Your preview link stays the same. You'd set up packages, prices and settings again.</span></label>
+        <span>Also deletes your setup: every event (current and past), package, code and promoter, so the site goes back to a blank start with one new event, "On D' Road", the original terms and FAQ drafts, and locked again: only the trailer shows. Your preview link stays the same. You'd set up packages, prices and settings again.</span></label>
     </div>
     <ul class="counts" id="counts" aria-live="polite"><li><b>&hellip;</b><span>Loading</span></li></ul>
     <div id="money" class="warn hidden" role="status"></div>
@@ -215,7 +224,7 @@ function show(d) {
   last = d;
   var all = scope() === 'everything';
   var rows = [[d.guests, 'guest', 'guests'], [d.invites, 'invite', 'invites'], [d.orders, 'order', 'orders'], [d.paid, 'paid order', 'paid orders'], [d.checkins, 'door scan', 'door scans'], [d.broadcasts, 'group email', 'group emails']];
-  if (all) rows = rows.concat([[d.packages, 'package', 'packages'], [d.tiers, 'price tier', 'price tiers'], [d.codes, 'promo code', 'promo codes'], [d.settings, 'saved setting', 'saved settings']]);
+  if (all) rows = rows.concat([[d.events, 'event', 'events'], [d.packages, 'package', 'packages'], [d.tiers, 'price tier', 'price tiers'], [d.codes, 'promo code', 'promo codes'], [d.promoters, 'promoter', 'promoters'], [d.settings, 'saved setting', 'saved settings']]);
   var ul = $('counts'); ul.replaceChildren();
   rows.forEach(function (x) { var li = el('li'); li.appendChild(el('b', String(x[0]))); li.appendChild(el('span', plural(x[0], x[1], x[2]))); ul.appendChild(li); });
   var m = $('money');
@@ -238,8 +247,9 @@ Array.prototype.forEach.call(document.querySelectorAll('input[name=scope]'), fun
 // One JSON file with everything the chosen reset deletes, from the admin lists the other pages already use.
 $('backup').addEventListener('click', function () {
   var b = this; b.disabled = true; $('b-msg').textContent = '';
-  var parts = [['guests', '/api/admin/guests'], ['invites', '/api/admin/invites'], ['orders', '/api/admin/orders'], ['checkins', '/api/admin/checkins'], ['broadcasts', '/api/admin/broadcasts']];
-  if (scope() === 'everything') parts = parts.concat([['packages', '/api/admin/packages'], ['pricing', '/api/admin/pricing'], ['payment_settings', '/api/admin/payment-settings'],
+  // Every event's orders, invites, door scans and group emails, not only the current event's.
+  var parts = [['guests', '/api/admin/guests'], ['invites', '/api/admin/invites?event=all'], ['orders', '/api/admin/orders?event=all'], ['checkins', '/api/admin/checkins?event=all'], ['broadcasts', '/api/admin/broadcasts?event=all'], ['events', '/api/admin/events']];
+  if (scope() === 'everything') parts = parts.concat([['packages', '/api/admin/packages?event=all'], ['pricing', '/api/admin/pricing'], ['promoters', '/api/admin/promoters'], ['payment_settings', '/api/admin/payment-settings'],
     ['event', '/api/admin/event'], ['site', '/api/admin/site'], ['pickup', '/api/admin/pickup']]);
   Promise.all(parts.map(function (x) { return call(x[1]); }))
     .then(function (r) {
@@ -276,7 +286,7 @@ $('go').addEventListener('click', function () {
   call('/api/admin/reset', { scope: scope(), code: $('typed').value }).then(function (d) {
     var x = d.deleted;
     say('msg', 'Done. Deleted ' + x.guests + ' ' + plural(x.guests, 'guest', 'guests') + ', ' + x.invites + ' ' + plural(x.invites, 'invite', 'invites') + ' and ' + x.orders + ' ' + plural(x.orders, 'order', 'orders') +
-      (d.scope === 'everything' ? ', plus ' + x.packages + ' ' + plural(x.packages, 'package', 'packages') + ' and all settings.' : '.') +
+      (d.scope === 'everything' ? ', plus ' + x.events + ' ' + plural(x.events, 'event', 'events') + ', ' + x.packages + ' ' + plural(x.packages, 'package', 'packages') + ' and all settings.' : '.') +
       ' Add yourself back with Add to roster before you log in.', true);
   }).catch(function (e) { say('msg', e.message); }).then(function () { forgetNumber(); load(); });
 });

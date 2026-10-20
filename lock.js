@@ -11,9 +11,11 @@ import { parseWhen } from './pricing.js';
 
 const KEYS = ['site_lock', 'site_unlock_at', 'preview_version'];
 const CACHE_MS = 5000;
-// Routes that stay open while locked: the admin API, the door scanner's API and the signed pass images.
-// /api/site is handled by site.js itself. Anything else under /api/ is a guest route.
-const OPEN_ROUTES = /^\/api\/(admin|door)(\/|$)|^\/api\/pass\//;
+// Routes that stay open while locked: the admin API, the door scanner's API, the signed pass images and the promoters'
+// private pages' API (promoter.js; sending an invite checks lockedNow() itself). /api/site is handled by site.js
+// itself. Anything else under /api/ is a guest route. The promoter pages (/promoter/<token>) aren't under /api/, so the
+// guard never sees them.
+const OPEN_ROUTES = /^\/api\/(admin|door|promoter)(\/|$)|^\/api\/pass\//;
 
 export function createLock({ pool, TOKEN_SECRET, safeEqual, SITE_URL }) {
   let cache = null, cachedAt = 0;
@@ -45,6 +47,9 @@ export function createLock({ pool, TOKEN_SECRET, safeEqual, SITE_URL }) {
     const ok = previewOk(req, s);
     return { locked: !ok, preview: ok };
   }
+
+  // Whether the site is locked for everyone right now (a preview header doesn't count).
+  const lockedNow = async () => isLocked(await settings());
 
   // Middleware for every request (registered right after CORS, so a 423 still carries the CORS headers and the
   // preflight for x-preview is answered first). Express matches routes ignoring case, so the check does too.
@@ -115,5 +120,5 @@ export function createLock({ pool, TOKEN_SECRET, safeEqual, SITE_URL }) {
     });
   }
 
-  return { guard, check, register, forget };
+  return { guard, check, register, forget, lockedNow };
 }

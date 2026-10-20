@@ -14,6 +14,8 @@ import { registerPricing, loadTiers, priceOf, checkPromo, discountFor, withState
 import { registerPickup, getSizeLock, isSizeLocked } from './pickup.js';
 import { registerReset } from './reset.js';
 import { createLock } from './lock.js';
+import { CUR, INVITES_LEFT_SQL, migrateEvents, registerEvents } from './events.js';
+import { registerPromoters } from './promoter.js';
 import QRCode from 'qrcode';
 
 const { Pool } = pkg;
@@ -172,12 +174,14 @@ function profileInput(b, mode) {
   }
   return { fields };
 }
-// Who invited each guest: their ACCEPTED invite's inviter ('CONTROL' for the admin), with the inviter's name when they
-// have one, and the invite's note. Use with "FROM guests g".
+// Who invited each guest: their ACCEPTED invite's inviter ('CONTROL' for the admin, 'PROMOTER' for a promoter), with
+// the inviter's name when they have one (a guest's full name, or the promoter's name), and the invite's note.
+// Use with "FROM guests g"; select inviter.full_name as the name.
 const INVITED_BY_SQL = `
-  LEFT JOIN LATERAL (SELECT i.inviter_email, i.note FROM invites i WHERE i.invitee_email = LOWER(g.email) AND i.status = 'ACCEPTED'
+  LEFT JOIN LATERAL (SELECT i.inviter_email, i.note, i.promoter_id FROM invites i WHERE i.invitee_email = LOWER(g.email) AND i.status = 'ACCEPTED'
                      ORDER BY i.accepted_at DESC NULLS LAST, i.id DESC LIMIT 1) inv ON TRUE
-  LEFT JOIN LATERAL (SELECT x.full_name FROM guests x WHERE LOWER(x.email) = LOWER(inv.inviter_email) LIMIT 1) inviter ON TRUE`;
+  LEFT JOIN LATERAL (SELECT COALESCE((SELECT pr.name FROM promoters pr WHERE pr.id = inv.promoter_id AND inv.inviter_email = 'PROMOTER'),
+                                     (SELECT x.full_name FROM guests x WHERE LOWER(x.email) = LOWER(inv.inviter_email) LIMIT 1)) AS full_name) inviter ON TRUE`;
 
 // ---------- Signed session tokens (no extra dependency) ----------
 const TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -315,6 +319,44 @@ const SITE_URL = process.env.FRONTEND_URL ? FRONTEND_URL : 'https://ondroad.xyz'
 // so no SQL has to be run by hand in Aiven. Safe to run every boot.
 async function ensureSchema() {
   await pool.query(`
+    -- Events: one current at a time (the partial unique index), the rest past. See events.js.
+    CREATE TABLE IF NOT EXISTS events (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'past' CHECK (status IN ('current', 'past')),
+      invites_per_guest INTEGER NOT NULL DEFAULT 2,
+      event_when TEXT NOT NULL DEFAULT '',
+      event_info TEXT NOT NULL DEFAULT '',
+      event_paid_info TEXT NOT NULL DEFAULT '',
+      event_location TEXT NOT NULL DEFAULT '',
+      event_poster TEXT NOT NULL DEFAULT '',
+      rsvp_confirmed INTEGER,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      started_at TIMESTAMPTZ,
+      ended_at TIMESTAMPTZ
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS events_one_current ON events (status) WHERE status = 'current';
+    -- Per guest and event: the admin's extra invites for that guest.
+    CREATE TABLE IF NOT EXISTS guest_event (
+      email TEXT NOT NULL,
+      event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+      invite_bonus INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (email, event_id)
+    );
+    CREATE TABLE IF NOT EXISTS promoters (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      note TEXT NOT NULL DEFAULT '',
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      token_version INTEGER NOT NULL DEFAULT 1,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS promoter_event (
+      promoter_id INTEGER NOT NULL REFERENCES promoters(id) ON DELETE CASCADE,
+      event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+      invites INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (promoter_id, event_id)
+    );
     CREATE TABLE IF NOT EXISTS packages (
       id SERIAL PRIMARY KEY,
       name TEXT NOT NULL,
@@ -424,7 +466,29 @@ async function ensureSchema() {
     ALTER TABLE guests ADD COLUMN IF NOT EXISTS decided_at TIMESTAMPTZ;
     CREATE INDEX IF NOT EXISTS orders_tier_idx ON orders (tier_id);
     CREATE INDEX IF NOT EXISTS orders_promo_idx ON orders (promo_code);
+    -- Each event's own rows (filled in by migrateEvents() for rows from before events).
+    ALTER TABLE packages ADD COLUMN IF NOT EXISTS event_id INTEGER REFERENCES events(id);
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS event_id INTEGER REFERENCES events(id);
+    ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS event_id INTEGER REFERENCES events(id);
+    ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS event_id INTEGER REFERENCES events(id);
+    ALTER TABLE invites ADD COLUMN IF NOT EXISTS event_id INTEGER REFERENCES events(id);
+    ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS promoter_id INTEGER REFERENCES promoters(id) ON DELETE SET NULL;
+    ALTER TABLE invites ADD COLUMN IF NOT EXISTS promoter_id INTEGER REFERENCES promoters(id) ON DELETE SET NULL;
+    -- A row written without an event_id (an older backend still running during a deploy, or SQL by hand) belongs to the
+    -- current event. A column default can't hold a subquery, so it goes through this function.
+    CREATE OR REPLACE FUNCTION current_event_id() RETURNS INTEGER LANGUAGE sql STABLE AS $fn$ SELECT id FROM events WHERE status = 'current' $fn$;
+    ALTER TABLE packages ALTER COLUMN event_id SET DEFAULT current_event_id();
+    ALTER TABLE orders ALTER COLUMN event_id SET DEFAULT current_event_id();
+    ALTER TABLE promo_codes ALTER COLUMN event_id SET DEFAULT current_event_id();
+    ALTER TABLE broadcasts ALTER COLUMN event_id SET DEFAULT current_event_id();
+    ALTER TABLE invites ALTER COLUMN event_id SET DEFAULT current_event_id();
+    CREATE INDEX IF NOT EXISTS orders_event_idx ON orders (event_id, status);
+    CREATE INDEX IF NOT EXISTS packages_event_idx ON packages (event_id);
+    CREATE INDEX IF NOT EXISTS invites_event_idx ON invites (event_id, inviter_email);
+    CREATE INDEX IF NOT EXISTS promo_codes_promoter_idx ON promo_codes (promoter_id);
   `);
+  // The first current event, and event_id on rows from before events (see events.js). Safe on every boot.
+  await migrateEvents(pool);
   // Each order stores what it costs. Orders from before that keep the package price.
   await pool.query(
     `UPDATE orders o SET list_cents = p.price_cents, amount_cents = p.price_cents, currency = p.currency
@@ -484,12 +548,15 @@ app.post('/api/login/verify', rateLimit(60, 15 * 60 * 1000), async (req, res) =>
   }
 });
 
-// The guest's row (birth_date as 'YYYY-MM-DD') plus has_paid (a PAID order, free passes included: their name and date of
-// birth are locked and invites are open) and who invited them (email or 'CONTROL', and their name). null if not found.
+// The guest's row (birth_date as 'YYYY-MM-DD') plus has_paid (a PAID order for the current event, free passes
+// included: their name and date of birth are locked and invites are open), who invited them (email, 'CONTROL' or
+// 'PROMOTER', and the name) and invites_left for the current event (see events.js; the legacy guests.invites_left
+// column is replaced by it). rsvp_status is the current event's attendance. null if not found.
 async function guestStatus(db, email) {
   const r = await db.query(
     `SELECT g.*, inv.inviter_email AS invited_by, inviter.full_name AS invited_by_name,
-            EXISTS (SELECT 1 FROM orders o WHERE LOWER(o.guest_email) = LOWER(g.email) AND o.status = 'PAID') AS has_paid
+            EXISTS (SELECT 1 FROM orders o WHERE LOWER(o.guest_email) = LOWER(g.email) AND o.status = 'PAID' AND o.event_id = ${CUR}) AS has_paid,
+            ${INVITES_LEFT_SQL} AS invites_left
      FROM guests g ${INVITED_BY_SQL}
      WHERE LOWER(g.email) = $1 ORDER BY g.id LIMIT 1`, [email]);
   return r.rows[0] || null;
@@ -525,8 +592,9 @@ app.post('/api/profile', requireAuth, rateLimit(20, 60 * 60 * 1000, perUser), as
       return res.status(403).json({ error: 'That account is no longer on the roster.' });
     }
     const cur = g.rows[0];
+    // Paid for the current event: that's the pass staff check the name against.
     const open = await client.query(
-      "SELECT status FROM orders WHERE LOWER(guest_email) = $1 AND status <> 'CANCELLED' ORDER BY id FOR UPDATE", [req.userEmail]);
+      `SELECT status FROM orders WHERE LOWER(guest_email) = $1 AND status <> 'CANCELLED' AND event_id = ${CUR} ORDER BY id FOR UPDATE`, [req.userEmail]);
     const paid = open.rows.some((o) => o.status === 'PAID');
     const changes = Object.keys(fields).filter((k) => fields[k] !== cur[k]);
     if (paid && changes.some((k) => k !== 'instagram' && cur[k] !== null)) {
@@ -563,15 +631,16 @@ app.post('/api/update-shirt', requireAuth, async (req, res) => {
 });
 
 // --- UPDATE RSVP ---
-// Attendance can only be confirmed once the guest has paid (a free pass counts), and it's locked once confirmed:
-// pulling out goes through a refund request, whose approval sets it back to PENDING.
+// Attendance can only be confirmed once the guest has paid for the current event (a free pass counts), and it's locked
+// once confirmed: pulling out goes through a refund request, whose approval sets it back to PENDING. Starting a new
+// event sets everyone back to PENDING (see events.js).
 app.post('/api/update-rsvp', requireAuth, async (req, res) => {
   const rsvp_status = typeof req.body?.rsvp_status === 'string' ? req.body.rsvp_status.trim() : '';
   if (!['CONFIRMED', 'PENDING'].includes(rsvp_status)) return res.status(400).json({ error: 'Invalid RSVP status.' });
   try {
     const g = await pool.query(
       `SELECT g.approval, g.rsvp_status,
-              EXISTS (SELECT 1 FROM orders o WHERE LOWER(o.guest_email) = LOWER(g.email) AND o.status = 'PAID') AS has_paid
+              EXISTS (SELECT 1 FROM orders o WHERE LOWER(o.guest_email) = LOWER(g.email) AND o.status = 'PAID' AND o.event_id = ${CUR}) AS has_paid
        FROM guests g WHERE LOWER(g.email) = $1 ORDER BY g.id LIMIT 1`, [req.userEmail]);
     if (!g.rowCount) return res.status(403).json({ error: 'That account is no longer on the roster.' });
     const guest = g.rows[0];
@@ -595,6 +664,17 @@ app.post('/api/update-rsvp', requireAuth, async (req, res) => {
 const hashToken = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
 const newInviteToken = () => crypto.randomBytes(24).toString('base64url');
 const inviteLink = (t) => `${FRONTEND_URL}/?invite=${t}`;
+
+// Whether someone can't be invited (by a guest, a promoter or the admin's guest-style check): they're on the roster
+// (pending and declined requests included), have a pending invite, or still hold an order for the current event that
+// isn't cancelled (a guest removed while their pass was live). db = pool or a client.
+async function inviteBlocked(db, email) {
+  const r = await db.query(
+    `SELECT 1 FROM guests WHERE LOWER(email) = $1
+     UNION SELECT 1 FROM invites WHERE invitee_email = $1 AND status = 'PENDING'
+     UNION SELECT 1 FROM orders WHERE LOWER(guest_email) = $1 AND status <> 'CANCELLED' AND event_id = ${CUR}`, [email]);
+  return r.rowCount > 0;
+}
 
 // Sends the invite email via Resend and returns an error object (or null). Never throws —
 // callers check the return value explicitly, so a failed send can never be reported as a success.
@@ -623,7 +703,7 @@ async function sendLoginEmail(to, link) {
   }));
 }
 
-// --- SEND A PERSONAL INVITE (uses one of the sender's invites) ---
+// --- SEND A PERSONAL INVITE (uses one of the sender's invites for the current event) ---
 app.post('/api/send-invite', requireAuth, rateLimit(20, 60 * 60 * 1000, perUser), async (req, res) => {
   const sender = req.userEmail;
   const recipient = normalizeEmail(req.body?.recipient_email);
@@ -635,6 +715,8 @@ app.post('/api/send-invite', requireAuth, rateLimit(20, 60 * 60 * 1000, perUser)
   try {
     client = await pool.connect();
     await client.query('BEGIN');
+    // Held until the invite is saved, so a new event can't start halfway (see events.js).
+    const ev = (await client.query("SELECT id FROM events WHERE status = 'current' FOR SHARE")).rows[0];
 
     // Only approved guests on the roster can invite. Their row stays locked until the invite is saved.
     const me = await client.query('SELECT approval FROM guests WHERE LOWER(email) = $1 ORDER BY id FOR UPDATE', [sender]);
@@ -643,35 +725,32 @@ app.post('/api/send-invite', requireAuth, rateLimit(20, 60 * 60 * 1000, perUser)
       return res.status(403).json(me.rowCount ? notApproved(me.rows[0].approval) : { error: 'That account is no longer on the roster.' });
     }
 
-    // Invites open once the sender has paid (a free pass counts).
-    const paid = await client.query("SELECT 1 FROM orders WHERE LOWER(guest_email) = $1 AND status = 'PAID' LIMIT 1", [sender]);
+    // Invites open once the sender has paid for this event (a free pass counts).
+    const paid = await client.query("SELECT 1 FROM orders WHERE LOWER(guest_email) = $1 AND status = 'PAID' AND event_id = $2 LIMIT 1", [sender, ev.id]);
     if (!paid.rowCount) {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: "Invites open once you've paid.", code: 'PAY_FIRST' });
     }
 
     // Someone on the roster (pending and declined requests included) or with an open invite can't be invited again.
-    // Once removed from the roster, they can be, unless they still hold an order that isn't cancelled (a guest
-    // removed while their pass was live; coming back as a new request would leave that pass working).
-    const dup = await client.query(
-      `SELECT 1 FROM guests WHERE LOWER(email) = $1
-       UNION SELECT 1 FROM invites WHERE invitee_email = $1 AND status = 'PENDING'
-       UNION SELECT 1 FROM orders WHERE LOWER(guest_email) = $1 AND status <> 'CANCELLED'`, [recipient]);
-    if (dup.rowCount) {
+    // Once removed from the roster, they can be, unless they still hold an order for this event that isn't cancelled
+    // (a guest removed while their pass was live; coming back as a new request would leave that pass working).
+    if (await inviteBlocked(client, recipient)) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'That person has already been invited.' });
     }
 
-    const dec = await client.query(
-      'UPDATE guests SET invites_left = invites_left - 1 WHERE LOWER(email) = $1 AND invites_left > 0', [sender]);
-    if (!dec.rowCount) {
+    // The allowance for this event (invites per guest + any bonus, less what they've sent; see events.js). The
+    // sender's row is locked, so two quick sends can't both take the last one.
+    const left = (await client.query(`SELECT ${INVITES_LEFT_SQL} AS n FROM guests g WHERE LOWER(g.email) = $1 ORDER BY g.id LIMIT 1`, [sender])).rows[0].n;
+    if (left <= 0) {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: "You've used all your invites." });
     }
 
     await client.query(
-      'INSERT INTO invites (token_hash, inviter_email, invitee_email, note) VALUES ($1, $2, $3, $4)',
-      [hashToken(token), sender, recipient, note]);
+      'INSERT INTO invites (token_hash, inviter_email, invitee_email, note, event_id) VALUES ($1, $2, $3, $4, $5)',
+      [hashToken(token), sender, recipient, note, ev.id]);
 
     const emailError = await sendInviteEmail(recipient, sender, note, inviteLink(token));
     if (emailError) throw Object.assign(new Error(emailError.message), { publicMessage: 'Email could not be delivered.' });
@@ -690,19 +769,25 @@ app.post('/api/send-invite', requireAuth, rateLimit(20, 60 * 60 * 1000, perUser)
 // --- LOOK UP AN INVITE LINK (public) ---
 app.get('/api/invite/:token', rateLimit(120, 15 * 60 * 1000), async (req, res) => {
   try {
-    const r = await pool.query('SELECT inviter_email, note, status FROM invites WHERE token_hash = $1', [hashToken(req.params.token)]);
+    const r = await pool.query(
+      `SELECT i.inviter_email, i.note, i.status, pr.name AS promoter_name FROM invites i
+       LEFT JOIN promoters pr ON pr.id = i.promoter_id WHERE i.token_hash = $1`, [hashToken(req.params.token)]);
     if (!r.rowCount || r.rows[0].status !== 'PENDING') {
       return res.status(404).json({ error: 'This invitation is invalid or has already been used.' });
     }
-    res.json({ inviter: r.rows[0].inviter_email, note: r.rows[0].note });
+    // A promoter's invite shows their name, with inviter_kind so the guest site words it as theirs.
+    const i = r.rows[0];
+    if (i.inviter_email === 'PROMOTER') return res.json({ inviter: i.promoter_name || "On D' Road", inviter_kind: 'PROMOTER', note: i.note });
+    res.json({ inviter: i.inviter_email, note: i.note });
   } catch (err) {
     serverError(res, err);
   }
 });
 
-// "Jane Doe (jane@x.com)", the email alone, or "You" for the admin's own invites.
+// "Jane Doe (jane@x.com)", the email alone, "promoter Kai" for a promoter's invite, or "You" for the admin's own.
 const inviterLabel = (inviterEmail, inviterName, you = 'You') =>
-  inviterEmail === 'CONTROL' ? you : inviterName ? `${inviterName} (${inviterEmail})` : inviterEmail || 'Unknown';
+  inviterEmail === 'CONTROL' ? you : inviterEmail === 'PROMOTER' ? `promoter ${inviterName || '(unknown)'}`
+    : inviterName ? `${inviterName} (${inviterEmail})` : inviterEmail || 'Unknown';
 
 // Tells the admin someone is waiting for approval. Returns an error (or null). Never throws.
 async function sendRequestEmail(g) {
@@ -713,9 +798,10 @@ async function sendRequestEmail(g) {
       tone: 'warn', tag: 'Waiting for you', title: 'New request',
       preheader: `${g.full_name} wants in. Invited by ${by}.`,
       lines: [`${g.full_name} accepted their invite and is waiting for your approval.`,
+        ...(g.invited_by === 'PROMOTER' ? [`Invited by ${by}.`] : []),
         "Check they're someone you want on the road, then approve or decline them in the Requests tab. A declined request gets no email."],
       details: [['Name', g.full_name], ['Age', g.birth_date ? String(ageOn(g.birth_date)) : null], ['Instagram', g.instagram ? '@' + g.instagram : null],
-        ['Email', g.email, true], ['Invited by', by]],
+        ['Email', g.email, true], ['Invited by', by.charAt(0).toUpperCase() + by.slice(1)]],
       quote: g.invite_note ? { from: by, text: g.invite_note } : null,
       cta: PUBLIC_URL ? { text: 'Review requests', url: `${PUBLIC_URL}/admin#requests` } : null
     }));
@@ -785,15 +871,15 @@ app.post('/api/admin/create-invite', requireAdmin, async (req, res) => {
   if (!isValidEmail(email)) return res.status(400).json({ error: 'A valid email is required.' });
   const token = newInviteToken();
   try {
-    // As in send-invite: a removed guest whose order isn't cancelled can't come back through an invite.
+    // As in send-invite: a removed guest whose order for this event isn't cancelled can't come back through an invite.
     const dup = await pool.query(
       `SELECT 1 FROM guests WHERE LOWER(email) = $1
        UNION SELECT 1 FROM invites WHERE invitee_email = $1 AND status = 'PENDING'`, [email]);
     if (dup.rowCount) return res.status(400).json({ error: 'That person is already on the roster or invited.' });
-    const live = await pool.query("SELECT 1 FROM orders WHERE LOWER(guest_email) = $1 AND status <> 'CANCELLED' LIMIT 1", [email]);
+    const live = await pool.query(`SELECT 1 FROM orders WHERE LOWER(guest_email) = $1 AND status <> 'CANCELLED' AND event_id = ${CUR} LIMIT 1`, [email]);
     if (live.rowCount) return res.status(400).json({ error: 'They still have an order from before they were removed. Use "Add to roster" instead.' });
     await pool.query(
-      "INSERT INTO invites (token_hash, inviter_email, invitee_email, note) VALUES ($1, 'CONTROL', $2, $3)",
+      `INSERT INTO invites (token_hash, inviter_email, invitee_email, note, event_id) VALUES ($1, 'CONTROL', $2, $3, ${CUR})`,
       [hashToken(token), email, note]);
     const link = inviteLink(token);
     const emailed = !(await sendInviteEmail(email, "On D' Road", note, link));
@@ -804,14 +890,14 @@ app.post('/api/admin/create-invite', requireAdmin, async (req, res) => {
 });
 
 // ---------- Packages (public read, admin write) ----------
-// Each active package with what it costs right now. With price tiers, that's the tier on sale; when every tier
+// Each active package of the current event with what it costs right now. With price tiers, that's the tier on sale; when every tier
 // has ended or sold out, sales_closed is true (price_cents is then the package price, only for display).
 app.get('/api/packages', async (req, res) => {
   try {
     const r = await pool.query(
       `SELECT p.id, p.name, p.price_cents, p.currency, p.includes, p.requires_compliance, p.capacity, p.sizes, p.pay_note,
               GREATEST(0, COALESCE(p.capacity, 2147483647) - (SELECT COUNT(*) FROM orders o WHERE o.package_id = p.id AND o.status <> 'CANCELLED'))::int AS spots_left
-       FROM packages p WHERE p.active = TRUE ORDER BY p.sort_order ASC, p.id ASC`);
+       FROM packages p WHERE p.active = TRUE AND p.event_id = ${CUR} ORDER BY p.sort_order ASC, p.id ASC`);
     const tiers = await loadTiers(pool, r.rows.map((p) => p.id));
     const now = new Date();
     res.json(r.rows.map((p) => {
@@ -830,14 +916,16 @@ app.get('/api/packages', async (req, res) => {
   }
 });
 
+// The current event's packages (?event=all: every event's, for the reset page's copy).
 app.get('/api/admin/packages', requireAdmin, async (req, res) => {
   try {
+    const all = req.query.event === 'all';
     const r = await pool.query(
       `SELECT p.*, (SELECT COUNT(*) FROM orders o WHERE o.package_id = p.id AND o.status <> 'CANCELLED') AS claimed,
               (SELECT COALESCE(json_object_agg(s.size, s.n), '{}'::json) FROM
                 (SELECT o.size, COUNT(*) AS n FROM orders o
                  WHERE o.package_id = p.id AND o.status <> 'CANCELLED' AND o.size IS NOT NULL GROUP BY o.size) s) AS size_counts
-       FROM packages p ORDER BY p.sort_order ASC, p.id ASC`);
+       FROM packages p ${all ? '' : `WHERE p.event_id = ${CUR}`} ORDER BY ${all ? 'p.event_id, ' : ''}p.sort_order ASC, p.id ASC`);
     const tiers = await loadTiers(pool, r.rows.map((p) => p.id));
     const now = new Date();
     res.json(r.rows.map((p) => {
@@ -882,8 +970,8 @@ app.post('/api/admin/packages', requireAdmin, async (req, res) => {
   const currency = ['XCD', 'USD'].includes(req.body?.currency) ? req.body.currency : 'XCD';
   try {
     const r = await pool.query(
-      `INSERT INTO packages (name, price_cents, currency, includes, requires_compliance, capacity, sort_order, sizes, pay_note)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+      `INSERT INTO packages (name, price_cents, currency, includes, requires_compliance, capacity, sort_order, sizes, pay_note, event_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, ${CUR}) RETURNING id`,
       [f.name, f.price_cents, currency, f.includes || '', !!f.requires_compliance, f.capacity ?? null, f.sort_order || 0,
         f.sizes || '', f.pay_note || '']);
     res.json({ success: true, id: r.rows[0].id });
@@ -899,8 +987,10 @@ app.post('/api/admin/packages/:id', requireAdmin, async (req, res) => {
   const cols = Object.keys(f); // fixed column names from packageInput, never from the request
   if (!id || !cols.length) return res.status(400).json({ error: 'Nothing to update.' });
   try {
-    await pool.query(`UPDATE packages SET ${cols.map((c, n) => `${c} = $${n + 1}`).join(', ')} WHERE id = $${cols.length + 1}`,
+    // Only the current event's packages can change; a past event's stay as they were sold.
+    const r = await pool.query(`UPDATE packages SET ${cols.map((c, n) => `${c} = $${n + 1}`).join(', ')} WHERE id = $${cols.length + 1} AND event_id = ${CUR}`,
       [...cols.map((c) => f[c]), id]);
+    if (!r.rowCount) return res.status(404).json({ error: "That package isn't part of the current event." });
     res.json({ success: true });
   } catch (err) {
     serverError(res, err);
@@ -911,6 +1001,9 @@ app.post('/api/admin/packages/:id/delete', requireAdmin, async (req, res) => {
   const id = idOf(req.params.id);
   if (!id) return res.status(400).json({ error: 'Invalid package.' });
   try {
+    if (!(await pool.query(`SELECT 1 FROM packages WHERE id = $1 AND event_id = ${CUR}`, [id])).rowCount) {
+      return res.status(404).json({ error: "That package isn't part of the current event." });
+    }
     const used = await pool.query('SELECT 1 FROM orders WHERE package_id = $1 LIMIT 1', [id]);
     if (used.rowCount) {
       await pool.query('UPDATE packages SET active = FALSE WHERE id = $1', [id]);
@@ -934,7 +1027,7 @@ app.get('/api/my-order', requireAuth, async (req, res) => {
       `SELECT o.id, o.status, o.reference_code, o.created_at, p.name AS package_name,
               COALESCE(o.amount_cents, p.price_cents) AS price_cents, COALESCE(o.currency, p.currency) AS currency, p.includes
        FROM orders o JOIN packages p ON p.id = o.package_id
-       WHERE o.guest_email = $1 AND o.status <> 'CANCELLED' ORDER BY o.id DESC LIMIT 1`, [req.userEmail]);
+       WHERE o.guest_email = $1 AND o.status <> 'CANCELLED' AND o.event_id = ${CUR} ORDER BY o.id DESC LIMIT 1`, [req.userEmail]);
     res.json(r.rows[0] || null);
   } catch (err) {
     serverError(res, err);
@@ -953,6 +1046,8 @@ app.post('/api/orders', requireAuth, rateLimit(10, 60 * 60 * 1000, perUser), rat
     const settings = await mail.getSettings();
     client = await pool.connect();
     await client.query('BEGIN');
+    // Held until the order is saved, so a new event can't start halfway and leave this one in the old event.
+    const ev = (await client.query("SELECT id FROM events WHERE status = 'current' FOR SHARE")).rows[0];
     // The guest row stays locked until the order is saved, so two quick reservations can't both go through.
     const guest = await client.query(
       'SELECT approval, full_name, birth_date, instagram FROM guests WHERE LOWER(email) = $1 ORDER BY id FOR UPDATE', [req.userEmail]);
@@ -971,15 +1066,16 @@ app.post('/api/orders', requireAuth, rateLimit(10, 60 * 60 * 1000, perUser), rat
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Finish your profile first: your name, date of birth and Instagram. Reload the page to add them.', code: 'PROFILE_REQUIRED' });
     }
-    const existing = await client.query("SELECT 1 FROM orders WHERE guest_email = $1 AND status <> 'CANCELLED'", [req.userEmail]);
+    // One active order per guest per event: a pass from a past event doesn't count.
+    const existing = await client.query("SELECT 1 FROM orders WHERE guest_email = $1 AND status <> 'CANCELLED' AND event_id = $2", [req.userEmail, ev.id]);
     if (existing.rowCount) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'You already have a package reserved. Cancel it first to choose another.' });
     }
     const pkg = await client.query(
-      'SELECT id, name, price_cents, currency, capacity, active, sizes, pay_note FROM packages WHERE id = $1 FOR UPDATE', [packageId]);
+      'SELECT id, name, price_cents, currency, capacity, active, sizes, pay_note, event_id FROM packages WHERE id = $1 FOR UPDATE', [packageId]);
     const p = pkg.rows[0];
-    if (!p || !p.active) {
+    if (!p || !p.active || p.event_id !== ev.id) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'That package is no longer available.' });
     }
@@ -1035,11 +1131,11 @@ app.post('/api/orders', requireAuth, rateLimit(10, 60 * 60 * 1000, perUser), rat
     const ref = newRef();
     await client.query(
       `INSERT INTO orders (guest_email, package_id, reference_code, size, terms_accepted_at, pay_days, pay_by, tier_id, tier_name,
-                           list_cents, discount_cents, amount_cents, currency, promo_code, status, paid_at, paid_via)
-       VALUES ($1, $2, $3, $4, NOW(), $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+                           list_cents, discount_cents, amount_cents, currency, promo_code, status, paid_at, paid_via, event_id)
+       VALUES ($1, $2, $3, $4, NOW(), $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
       [req.userEmail, packageId, ref, size, settings.payDays, payBy, tierId, price.tier ? price.tier.name : null,
         list, discount, amount, p.currency, promo ? promo.code : null,
-        free ? 'PAID' : 'RESERVED', free ? now : null, free ? 'COMP' : null]);
+        free ? 'PAID' : 'RESERVED', free ? now : null, free ? 'COMP' : null, ev.id]);
     await client.query('COMMIT');
     res.json({ success: true, reference_code: ref, status: free ? 'PAID' : 'RESERVED', amount_cents: amount, currency: p.currency });
     // Sent after responding so a slow email never holds up the guest.
@@ -1065,7 +1161,7 @@ app.post('/api/orders/size', requireAuth, async (req, res) => {
   try {
     const r = await pool.query(
       `SELECT o.id, o.status, o.picked_up_at, p.sizes FROM orders o JOIN packages p ON p.id = o.package_id
-       WHERE o.guest_email = $1 AND o.status <> 'CANCELLED' ORDER BY o.id DESC LIMIT 1`, [req.userEmail]);
+       WHERE o.guest_email = $1 AND o.status <> 'CANCELLED' AND o.event_id = ${CUR} ORDER BY o.id DESC LIMIT 1`, [req.userEmail]);
     if (!r.rowCount) return res.status(400).json({ error: 'You have no order to change.' });
     // The size handed out is the one counted as collected, so it can't change afterwards.
     if (r.rows[0].picked_up_at) {
@@ -1086,7 +1182,7 @@ app.post('/api/orders/size', requireAuth, async (req, res) => {
 app.post('/api/orders/cancel', requireAuth, async (req, res) => {
   try {
     const r = await pool.query(
-      `UPDATE orders SET status = 'CANCELLED' WHERE guest_email = $1 AND status = 'RESERVED'
+      `UPDATE orders SET status = 'CANCELLED' WHERE guest_email = $1 AND status = 'RESERVED' AND event_id = ${CUR}
        RETURNING reference_code, (SELECT name FROM packages WHERE id = orders.package_id) AS package_name`, [req.userEmail]);
     if (!r.rowCount) return res.status(400).json({ error: 'No reserved order to cancel.' });
     res.json({ success: true });
@@ -1109,7 +1205,7 @@ app.post('/api/orders/request-refund', requireAuth, rateLimit(5, 60 * 60 * 1000,
   try {
     const r = await pool.query(
       `UPDATE orders SET cancel_requested_at = NOW(), cancel_reason = $2
-       WHERE guest_email = $1 AND status = 'PAID' AND cancel_requested_at IS NULL
+       WHERE guest_email = $1 AND status = 'PAID' AND cancel_requested_at IS NULL AND event_id = ${CUR}
        RETURNING reference_code, amount_cents = 0 AS free,
                  (SELECT name FROM packages WHERE id = orders.package_id) AS package_name`, [req.userEmail, reason]);
     if (!r.rowCount) return res.status(400).json({ error: 'No paid order to cancel, or a request is already open.' });
@@ -1146,7 +1242,7 @@ app.post('/api/orders/withdraw-refund', requireAuth, async (req, res) => {
   try {
     const r = await pool.query(
       `UPDATE orders SET cancel_requested_at = NULL, cancel_reason = NULL
-       WHERE guest_email = $1 AND status = 'PAID' AND cancel_requested_at IS NOT NULL`, [req.userEmail]);
+       WHERE guest_email = $1 AND status = 'PAID' AND cancel_requested_at IS NOT NULL AND event_id = ${CUR}`, [req.userEmail]);
     if (!r.rowCount) return res.status(400).json({ error: 'No open cancellation request.' });
     res.json({ success: true });
   } catch (err) {
@@ -1154,7 +1250,10 @@ app.post('/api/orders/withdraw-refund', requireAuth, async (req, res) => {
   }
 });
 
+// The current event's orders; ?event=<id> for another event's, ?event=all for every event's (the reset page's copy).
 app.get('/api/admin/orders', requireAdmin, async (req, res) => {
+  const all = req.query.event === 'all';
+  const id = /^\d{1,9}$/.test(String(req.query.event || '')) ? Number(req.query.event) : null;
   try {
     const r = await pool.query(
       `SELECT o.id, o.package_id, o.guest_email, o.status, o.reference_code, o.created_at, o.paid_at,
@@ -1164,9 +1263,10 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
               COALESCE(o.amount_cents, p.price_cents) AS amount_cents, COALESCE(o.list_cents, p.price_cents) AS list_cents,
               COALESCE(o.amount_cents, p.price_cents) AS price_cents, COALESCE(o.currency, p.currency) AS currency,
               NOT EXISTS (SELECT 1 FROM guests g WHERE LOWER(g.email) = LOWER(o.guest_email)) AS removed_guest,
-              p.name AS package_name, p.sizes AS package_sizes
-       FROM orders o JOIN packages p ON p.id = o.package_id
-       ORDER BY (o.status = 'PAID' AND o.cancel_requested_at IS NOT NULL) DESC, o.id DESC`);
+              p.name AS package_name, p.sizes AS package_sizes, o.event_id, e.name AS event_name, e.status = 'current' AS current_event
+       FROM orders o JOIN packages p ON p.id = o.package_id LEFT JOIN events e ON e.id = o.event_id
+       ${all ? '' : id ? 'WHERE o.event_id = $1' : `WHERE o.event_id = ${CUR}`}
+       ORDER BY (o.status = 'PAID' AND o.cancel_requested_at IS NOT NULL) DESC, o.id DESC`, id && !all ? [id] : []);
     res.json(r.rows);
   } catch (err) {
     serverError(res, err);
@@ -1238,7 +1338,7 @@ app.post('/api/admin/orders/:id/mark-paid', requireAdmin, async (req, res) => {
   const id = idOf(req.params.id);
   try {
     const r = await pool.query(
-      `UPDATE orders SET status = 'PAID', paid_at = NOW(), paid_via = 'MANUAL' WHERE id = $1 AND status = 'RESERVED'
+      `UPDATE orders SET status = 'PAID', paid_at = NOW(), paid_via = 'MANUAL' WHERE id = $1 AND status = 'RESERVED' AND event_id = ${CUR}
        RETURNING guest_email, reference_code, (SELECT name FROM packages WHERE id = orders.package_id) AS package_name`, [id]);
     if (!r.rowCount) return res.status(400).json({ error: 'Order not found or already resolved.' });
     const { guest_email, reference_code, package_name } = r.rows[0];
@@ -1254,7 +1354,7 @@ app.post('/api/admin/orders/:id/cancel', requireAdmin, async (req, res) => {
   const id = idOf(req.params.id);
   try {
     const r = await pool.query(
-      `UPDATE orders SET status = 'CANCELLED' WHERE id = $1 AND status = 'RESERVED'
+      `UPDATE orders SET status = 'CANCELLED' WHERE id = $1 AND status = 'RESERVED' AND event_id = ${CUR}
        RETURNING guest_email, reference_code, (SELECT name FROM packages WHERE id = orders.package_id) AS package_name`, [id]);
     if (!r.rowCount) return res.status(400).json({ error: 'Order not found or not an unpaid reservation.' });
     const o = r.rows[0];
@@ -1277,8 +1377,10 @@ app.post('/api/admin/orders/:id/approve-refund', requireAdmin, async (req, res) 
   const id = idOf(req.params.id);
   try {
     const cur = await pool.query(
-      "SELECT reference_code, paid_via, paypal_capture_id, paypal_amount FROM orders WHERE id = $1 AND status = 'PAID'", [id]);
+      `SELECT reference_code, paid_via, paypal_capture_id, paypal_amount, event_id = ${CUR} AS current FROM orders WHERE id = $1 AND status = 'PAID'`, [id]);
     if (!cur.rowCount) return res.status(400).json({ error: 'Order not found or not paid.' });
+    // A past event's passes are history; its open refund requests had to be settled before it ended.
+    if (!cur.rows[0].current) return res.status(400).json({ error: 'This order is from a past event.' });
     const pp = cur.rows[0].paid_via === 'PAYPAL' && cur.rows[0].paypal_capture_id ? cur.rows[0] : null;
     let refundId = null;
     if (pp) {
@@ -1288,7 +1390,7 @@ app.post('/api/admin/orders/:id/approve-refund', requireAdmin, async (req, res) 
     }
     const r = await pool.query(
       `UPDATE orders o SET status = 'CANCELLED', refunded_at = NOW(), paypal_refund_id = COALESCE($2, o.paypal_refund_id) FROM packages p
-       WHERE o.id = $1 AND p.id = o.package_id AND o.status = 'PAID'
+       WHERE o.id = $1 AND p.id = o.package_id AND o.status = 'PAID' AND o.event_id = ${CUR}
        RETURNING o.guest_email, o.reference_code, p.name AS package_name,
                  COALESCE(o.amount_cents, p.price_cents) AS amount_cents, COALESCE(o.currency, p.currency) AS currency`, [id, refundId]);
     if (!r.rowCount) return res.status(400).json({ error: 'Order not found or not paid.' });
@@ -1296,7 +1398,7 @@ app.post('/api/admin/orders/:id/approve-refund', requireAdmin, async (req, res) 
     // No pass, no attendance: confirmed attendance goes back to pending (it's locked only while they hold a pass).
     await pool.query(
       `UPDATE guests SET rsvp_status = 'PENDING' WHERE LOWER(email) = LOWER($1) AND rsvp_status = 'CONFIRMED'
-         AND NOT EXISTS (SELECT 1 FROM orders WHERE LOWER(guest_email) = LOWER($1) AND status = 'PAID')`, [o.guest_email]);
+         AND NOT EXISTS (SELECT 1 FROM orders WHERE LOWER(guest_email) = LOWER($1) AND status = 'PAID' AND event_id = ${CUR})`, [o.guest_email]);
     // A free pass has nothing to refund, so the guest just hears it's cancelled.
     const emailError = o.amount_cents === 0 && !pp ? await mail.send(o.guest_email, "Free pass cancelled — On D' Road", renderEmail({
       tone: 'bad', tag: 'Pass cancelled', title: 'Cancelled',
@@ -1318,12 +1420,16 @@ app.post('/api/admin/orders/:id/approve-refund', requireAdmin, async (req, res) 
 });
 
 // ---------- Admin ----------
-// Every guest with their age today (Antigua), who invited them and the invite's note, in one query.
+// Every guest with their age today (Antigua), who invited them and the invite's note, and their invites for the
+// current event (invites_left, invite_bonus and invites_sent), in one query.
 app.get('/api/admin/guests', requireAdmin, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT g.*, date_part('year', age((NOW() AT TIME ZONE 'America/Antigua')::date, g.birth_date))::int AS age,
-              inv.inviter_email AS invited_by, inviter.full_name AS invited_by_name, inv.note AS invite_note
+              inv.inviter_email AS invited_by, inviter.full_name AS invited_by_name, inv.note AS invite_note,
+              ${INVITES_LEFT_SQL} AS invites_left,
+              COALESCE((SELECT ge.invite_bonus FROM guest_event ge WHERE ge.email = LOWER(g.email) AND ge.event_id = ${CUR}), 0) AS invite_bonus,
+              (SELECT COUNT(*) FROM invites i WHERE LOWER(i.inviter_email) = LOWER(g.email) AND i.event_id = ${CUR} AND i.status <> 'REVOKED')::int AS invites_sent
        FROM guests g ${INVITED_BY_SQL}
        ORDER BY g.id ASC`);
     res.json(result.rows);
@@ -1398,11 +1504,18 @@ app.post('/api/admin/guests/profile', requireAdmin, async (req, res) => {
   }
 });
 
+// A guest's extra invites for the current event (on top of the event's invites per guest), in guest_event. The legacy
+// guests.invites_left column isn't used any more (see events.js).
+const setInviteBonus = (db, email, bonus) => db.query(
+  `INSERT INTO guest_event (email, event_id, invite_bonus) VALUES ($1, ${CUR}, $2)
+   ON CONFLICT (email, event_id) DO UPDATE SET invite_bonus = EXCLUDED.invite_bonus`, [email, bonus]);
+
+// Back to the event's standard allowance: no bonus.
 app.post('/api/admin/reset-invites', requireAdmin, async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   if (!isValidEmail(email)) return res.status(400).json({ error: 'A valid email is required.' });
   try {
-    await pool.query('UPDATE guests SET invites_left = 2 WHERE LOWER(email) = $1', [email]);
+    await setInviteBonus(pool, email, 0);
     res.json({ success: true });
   } catch (err) {
     serverError(res, err);
@@ -1425,9 +1538,16 @@ app.post('/api/admin/add-guest', requireAdmin, async (req, res) => {
   }
 });
 
+// The current event's invites, plus pending ones from past events (their links still work, so they can be revoked).
+// ?event=all: every invite. promoter_name is set on a promoter's invite (inviter_email 'PROMOTER').
 app.get('/api/admin/invites', requireAdmin, async (req, res) => {
+  const all = req.query.event === 'all';
   try {
-    const r = await pool.query('SELECT id, inviter_email, invitee_email, note, status, created_at, accepted_at FROM invites ORDER BY id DESC');
+    const r = await pool.query(
+      `SELECT i.id, i.inviter_email, i.invitee_email, i.note, i.status, i.created_at, i.accepted_at, i.event_id, i.promoter_id,
+              pr.name AS promoter_name, e.name AS event_name, e.status = 'current' AS current_event
+       FROM invites i LEFT JOIN promoters pr ON pr.id = i.promoter_id LEFT JOIN events e ON e.id = i.event_id
+       ${all ? '' : `WHERE i.event_id = ${CUR} OR i.status = 'PENDING'`} ORDER BY i.id DESC`);
     res.json(r.rows);
   } catch (err) {
     serverError(res, err);
@@ -1441,13 +1561,12 @@ app.post('/api/admin/revoke-invite', requireAdmin, async (req, res) => {
   try {
     client = await pool.connect();
     await client.query('BEGIN');
+    // The inviter (a guest or a promoter) gets it back: allowances count the invites that aren't revoked.
     const r = await client.query("UPDATE invites SET status = 'REVOKED' WHERE id = $1 AND status = 'PENDING' RETURNING inviter_email", [id]);
     if (!r.rowCount) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Only pending invites can be revoked.' });
     }
-    // Give the inviter their invite back (no-op for admin-created invites)
-    await client.query('UPDATE guests SET invites_left = invites_left + 1 WHERE LOWER(email) = $1', [r.rows[0].inviter_email.toLowerCase()]);
     await client.query('COMMIT');
     res.json({ success: true });
   } catch (err) {
@@ -1458,18 +1577,35 @@ app.post('/api/admin/revoke-invite', requireAdmin, async (req, res) => {
   }
 });
 
+// How many invites a guest can still send for the current event: stored as their bonus, so that the event's invites
+// per guest + bonus - invites sent = count.
 app.post('/api/admin/set-invites', requireAdmin, async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   const count = parseInt(req.body?.count, 10);
   if (!isValidEmail(email) || !(count >= 0 && count <= 20)) return res.status(400).json({ error: 'Invalid email or count (0-20).' });
+  let client;
   try {
-    await pool.query('UPDATE guests SET invites_left = $1 WHERE LOWER(email) = $2', [count, email]);
-    res.json({ success: true });
+    client = await pool.connect();
+    await client.query('BEGIN');
+    // The guest's row is locked as send-invite locks it, so an invite going out right now is counted.
+    const g = await client.query('SELECT 1 FROM guests WHERE LOWER(email) = $1 ORDER BY id FOR UPDATE', [email]);
+    if (!g.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'That guest is not on the roster.' });
+    }
+    const r = (await client.query(
+      `SELECT (SELECT invites_per_guest FROM events WHERE status = 'current') AS per_guest,
+              (SELECT COUNT(*) FROM invites WHERE LOWER(inviter_email) = $1 AND event_id = ${CUR} AND status <> 'REVOKED')::int AS sent`, [email])).rows[0];
+    await setInviteBonus(client, email, count + r.sent - r.per_guest);
+    await client.query('COMMIT');
+    res.json({ success: true, invites_left: count });
   } catch (err) {
+    await client?.query('ROLLBACK').catch(() => {});
     serverError(res, err);
+  } finally {
+    client?.release();
   }
 });
-
 app.post('/api/admin/remove-guest', requireAdmin, async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   if (!isValidEmail(email)) return res.status(400).json({ error: 'A valid email is required.' });
@@ -1481,9 +1617,10 @@ app.post('/api/admin/remove-guest', requireAdmin, async (req, res) => {
     await client.query('BEGIN');
     // Locked first, as /api/orders locks the guest row, so no new order (a free pass is PAID at once) can slip in.
     await client.query('SELECT 1 FROM guests WHERE LOWER(email) = $1 FOR UPDATE', [email]);
-    // Their orders are locked too, so a payment or a free code being applied right now finishes before we look.
+    // Their orders are locked too, so a payment or a free code being applied right now finishes before we look. Only the
+    // current event's count: a past event's pass doesn't open the door any more.
     const open = await client.query(
-      "SELECT status, reference_code FROM orders WHERE LOWER(guest_email) = $1 AND status <> 'CANCELLED' ORDER BY id FOR UPDATE", [email]);
+      `SELECT status, reference_code FROM orders WHERE LOWER(guest_email) = $1 AND status <> 'CANCELLED' AND event_id = ${CUR} ORDER BY id FOR UPDATE`, [email]);
     const paid = open.rows.find((o) => o.status === 'PAID');
     if (paid) {
       await client.query('ROLLBACK');
@@ -1572,6 +1709,12 @@ a { color: inherit; }
 .page-head::after { content: ''; position: absolute; left: 0; bottom: -1px; width: 56px; height: 2px; background: var(--accent); }
 .page-head h1 { font-family: var(--display); font-stretch: 125%; font-weight: 800; font-size: clamp(34px, 5vw, 52px); line-height: .95; letter-spacing: -.01em; text-transform: uppercase; margin: 0; }
 .page-head p { margin: 12px 0 0; font-family: var(--mono); font-size: 12px; letter-spacing: .02em; color: var(--muted); }
+/* The current event, above the title */
+.evtag { display: inline-block; margin-bottom: 12px; font-family: var(--mono); font-size: 11.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--text); text-decoration: none; overflow-wrap: anywhere; }
+.evtag:empty { display: none; }
+.evtag::before { content: '[ Event: '; color: var(--dim); } .evtag::after { content: ' ]'; color: var(--dim); }
+.evtag:hover { color: var(--accent-hi); }
+.past-note { margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--line); border-left: 2px solid var(--cyan); background: var(--surface-2); font-size: 13.5px; color: var(--muted); }
 
 /* ---------- Attention banner ---------- */
 .alert {
@@ -1801,9 +1944,10 @@ dialog .btn.danger-solid:hover { background: #941c15; border-color: #941c15; }
 <header class="top">
   <div class="brand"><svg class="mark" viewBox="0 0 30 18" aria-hidden="true" focusable="false"><path fill="#e4e3df" d="M0 6h30v12H0z"/><path fill="#0a0a0b" d="M18.2 0h5.6l-4.6 18h-5.6z"/><path fill="#ff5a1f" d="M19.6 0h2.8l-4.6 18h-2.8z"/></svg><b>ON D<span>'</span> <i>ROAD</i></b><span class="sub">Command Center</span></div>
   <nav class="top-right">
+    <a class="top-link" href="/admin/events">Events</a>
     <a class="top-link" href="/door" target="_blank" rel="noopener">Door scanner</a>
     <a class="top-link" href="/admin/payments">Payment settings</a>
-    <a class="top-link" href="/admin/pricing">Prices &amp; codes</a>
+    <a class="top-link" href="/admin/pricing">Prices, codes &amp; promoters</a>
     <a class="top-link" href="/admin/pickup">Sizes &amp; pickup</a>
     <a class="top-link" href="/admin/event">Event &amp; messages</a>
     <a class="top-link" href="/admin/site">Site, contact, terms &amp; FAQ</a>
@@ -1815,6 +1959,7 @@ dialog .btn.danger-solid:hover { background: #941c15; border-color: #941c15; }
 <main class="wrap">
   <div class="page-head">
     <div>
+      <a class="evtag" id="ev-tag" href="/admin/events" title="Events"></a>
       <h1>Overview</h1>
       <p id="updated">Loading&hellip;</p>
     </div>
@@ -1895,7 +2040,7 @@ dialog .btn.danger-solid:hover { background: #941c15; border-color: #941c15; }
         <input id="p-sizes" placeholder="Sizes guests choose from, e.g. S, M, L, XL (leave blank if no size is needed)" aria-label="Sizes">
         <textarea id="p-paynote" maxlength="1000" placeholder="Cash payment details for this package (optional). Shown under the general payment instructions, e.g. who to pay and where." aria-label="Cash payment details for this package (optional)"></textarea>
       </div>
-      <p class="hint">Want early bird pricing or promo codes? Create the package, then set them up in <a href="/admin/pricing">Prices &amp; codes</a>.</p>
+      <p class="hint">Want early bird pricing or promo codes? Create the package, then set them up in <a href="/admin/pricing">Prices, codes &amp; promoters</a>.</p>
       <div class="create-foot">
         <label class="check"><input type="checkbox" id="p-compliance" checked> Requires costume compliance</label>
         <button class="btn" type="submit">Create package</button>
@@ -1906,10 +2051,12 @@ dialog .btn.danger-solid:hover { background: #941c15; border-color: #941c15; }
 
   <section class="panel hidden" id="orders-panel" role="tabpanel">
     <div class="toolbar">
+      <select id="order-event" class="hidden" aria-label="Event"></select>
       <input id="order-search" class="grow" placeholder="Search name, email or reference" type="search">
       <select id="order-filter" aria-label="Order status filter"><option value="">All orders</option><option value="REFUND">Refund requests</option><option value="RESERVED">Awaiting payment</option><option value="PAID">Paid</option><option value="COMP">Free passes</option><option value="COLLECTED">Package collected</option><option value="UNCOLLECTED">Paid, not collected</option><option value="CHECKED">Checked in</option><option value="CANCELLED">Cancelled</option></select>
       <button class="btn ghost" id="orders-csv-btn" type="button">Export orders CSV</button>
     </div>
+    <p id="order-past" class="past-note hidden" role="status"></p>
     <div class="scroll"><table class="cards"><thead><tr><th>Guest</th><th>Package</th><th class="num">Amount</th><th>Status</th><th>Reference</th><th>Reserved</th><th></th></tr></thead><tbody id="orderlist"></tbody></table></div>
   </section>
   <section class="panel hidden" id="door-panel" role="tabpanel">
@@ -1945,6 +2092,9 @@ dialog .btn.danger-solid:hover { background: #941c15; border-color: #941c15; }
 const $ = (id) => document.getElementById(id);
 const NL = String.fromCharCode(10);
 let guests = [], invites = [], products = [], orders = [], checkins = [];
+// Events (for the event tag and the Orders tab's event picker), and the orders the Orders tab shows: the current
+// event's, or a past event's (read-only) picked in #order-event.
+let events = { current: null, past: [] }, viewOrders = null, viewEvent = '';
 let guestByEmail = new Map();
 
 async function api(path, body) {
@@ -2091,8 +2241,8 @@ function approvalPill(g) {
   if (g.approval === 'DECLINED') return pill('Declined', 'bad');
   return null;
 }
-// Who invited them, for the admin: the admin's own invites are "You".
-function invitedBy(g) { return !g.invited_by ? '' : g.invited_by === 'CONTROL' ? 'You' : (g.invited_by_name || g.invited_by); }
+// Who invited them, for the admin: the admin's own invites are "You", a promoter's "Promoter <name>".
+function invitedBy(g) { return !g.invited_by ? '' : g.invited_by === 'CONTROL' ? 'You' : g.invited_by === 'PROMOTER' ? 'Promoter ' + (g.invited_by_name || '') : (g.invited_by_name || g.invited_by); }
 function igLink(handle) {
   const a = el('a', '@' + handle, 'ig');
   a.href = 'https://instagram.com/' + encodeURIComponent(handle);
@@ -2236,7 +2386,10 @@ function renderGuests() {
       return 'Profile saved.';
     }));
     act.appendChild(actionBtn('Set invites', 'ghost', async () => {
-      const v = await ask({ title: 'Set invites', text: 'How many invites ' + g.email + ' can still send.', ok: 'Save', fields: [{ name: 'count', label: 'Invites (0 to 20)', type: 'number', min: 0, max: 20, value: g.invites_left, required: true }] });
+      const ev = events.current;
+      const v = await ask({ title: 'Set invites', text: 'How many invites ' + g.email + ' can still send for ' + (ev ? ev.name : 'this event') + '.' +
+        (ev ? ' Everyone gets ' + plural(ev.invites_per_guest, 'invite', 'invites') + ' for it, and they have sent ' + (Number(g.invites_sent) || 0) + '.' : ''),
+        ok: 'Save', fields: [{ name: 'count', label: 'Invites left (0 to 20)', type: 'number', min: 0, max: 20, value: g.invites_left, required: true }] });
       if (!v) return false;
       await api('/api/admin/set-invites', { email: g.email, count: v.count });
       return 'Invites updated.';
@@ -2270,7 +2423,7 @@ function renderRequests() {
     if (g.instagram) ig.appendChild(igLink(g.instagram));
     td(tr, g.email);
     const by = td(tr, invitedBy(g));
-    if (g.invited_by && g.invited_by !== 'CONTROL' && g.invited_by_name) by.appendChild(el('span', g.invited_by, 'subtext'));
+    if (g.invited_by && g.invited_by !== 'CONTROL' && g.invited_by !== 'PROMOTER' && g.invited_by_name) by.appendChild(el('span', g.invited_by, 'subtext'));
     td(tr, g.invite_note || '', 'note');
     const when = td(tr, shortDate(g.applied_at), 'mono'); when.title = longDate(g.applied_at);
     if (g.approval === 'DECLINED' && g.decided_at) when.appendChild(el('span', 'Declined ' + shortDate(g.decided_at), 'subtext'));
@@ -2278,7 +2431,7 @@ function renderRequests() {
     act.appendChild(actionBtn('Approve', 'good', () => approve(g)));
     if (g.approval === 'PENDING') act.appendChild(actionBtn('Decline', 'danger', async () => {
       const who = g.full_name || g.email;
-      const inviter = g.invited_by === 'CONTROL' ? 'you' : (g.invited_by_name || g.invited_by || 'whoever invited them');
+      const inviter = g.invited_by === 'CONTROL' ? 'you' : g.invited_by === 'PROMOTER' ? 'promoter ' + (g.invited_by_name || '') : (g.invited_by_name || g.invited_by || 'whoever invited them');
       const v = await ask({ title: 'Decline ' + who + '?', text: "They won't get an email. Their invite stays used, and " + inviter + " doesn't get it back. You can still approve them later from Declined.", ok: 'Decline', danger: true });
       if (!v) return false;
       await api('/api/admin/guests/decline', { email: g.email });
@@ -2292,12 +2445,13 @@ function renderRequests() {
 function renderInvites() {
   const q = $('inv-search').value.trim().toLowerCase(), f = $('inv-filter').value;
   const tbody = $('invlist'); tbody.replaceChildren();
-  const list = invites.filter((v) => (!f || v.status === f) && (String(v.invitee_email).toLowerCase().includes(q) || String(v.inviter_email).toLowerCase().includes(q)));
+  const list = invites.filter((v) => (!f || v.status === f) && (String(v.invitee_email).toLowerCase().includes(q) || String(v.inviter_email).toLowerCase().includes(q) || String(v.promoter_name || '').toLowerCase().includes(q)));
   if (!list.length) return emptyRow(tbody, 5, invites.length ? 'No invites match.' : 'No invites sent yet.');
   list.forEach((v) => {
     const tr = el('tr');
     td(tr, v.invitee_email, 'strong');
-    td(tr, v.inviter_email === 'CONTROL' ? "On D' Road" : v.inviter_email);
+    const from = td(tr, v.inviter_email === 'CONTROL' ? "On D' Road" : v.inviter_email === 'PROMOTER' ? 'Promoter ' + (v.promoter_name || '') : v.inviter_email);
+    if (v.current_event === false) from.appendChild(el('span', 'From ' + (v.event_name || 'a past event'), 'subtext'));
     td(tr, '').appendChild(v.status === 'ACCEPTED' ? pill('Accepted', 'good') : v.status === 'PENDING' ? pill('Pending', 'warn') : pill(v.status === 'REVOKED' ? 'Revoked' : v.status, 'neutral'));
     const sent = td(tr, shortDate(v.created_at), 'mono'); sent.title = longDate(v.created_at);
     const act = td(tr, '', 'actions');
@@ -2392,12 +2546,34 @@ const ORDER_FILTERS = {
   COLLECTED: (o) => !!o.picked_up_at,
   UNCOLLECTED: (o) => o.status === 'PAID' && !o.picked_up_at
 };
+// The event picker above the orders: the current event, then past ones (shown only once there are past events).
+function renderEventPicker() {
+  const sel = $('order-event');
+  sel.classList.toggle('hidden', !events.past.length);
+  sel.replaceChildren();
+  const add = (v, t) => { const o = el('option', t); o.value = v; sel.appendChild(o); };
+  if (events.current) add('', events.current.name + ' (current)');
+  events.past.forEach((e) => add(String(e.id), e.name + ' (past)'));
+  sel.value = viewEvent;
+  if (sel.value !== viewEvent) { viewEvent = ''; viewOrders = null; sel.value = ''; }
+  $('ev-tag').textContent = events.current ? events.current.name : '';
+}
+async function pickEvent(v) {
+  viewEvent = v || '';
+  viewOrders = viewEvent ? await api('/api/admin/orders?event=' + encodeURIComponent(viewEvent)) : null;
+  renderOrders();
+}
 function renderOrders() {
   const f = $('order-filter').value, q = $('order-search').value.trim();
   const tbody = $('orderlist'); tbody.replaceChildren();
-  const list = orders.filter((o) => (!f || (ORDER_FILTERS[f] ? ORDER_FILTERS[f](o) : o.status === f)) &&
+  // A past event's orders are read-only: its passes are history.
+  const all = viewOrders || orders, past = !!viewOrders;
+  const pastEv = past ? events.past.find((e) => String(e.id) === viewEvent) : null;
+  $('order-past').classList.toggle('hidden', !past);
+  $('order-past').textContent = past ? (pastEv ? pastEv.name : 'A past event') + ' is over: its orders are read-only. Its passes no longer open the door.' : '';
+  const list = all.filter((o) => (!f || (ORDER_FILTERS[f] ? ORDER_FILTERS[f](o) : o.status === f)) &&
     matches(q, [nameOf(o.guest_email), o.guest_email, o.reference_code]));
-  if (!list.length) return emptyRow(tbody, 7, orders.length ? 'No orders match.' : 'No orders yet.');
+  if (!list.length) return emptyRow(tbody, 7, all.length ? 'No orders match.' : 'No orders yet.');
   list.forEach((o) => {
     const tr = el('tr');
     const name = nameOf(o.guest_email);
@@ -2427,6 +2603,7 @@ function renderOrders() {
     td(tr, o.reference_code, 'mono');
     const when = td(tr, shortDate(o.created_at), 'mono'); when.title = longDate(o.created_at);
     const act = td(tr, '', 'actions');
+    if (past) { tbody.appendChild(tr); return; }
     // The admin can change a size even when sizes are locked for guests.
     if (o.status !== 'CANCELLED' && o.package_sizes) {
       act.appendChild(actionBtn('Size', 'ghost', async () => {
@@ -2512,7 +2689,7 @@ function labelCells(tbody) {
   const heads = Array.from(tbody.closest('table').querySelectorAll('thead th')).map((th) => th.textContent.trim());
   Array.from(tbody.rows).forEach((tr) => Array.from(tr.cells).forEach((c, i) => c.setAttribute('data-label', tr.classList.contains('empty-row') ? '' : (heads[i] || ''))));
 }
-function renderAll() { renderStats(); renderSales(); renderGuests(); renderRequests(); renderInvites(); renderProducts(); renderOrders(); renderDoor(); renderCounts(); }
+function renderAll() { renderEventPicker(); renderStats(); renderSales(); renderGuests(); renderRequests(); renderInvites(); renderProducts(); renderOrders(); renderDoor(); renderCounts(); }
 
 // The site lock's status line: shown while the site is locked, with the unlock time when one is set.
 async function refreshLock() {
@@ -2526,8 +2703,11 @@ async function refreshLock() {
 async function refresh() {
   refreshLock();
   try {
-    const r = await Promise.all([api('/api/admin/guests'), api('/api/admin/invites'), api('/api/admin/packages'), api('/api/admin/orders'), api('/api/admin/checkins')]);
+    const r = await Promise.all([api('/api/admin/guests'), api('/api/admin/invites'), api('/api/admin/packages'), api('/api/admin/orders'), api('/api/admin/checkins'),
+      api('/api/admin/events').catch(() => null), viewEvent ? api('/api/admin/orders?event=' + encodeURIComponent(viewEvent)) : null]);
     guests = r[0]; invites = r[1]; products = r[2]; orders = r[3]; checkins = Array.isArray(r[4]) ? r[4] : [];
+    if (r[5]) events = { current: r[5].current, past: r[5].past || [] };
+    viewOrders = r[6];
     guestByEmail = new Map(guests.map((g) => [String(g.email).toLowerCase(), g]));
   } catch (e) { toast(e.message, true); return; }
   renderAll();
@@ -2547,7 +2727,10 @@ function showTab(which) {
 tabs.forEach((t) => $(t).addEventListener('click', () => showTab(t)));
 $('alert-go').addEventListener('click', () => { $('order-filter').value = 'REFUND'; renderOrders(); showTab('tab-o'); $('orders-panel').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
 $('req-alert-go').addEventListener('click', () => { $('req-filter').value = 'PENDING'; renderRequests(); showTab('tab-r'); $('requests-panel').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
-function tabFromHash() { if (location.hash === '#requests') showTab('tab-r'); }
+function tabFromHash() { if (location.hash === '#requests') showTab('tab-r'); if (location.hash === '#orders') showTab('tab-o'); }
+// /admin?event=<id>#orders (from the Events page) opens that event's orders.
+(function () { const v = new URLSearchParams(location.search).get('event'); if (v && /^[0-9]+$/.test(v)) viewEvent = v; })();
+$('order-event').addEventListener('change', (e) => { pickEvent(e.target.value).catch((err) => toast(err.message, true)); });
 window.addEventListener('hashchange', tabFromHash);
 tabFromHash();
 
@@ -2631,8 +2814,9 @@ $('csv-btn').addEventListener('click', () => {
 // Every order, newest first. Amounts are in the order's currency, e.g. 250.00.
 $('orders-csv-btn').addEventListener('click', () => {
   const amount = (c) => (c === null || c === undefined ? '' : (Number(c) / 100).toFixed(2));
+  const list = viewOrders || orders;
   downloadCsv('ondroad-orders.csv', [['reference', 'email', 'name', 'package', 'tier', 'size', 'list', 'discount', 'code', 'amount', 'currency', 'status', 'paid_via', 'reserved_at', 'paid_at', 'picked_up_at', 'checked_in_at']].concat(
-    orders.slice().sort((a, b) => b.id - a.id).map((o) => [o.reference_code, o.guest_email, nameOf(o.guest_email), o.package_name, o.tier_name, o.size, amount(o.list_cents ?? o.price_cents),
+    list.slice().sort((a, b) => b.id - a.id).map((o) => [o.reference_code, o.guest_email, nameOf(o.guest_email), o.package_name, o.tier_name, o.size, amount(o.list_cents ?? o.price_cents),
       amount(o.discount_cents || 0), o.promo_code, amount(amountOf(o)), o.currency, isRefundRequest(o) ? 'REFUND_REQUESTED' : o.status, o.paid_via,
       o.created_at, o.paid_at, o.picked_up_at, o.checked_in_at])));
 });
@@ -2643,6 +2827,13 @@ refresh();
 </script>
 </body>
 </html>`;
+
+// Events (see events.js): /admin/events and its API.
+registerEvents({ app, pool, requireAdmin });
+// Promoters (see promoter.js): their private pages, their API and the admin routes. Registered here, after the invite
+// helpers it shares with /api/send-invite.
+registerPromoters({ app, pool, TOKEN_SECRET, safeEqual, requireAdmin, rateLimit, lock, mail, renderEmail, normalizeEmail, isValidEmail,
+  hashToken, newInviteToken, inviteLink, inviteBlocked, SITE_URL, PUBLIC_URL });
 
 app.get('/admin', requireAdmin, (req, res) => res.send(ADMIN_PAGE));
 

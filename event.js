@@ -1,8 +1,10 @@
 // event.js: event details guests see in their account, and email updates to groups of guests.
-// "When", the general details and the poster show to every approved guest. The paid-only details
-// (meetup spot, pickup info) and the location are only sent to guests whose order is paid.
+// The details belong to the current event (columns on its events row, see events.js); its name is the title of the
+// guest's event page. "When", the general details and the poster show to every approved guest. The paid-only details
+// (meetup spot, pickup info) and the location are only sent to guests whose order for this event is paid.
 // Guests still waiting for approval, or declined, get nothing.
 import { renderEmail } from './emails.js';
+import { CUR } from './events.js';
 
 // The poster is an https:// link, or an image in the guest site repo like "art/poster.jpg": the same checks site.js
 // uses for sponsor logos, so the guest site can load it the same way.
@@ -13,10 +15,10 @@ function isHttpsUrl(v) {
 }
 const isPoster = (v) => isHttpsUrl(v) || POSTER_PATH.test(v);
 
-// Who each group email goes to.
+// Who each group email goes to. Paid and reserved are the current event's orders; everyone approved is the roster.
 const AUDIENCES = {
-  paid: "SELECT DISTINCT LOWER(guest_email) AS email FROM orders WHERE status = 'PAID'",
-  reserved: "SELECT DISTINCT LOWER(guest_email) AS email FROM orders WHERE status = 'RESERVED'",
+  paid: `SELECT DISTINCT LOWER(guest_email) AS email FROM orders WHERE status = 'PAID' AND event_id = ${CUR}`,
+  reserved: `SELECT DISTINCT LOWER(guest_email) AS email FROM orders WHERE status = 'RESERVED' AND event_id = ${CUR}`,
   // Approved guests only: people still waiting for approval, or declined, get no group emails (they'd carry the
   // event details that /api/event keeps from them, and a declined request gets no email at all).
   all: "SELECT DISTINCT LOWER(email) AS email FROM guests WHERE approval = 'APPROVED'"
@@ -24,14 +26,16 @@ const AUDIENCES = {
 const BATCH = 100; // Resend's batch limit
 
 export function registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, requireAuth, requireAdmin, mail }) {
+  // Field -> column on the events row (fixed names, never from a request).
   const KEYS = { when: 'event_when', info: 'event_info', paid_info: 'event_paid_info', location: 'event_location', poster: 'event_poster' };
   const LIMITS = { when: 120, info: 3000, paid_info: 3000, location: 300, poster: 500 };
 
+  // The current event's name and details.
   async function getEvent() {
-    const r = await pool.query('SELECT key, value FROM settings WHERE key = ANY($1)', [Object.values(KEYS)]);
-    const s = Object.fromEntries(r.rows.map((x) => [x.key, x.value]));
+    const r = await pool.query("SELECT * FROM events WHERE status = 'current'");
+    const s = r.rows[0] || {};
     const poster = s.event_poster || '';
-    return { when: s.event_when || '', info: s.event_info || '', paid_info: s.event_paid_info || '',
+    return { name: s.name || '', when: s.event_when || '', info: s.event_info || '', paid_info: s.event_paid_info || '',
       location: s.event_location || '', poster: isPoster(poster) ? poster : '' };
   }
 
@@ -51,14 +55,16 @@ export function registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, req
 
   // ---------- Guest ----------
   const NOTHING = { when: '', info: '', paid: false, paid_info: '', has_paid_info: false, location: '', poster: '' };
+  // name: the current event's, for the title of the guest's event page (an older guest site ignores it).
   app.get('/api/event', requireAuth, async (req, res) => {
     try {
       // Only approved guests see the event. Pending and declined requests (and removed guests) get empty details.
       const g = await pool.query('SELECT approval FROM guests WHERE LOWER(email) = $1 ORDER BY id LIMIT 1', [req.userEmail]);
       if (!g.rowCount || (g.rows[0].approval && g.rows[0].approval !== 'APPROVED')) return res.json(NOTHING);
       const ev = await getEvent();
-      const paid = await pool.query("SELECT 1 FROM orders WHERE LOWER(guest_email) = $1 AND status = 'PAID' LIMIT 1", [req.userEmail]);
+      const paid = await pool.query(`SELECT 1 FROM orders WHERE LOWER(guest_email) = $1 AND status = 'PAID' AND event_id = ${CUR} LIMIT 1`, [req.userEmail]);
       res.json({
+        name: ev.name,
         when: ev.when, info: ev.info,
         paid: !!paid.rowCount,
         paid_info: paid.rowCount ? ev.paid_info : '',
@@ -95,9 +101,10 @@ export function registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, req
       return res.status(400).json({ error: 'The poster needs to be an https:// image link, or a file in the guest site like art/poster.jpg.' });
     }
     try {
-      for (const [field, v] of Object.entries(vals)) {
-        await pool.query(
-          'INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value', [KEYS[field], v]);
+      const cols = Object.keys(vals);
+      if (cols.length) {
+        // One statement, on the current event's row.
+        await pool.query(`UPDATE events SET ${cols.map((f, n) => `${KEYS[f]} = $${n + 1}`).join(', ')} WHERE status = 'current'`, cols.map((f) => vals[f]));
       }
       res.json({ success: true });
     } catch (err) {
@@ -113,8 +120,11 @@ export function registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, req
       for (const [k, q] of Object.entries(AUDIENCES)) {
         counts[k] = parseInt((await pool.query(`SELECT COUNT(*) FROM (${q}) x`)).rows[0].count, 10);
       }
+      // The current event's sends (?event=all: every event's, for the reset page's copy).
+      const all = req.query.event === 'all';
       const log = await pool.query(
-        'SELECT id, audience, subject, recipients, sent, failed, created_at FROM broadcasts ORDER BY id DESC LIMIT 20');
+        `SELECT b.id, b.audience, b.subject, b.recipients, b.sent, b.failed, b.created_at, b.event_id${all ? ', b.message' : ''}
+         FROM broadcasts b ${all ? '' : `WHERE b.event_id = ${CUR}`} ORDER BY b.id DESC ${all ? '' : 'LIMIT 20'}`);
       res.json({ counts, log: log.rows });
     } catch (err) {
       console.error(err);
@@ -160,7 +170,7 @@ export function registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, req
         if (i + BATCH < recipients.length) await new Promise((r) => setTimeout(r, 600)); // stay under Resend's rate limit
       }
       await pool.query(
-        'INSERT INTO broadcasts (audience, subject, message, recipients, sent, failed) VALUES ($1, $2, $3, $4, $5, $6)',
+        `INSERT INTO broadcasts (audience, subject, message, recipients, sent, failed, event_id) VALUES ($1, $2, $3, $4, $5, $6, ${CUR})`,
         [audience, subject, message, recipients.length, sent, failed]);
       res.json({ success: true, recipients: recipients.length, sent, failed });
     } catch (err) {
@@ -214,6 +224,8 @@ button.ghost:hover { border-color: var(--text); background: rgba(236, 235, 230, 
 .wrap { max-width: 720px; margin: 0 auto; padding: clamp(24px, 4vw, 48px) clamp(16px, 3vw, 32px) 80px; }
 .card { margin-bottom: 22px; }
 .card > p { color: var(--muted); margin: 0; }
+.card > p b { color: var(--text); font-weight: 700; }
+.card > p a { color: var(--text); text-decoration-color: var(--accent); text-underline-offset: 3px; }
 label { display: block; font-family: var(--mono); font-size: 11px; font-weight: 400; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin: 24px 0 8px; }
 textarea, input, select { width: 100%; min-height: 44px; font: 500 15px var(--body); color: var(--text); background: var(--well); border: 1px solid var(--line-strong); border-radius: 0; padding: 11px 13px; transition: border-color .15s, box-shadow .15s; }
 textarea:hover, input:hover, select:hover { border-color: rgba(236, 235, 230, .42); }
@@ -255,7 +267,7 @@ td .bad { color: var(--bad); }
 
   <section class="card" aria-labelledby="ev-h">
     <h2 id="ev-h">Event details</h2>
-    <p>Shown in every approved guest's account. Guests still waiting for approval see none of it. Leave everything empty to hide the section.</p>
+    <p>For the current event, <b id="ev-name"></b> (rename it or start a new one on <a href="/admin/events">Events</a>). Shown in every approved guest's account. Guests still waiting for approval see none of it. Leave everything empty to hide the section.</p>
     <label for="when">When</label>
     <input id="when" maxlength="120" placeholder="Example: Carnival Tuesday, August 4 · 9:00 AM">
     <label for="info">Details for everyone</label>
@@ -276,7 +288,7 @@ td .bad { color: var(--bad); }
 
   <section class="card" aria-labelledby="bc-h">
     <h2 id="bc-h">Email guests</h2>
-    <p>Sends one email to everyone in the group. Send yourself a test first.</p>
+    <p>Sends one email to everyone in the group. Paid and reserved mean this event's orders. Send yourself a test first.</p>
     <label for="aud">Send to</label>
     <select id="aud">
       <option value="paid">Paid guests</option>
@@ -298,7 +310,7 @@ td .bad { color: var(--bad); }
 
   <section class="card" aria-labelledby="log-h">
     <h2 id="log-h">Sent</h2>
-    <p>The last 20 emails sent from this page.</p>
+    <p>The last 20 emails sent from this page for this event.</p>
     <div id="log"></div>
   </section>
 </main>
@@ -341,6 +353,7 @@ function showPoster() {
 $('poster').addEventListener('input', showPoster);
 
 fetch('/api/admin/event').then(function (r) { return r.json(); }).then(function (d) {
+  $('ev-name').textContent = d.name || '';
   $('when').value = d.when || ''; $('info').value = d.info || ''; $('paid').value = d.paid_info || '';
   $('loc').value = d.location || ''; $('poster').value = d.poster || '';
   showPoster();
