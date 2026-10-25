@@ -330,6 +330,34 @@ const SITE_URL = process.env.FRONTEND_URL ? FRONTEND_URL : 'https://ondroad.xyz'
 // Creates the packages/orders/settings tables and any missing columns on startup,
 // so no SQL has to be run by hand in Aiven. Safe to run every boot.
 async function ensureSchema() {
+  // The first tables (made by hand in Aiven before the rest were made here), so a new, empty database works too.
+  // Their later columns are added below with ADD COLUMN IF NOT EXISTS.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS guests (
+      id SERIAL PRIMARY KEY,
+      email TEXT NOT NULL UNIQUE,
+      rsvp_status TEXT,
+      shirt_size TEXT,
+      invites_left INTEGER NOT NULL DEFAULT 2
+    );
+    CREATE TABLE IF NOT EXISTS invites (
+      id SERIAL PRIMARY KEY,
+      token_hash TEXT UNIQUE NOT NULL,
+      inviter_email TEXT NOT NULL,
+      invitee_email TEXT NOT NULL,
+      note TEXT,
+      status TEXT NOT NULL DEFAULT 'PENDING',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      accepted_at TIMESTAMPTZ
+    );
+    CREATE TABLE IF NOT EXISTS login_links (
+      id SERIAL PRIMARY KEY,
+      code_hash TEXT NOT NULL,
+      email TEXT NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL,
+      used_at TIMESTAMPTZ
+    );
+  `);
   await pool.query(`
     -- Events: one current at a time (the partial unique index), the rest past. See events.js.
     CREATE TABLE IF NOT EXISTS events (
