@@ -566,8 +566,8 @@ async function issueTickets(db, orderId, holderName, holderEmail) {
   }
 }
 
-export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, requireAdmin, rateLimit, mail, renderEmail,
-  normalizeEmail, isValidEmail, cleanName, cleanBirthDate, SITE_URL, PUBLIC_URL }) {
+export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, requireRole, rateLimit, mail, renderEmail,
+  normalizeEmail, isValidEmail, cleanName, cleanBirthDate, SITE_URL, PUBLIC_URL, notify = async () => {} }) {
   const json = express.json({ limit: '16kb' });
   const adminJson = express.json({ limit: '100kb' }); // ticket terms and event texts can be long
   const sign = (data) => crypto.createHmac('sha256', TOKEN_SECRET).update(data).digest('base64url').slice(0, 22);
@@ -588,7 +588,7 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
     applies: (path) => (path === '/api/tickets' || path.startsWith('/api/tickets/')) && !OPEN.test(path),
     adminPath: '/api/admin/tickets-lock', what: 'Ticket site' });
   app.use(lock.guard);
-  lock.register({ app, requireAdmin, json: adminJson });
+  lock.register({ app, requireRole, json: adminJson });
 
   const settingsOf = async (db, keys) => Object.fromEntries((await db.query('SELECT key, value FROM settings WHERE key = ANY($1)', [keys])).rows.map((r) => [r.key, r.value]));
   async function siteInfo(db) {
@@ -662,12 +662,13 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
 
   // Records a payment on a locked order. Returns 'PAID' (in full: tickets issued), 'DEPOSIT' (deposit paid, balance due)
   // or 'STALE' (the order wasn't in the state the payment was for; nothing recorded).
-  async function recordPayment(db, o, { kind, via, cents, usdAmount = null, ppOrderId = null, captureId = null, note = '' }) {
+  // byName / byId: the admin who marked it paid by hand (the audit log has the rest).
+  async function recordPayment(db, o, { kind, via, cents, usdAmount = null, ppOrderId = null, captureId = null, note = '', byName = null, byId = null }) {
     const wanted = kind === 'BALANCE' ? 'DEPOSIT_PAID' : 'PENDING';
     if (o.status !== wanted) return 'STALE';
     if (captureId && (await db.query('SELECT 1 FROM ticket_payments WHERE capture_id = $1', [captureId])).rowCount) return 'STALE';
-    await db.query(`INSERT INTO ticket_payments (order_id, kind, via, amount_cents, usd_amount, paypal_order_id, capture_id, note)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, [o.id, kind, via, cents, usdAmount, ppOrderId, captureId, note]);
+    await db.query(`INSERT INTO ticket_payments (order_id, kind, via, amount_cents, usd_amount, paypal_order_id, capture_id, note, by_name, by_user_id)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`, [o.id, kind, via, cents, usdAmount, ppOrderId, captureId, note, byName, byId]);
     const paid = o.paid_cents + cents;
     const vias = (await db.query('SELECT DISTINCT via FROM ticket_payments WHERE order_id = $1', [o.id])).rows.map((r) => r.via);
     const paidVia = vias.length > 1 ? 'MIXED' : vias[0];
@@ -717,13 +718,27 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
     return recordCapture(db, o, r.data);
   }
 
-  // After a payment is recorded (outside the transaction): the emails.
+  // After a payment is recorded (outside the transaction): the emails, and the admin app's alert (no buyer details in it).
   async function afterPaid(state, ref) {
     if (state !== 'PAID' && state !== 'DEPOSIT') return;
     const o = (await pool.query('SELECT * FROM ticket_orders WHERE ref = $1', [ref])).rows[0];
     if (!o) return;
     if (state === 'PAID') await sendTicketsEmail(o).catch((e) => console.error('Tickets email:', e.message));
     else await sendDepositEmail(o).catch((e) => console.error('Deposit email:', e.message));
+    await alertPaid(state, o).catch((e) => console.error('Ticket alert:', e.message));
+  }
+  async function alertPaid(state, o) {
+    const ev = await eventById(pool, o.event_id);
+    const items = (await pool.query('SELECT kind, qty, tickets_included, product_name FROM ticket_order_items WHERE order_id = $1 ORDER BY id', [o.id])).rows;
+    const tables = items.filter((i) => i.kind === 'TABLE').map((i) => i.product_name);
+    const people = items.filter((i) => i.kind === 'TICKET').reduce((a, i) => a + i.qty * i.tickets_included, 0);
+    const what = [tables.length ? tables.join(', ') : null, people ? `${people} ${people === 1 ? 'ticket' : 'tickets'}` : null].filter(Boolean).join(' + ');
+    if (state === 'DEPOSIT') {
+      return notify('deposits', { title: 'Table deposit paid', url: '/admin/app#home',
+        body: `${ev.name} · ${what} · balance ${money(o.total_cents - o.paid_cents, o.currency)} due ${longDate(o.balance_due_at)}` });
+    }
+    if (o.deposit_paid_at) return notify('deposits', { title: 'Balance paid', body: `${ev.name} · ${what} · ${o.ref}`, url: '/admin/app#home' });
+    return notify('sales', { title: tables.length ? 'Table booked' : 'Tickets sold', body: `${ev.name} · ${what} · ${money(o.total_cents, o.currency)}`, url: '/admin/app#home' });
   }
 
   // ---------- Guest API ----------
@@ -1151,6 +1166,14 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
       }));
       out.reminded++;
     }
+    // 3b. The admin app's "balance due tomorrow" alert, once per order, in the last 24 hours before the deadline.
+    const soon = await pool.query(
+      `UPDATE ticket_orders SET balance_alert_at = NOW()
+       WHERE status = 'DEPOSIT_PAID' AND balance_alert_at IS NULL AND balance_due_at > NOW() AND balance_due_at < NOW() + INTERVAL '24 hours' RETURNING *`);
+    for (const o of soon.rows) {
+      const ev = await eventById(pool, o.event_id);
+      await notify('deposits', { title: 'Balance due tomorrow', body: `${ev.name} · ${o.ref} · ${money(o.total_cents - o.paid_cents, o.currency)}`, url: '/admin/app#home' });
+    }
     // 4. Balances not paid by the deadline: the booking is cancelled and the table released. The deposit is kept.
     const late = await pool.query(
       `UPDATE ticket_orders SET status = 'CANCELLED', cancelled_at = NOW(), cancel_reason = 'BALANCE_UNPAID'
@@ -1284,9 +1307,9 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
     return m;
   }
 
-  app.get('/admin/tickets', requireAdmin, (req, res) => res.type('html').send(ticketsAdminPage({ TICKETS_URL, SITE_URL })));
+  app.get('/admin/tickets', requireRole('OWNER', 'ADMIN'), (req, res) => res.type('html').send(ticketsAdminPage({ TICKETS_URL, SITE_URL })));
 
-  app.get('/api/admin/tickets/events', requireAdmin, async (req, res) => {
+  app.get('/api/admin/tickets/events', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     try {
       const evs = (await pool.query('SELECT * FROM ticket_events ORDER BY sort_order, starts_at NULLS LAST, id')).rows;
       const st = await eventStats(evs.map((e) => e.id));
@@ -1294,7 +1317,7 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
         stats: st.get(e.id) || { tickets_sold: 0, orders_paid: 0, orders_deposit: 0, orders_held: 0, received_cents: 0, balance_cents: 0, currency: null } })));
     } catch (err) { serverError(res, err); }
   });
-  app.post('/api/admin/tickets/events', requireAdmin, adminJson, async (req, res) => {
+  app.post('/api/admin/tickets/events', requireRole('OWNER', 'ADMIN'), adminJson, async (req, res) => {
     const v = eventInput(req.body || {});
     if (v.error) return adminFail(res, v.error);
     try {
@@ -1305,7 +1328,7 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
       res.json({ success: true, event: r.rows[0] });
     } catch (err) { serverError(res, err); }
   });
-  app.post('/api/admin/tickets/events/:id', requireAdmin, adminJson, async (req, res) => {
+  app.post('/api/admin/tickets/events/:id', requireRole('OWNER', 'ADMIN'), adminJson, async (req, res) => {
     try {
       const cur = await eventRow(idOf(req.params.id));
       if (!cur) return adminFail(res, 'Event not found.', 404);
@@ -1319,7 +1342,7 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
       res.json({ success: true, event: r.rows[0] });
     } catch (err) { serverError(res, err); }
   });
-  app.post('/api/admin/tickets/events/:id/delete', requireAdmin, adminJson, async (req, res) => {
+  app.post('/api/admin/tickets/events/:id/delete', requireRole('OWNER', 'ADMIN'), adminJson, async (req, res) => {
     try {
       const id = idOf(req.params.id);
       if ((await pool.query('SELECT 1 FROM ticket_orders WHERE event_id = $1 LIMIT 1', [id])).rowCount) return adminFail(res, 'This event has orders, so it stays. Set it to Past instead.', 409);
@@ -1330,7 +1353,7 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
   });
 
   // One event in full: products (with tiers and live numbers), money, and every order.
-  app.get('/api/admin/tickets/events/:id', requireAdmin, async (req, res) => {
+  app.get('/api/admin/tickets/events/:id', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     try {
       const ev = await eventRow(idOf(req.params.id));
       if (!ev) return adminFail(res, 'Event not found.', 404);
@@ -1371,7 +1394,7 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
   async function currencyClash(eventId, currency, exceptId = 0) {
     return (await pool.query('SELECT 1 FROM ticket_products WHERE event_id = $1 AND currency <> $2 AND id <> $3 LIMIT 1', [eventId, currency, exceptId])).rowCount > 0;
   }
-  app.post('/api/admin/tickets/products', requireAdmin, adminJson, async (req, res) => {
+  app.post('/api/admin/tickets/products', requireRole('OWNER', 'ADMIN'), adminJson, async (req, res) => {
     try {
       const ev = await eventRow(idOf(req.body?.event_id));
       if (!ev) return adminFail(res, 'Event not found.', 404);
@@ -1384,7 +1407,7 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
       res.json({ success: true, product: r.rows[0] });
     } catch (err) { serverError(res, err); }
   });
-  app.post('/api/admin/tickets/products/:id', requireAdmin, adminJson, async (req, res) => {
+  app.post('/api/admin/tickets/products/:id', requireRole('OWNER', 'ADMIN'), adminJson, async (req, res) => {
     try {
       const cur = (await pool.query('SELECT * FROM ticket_products WHERE id = $1', [idOf(req.params.id)])).rows[0];
       if (!cur) return adminFail(res, 'Not found.', 404);
@@ -1397,7 +1420,7 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
       res.json({ success: true, product: r.rows[0] });
     } catch (err) { serverError(res, err); }
   });
-  app.post('/api/admin/tickets/products/:id/delete', requireAdmin, adminJson, async (req, res) => {
+  app.post('/api/admin/tickets/products/:id/delete', requireRole('OWNER', 'ADMIN'), adminJson, async (req, res) => {
     try {
       const id = idOf(req.params.id);
       if ((await pool.query('SELECT 1 FROM ticket_order_items WHERE product_id = $1 LIMIT 1', [id])).rowCount) return adminFail(res, 'This has orders, so it stays. Hide it instead.', 409);
@@ -1415,7 +1438,7 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
     if (b.sort_order !== undefined) { f.sort_order = int(b.sort_order); if (!Number.isInteger(f.sort_order)) return { error: 'Sort order is a whole number.' }; }
     return { fields: f };
   }
-  app.post('/api/admin/tickets/tiers', requireAdmin, adminJson, async (req, res) => {
+  app.post('/api/admin/tickets/tiers', requireRole('OWNER', 'ADMIN'), adminJson, async (req, res) => {
     try {
       const pid = idOf(req.body?.product_id);
       if (!(await pool.query('SELECT 1 FROM ticket_products WHERE id = $1', [pid])).rowCount) return adminFail(res, 'Not found.', 404);
@@ -1427,7 +1450,7 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
       res.json({ success: true, tier: r.rows[0] });
     } catch (err) { serverError(res, err); }
   });
-  app.post('/api/admin/tickets/tiers/:id', requireAdmin, adminJson, async (req, res) => {
+  app.post('/api/admin/tickets/tiers/:id', requireRole('OWNER', 'ADMIN'), adminJson, async (req, res) => {
     try {
       const v = tierInput(req.body || {}, false);
       if (v.error) return adminFail(res, v.error);
@@ -1437,7 +1460,7 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
       res.json({ success: true, tier: r.rows[0] });
     } catch (err) { serverError(res, err); }
   });
-  app.post('/api/admin/tickets/tiers/:id/delete', requireAdmin, adminJson, async (req, res) => {
+  app.post('/api/admin/tickets/tiers/:id/delete', requireRole('OWNER', 'ADMIN'), adminJson, async (req, res) => {
     try {
       const r = await pool.query('DELETE FROM ticket_tiers WHERE id = $1', [idOf(req.params.id)]);
       if (!r.rowCount) return adminFail(res, 'Not found.', 404);
@@ -1446,7 +1469,7 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
   });
 
   // The menus: bottles, chaser groups and chasers, shared by every event, and the three bottle tier names.
-  app.get('/api/admin/tickets/menus', requireAdmin, async (req, res) => {
+  app.get('/api/admin/tickets/menus', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     try {
       const [b, g, c, labels] = await Promise.all([pool.query('SELECT * FROM bottles ORDER BY tier, sort_order, id'), pool.query('SELECT * FROM chaser_groups ORDER BY sort_order, id'),
         pool.query('SELECT * FROM chasers ORDER BY sort_order, id'), tierLabels(pool)]);
@@ -1480,7 +1503,7 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
     } }
   };
   for (const [path, m] of Object.entries(MENU)) {
-    app.post(`/api/admin/tickets/${path}`, requireAdmin, adminJson, async (req, res) => {
+    app.post(`/api/admin/tickets/${path}`, requireRole('OWNER', 'ADMIN'), adminJson, async (req, res) => {
       const v = m.check(req.body || {}, true);
       if (v.error) return adminFail(res, v.error);
       try {
@@ -1492,7 +1515,7 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
         serverError(res, err);
       }
     });
-    app.post(`/api/admin/tickets/${path}/:id`, requireAdmin, adminJson, async (req, res) => {
+    app.post(`/api/admin/tickets/${path}/:id`, requireRole('OWNER', 'ADMIN'), adminJson, async (req, res) => {
       const v = m.check(req.body || {}, false);
       if (v.error) return adminFail(res, v.error);
       if (!Object.keys(v.fields).length) return adminFail(res, 'Nothing to change.');
@@ -1503,7 +1526,7 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
       } catch (err) { serverError(res, err); }
     });
     // Orders keep a copy of what was picked (names and prices), so deleting a menu item never changes an order.
-    app.post(`/api/admin/tickets/${path}/:id/delete`, requireAdmin, adminJson, async (req, res) => {
+    app.post(`/api/admin/tickets/${path}/:id/delete`, requireRole('OWNER', 'ADMIN'), adminJson, async (req, res) => {
       try {
         const r = await pool.query(`DELETE FROM ${m.table} WHERE id = $1`, [idOf(req.params.id)]);
         if (!r.rowCount) return adminFail(res, 'Not found.', 404);
@@ -1511,7 +1534,7 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
       } catch (err) { serverError(res, err); }
     });
   }
-  app.post('/api/admin/tickets/tier-labels', requireAdmin, adminJson, async (req, res) => {
+  app.post('/api/admin/tickets/tier-labels', requireRole('OWNER', 'ADMIN'), adminJson, async (req, res) => {
     const l = Array.isArray(req.body?.labels) ? req.body.labels.map((x) => text(x, 30)) : [];
     if (l.length !== 3 || l.some((x) => !x)) return adminFail(res, 'Name all three tiers.');
     try {
@@ -1521,10 +1544,10 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
   });
 
   // Ticket terms.
-  app.get('/api/admin/tickets/terms', requireAdmin, async (req, res) => {
+  app.get('/api/admin/tickets/terms', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     try { const s = await siteInfo(pool); res.json({ terms: s.terms, terms_updated_at: s.terms_updated_at, default_terms: DEFAULT_TICKET_TERMS }); } catch (err) { serverError(res, err); }
   });
-  app.post('/api/admin/tickets/terms', requireAdmin, adminJson, async (req, res) => {
+  app.post('/api/admin/tickets/terms', requireRole('OWNER', 'ADMIN'), adminJson, async (req, res) => {
     const t = text(req.body?.terms, 20000);
     if (!t) return adminFail(res, "The terms can't be empty. Use the original draft to start again.");
     try {
@@ -1542,7 +1565,7 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
   // deposit back too). If PayPal refuses one, the order stays as it is and the captures already refunded are recorded,
   // so trying again carries on. Money paid by hand is listed for the organizers to give back themselves. Then the
   // order is REFUNDED and its tickets stop working.
-  app.post('/api/admin/tickets/orders/:id/refund', requireAdmin, adminJson, async (req, res) => {
+  app.post('/api/admin/tickets/orders/:id/refund', requireRole('OWNER', 'ADMIN'), adminJson, async (req, res) => {
     try {
       const o = (await pool.query('SELECT * FROM ticket_orders WHERE id = $1', [idOf(req.params.id)])).rows[0];
       if (!o || !['PAID', 'DEPOSIT_PAID'].includes(o.status)) return adminFail(res, 'Only a paid order (or a paid deposit) can be refunded.');
@@ -1569,14 +1592,15 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
     } catch (err) { serverError(res, err); }
   });
   // The balance paid by hand (cash, bank transfer): the order is PAID and its tickets are issued and emailed.
-  app.post('/api/admin/tickets/orders/:id/mark-paid', requireAdmin, adminJson, async (req, res) => {
+  app.post('/api/admin/tickets/orders/:id/mark-paid', requireRole('OWNER', 'ADMIN'), adminJson, async (req, res) => {
     let client, state;
     try {
       client = await pool.connect();
       await client.query('BEGIN');
       const o = (await client.query('SELECT * FROM ticket_orders WHERE id = $1 FOR UPDATE', [idOf(req.params.id)])).rows[0];
       if (!o || o.status !== 'DEPOSIT_PAID') { await client.query('ROLLBACK'); return adminFail(res, 'Only an order with its deposit paid has a balance to mark paid.'); }
-      state = await recordPayment(client, o, { kind: 'BALANCE', via: 'MANUAL', cents: o.total_cents - o.paid_cents, note: text(req.body?.note, 200) });
+      state = await recordPayment(client, o, { kind: 'BALANCE', via: 'MANUAL', cents: o.total_cents - o.paid_cents, note: text(req.body?.note, 200),
+        byName: req.admin?.name || null, byId: req.admin?.id || null });
       await client.query('COMMIT');
       await afterPaid(state, o.ref);
       res.json({ success: true, status: 'PAID' });
@@ -1586,7 +1610,7 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
     } finally { client?.release(); }
   });
   // A new balance deadline (in the future, and not after the event starts).
-  app.post('/api/admin/tickets/orders/:id/balance-due', requireAdmin, adminJson, async (req, res) => {
+  app.post('/api/admin/tickets/orders/:id/balance-due', requireRole('OWNER', 'ADMIN'), adminJson, async (req, res) => {
     try {
       const o = (await pool.query('SELECT * FROM ticket_orders WHERE id = $1', [idOf(req.params.id)])).rows[0];
       if (!o || o.status !== 'DEPOSIT_PAID') return adminFail(res, 'Only an order with a balance to pay has a deadline.');
@@ -1601,7 +1625,7 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
       res.json({ success: true, balance_due_at: r.rows[0].balance_due_at });
     } catch (err) { serverError(res, err); }
   });
-  app.post('/api/admin/tickets/run-jobs', requireAdmin, adminJson, async (req, res) => {
+  app.post('/api/admin/tickets/run-jobs', requireRole('OWNER', 'ADMIN'), adminJson, async (req, res) => {
     try { res.json({ success: true, ...(await sweep()) }); } catch (err) { serverError(res, err); }
   });
 
@@ -1634,10 +1658,10 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
     return '"' + s.replace(/"/g, '""') + '"';
   }).join(',')).join('\n');
   const sendCsv = (res, name, rows) => res.type('text/csv; charset=utf-8').set('Content-Disposition', `attachment; filename="${name}"`).send(csv(rows));
-  app.get('/api/admin/tickets/events/:id/bar-list', requireAdmin, async (req, res) => {
+  app.get('/api/admin/tickets/events/:id/bar-list', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     try { const ev = await eventRow(idOf(req.params.id)); if (!ev) return adminFail(res, 'Event not found.', 404); res.json({ event: { id: ev.id, name: ev.name, when: whenRange(ev.starts_at, ev.ends_at) }, ...(await barList(ev.id)) }); } catch (err) { serverError(res, err); }
   });
-  app.get('/api/admin/tickets/events/:id/bar-list.csv', requireAdmin, async (req, res) => {
+  app.get('/api/admin/tickets/events/:id/bar-list.csv', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     try {
       const ev = await eventRow(idOf(req.params.id)); if (!ev) return adminFail(res, 'Event not found.', 404);
       const b = await barList(ev.id);
@@ -1651,14 +1675,14 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
       sendCsv(res, `bar-list-${ev.slug}.csv`, rows);
     } catch (err) { serverError(res, err); }
   });
-  app.get('/admin/tickets/events/:id/bar-list', requireAdmin, async (req, res) => {
+  app.get('/admin/tickets/events/:id/bar-list', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     try {
       const ev = await eventRow(idOf(req.params.id)); if (!ev) return res.status(404).send('Event not found.');
       res.type('html').send(barListPage({ event: { name: ev.name, when: whenRange(ev.starts_at, ev.ends_at), id: ev.id }, ...(await barList(ev.id)) }));
     } catch (err) { serverError(res, err); }
   });
   // The door list: every ticket of the event, for a backup list on paper.
-  app.get('/api/admin/tickets/events/:id/door.csv', requireAdmin, async (req, res) => {
+  app.get('/api/admin/tickets/events/:id/door.csv', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     try {
       const ev = await eventRow(idOf(req.params.id)); if (!ev) return adminFail(res, 'Event not found.', 404);
       const r = await pool.query(
@@ -1669,7 +1693,7 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
     } catch (err) { serverError(res, err); }
   });
   // The door log of one ticket event (the Command Center's Door tab and /admin/tickets).
-  app.get('/api/admin/ticket-checkins', requireAdmin, async (req, res) => {
+  app.get('/api/admin/ticket-checkins', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     try {
       const r = await pool.query(
         `SELECT c.id, c.kind, c.device, c.scanned_at, c.synced_at, t.ref, t.kind AS ticket_kind, t.label, o.ref AS order_ref, o.event_id
@@ -1679,7 +1703,7 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
     } catch (err) { serverError(res, err); }
   });
   // Everything of the ticket site, for the Reset page's "Download a copy first".
-  app.get('/api/admin/tickets/export', requireAdmin, async (req, res) => {
+  app.get('/api/admin/tickets/export', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     try {
       const q = (t) => pool.query(`SELECT * FROM ${t} ORDER BY id`).then((r) => r.rows);
       const [events, products, tiers, orders, items, payments, tks, checkins, bottles, groups, chasers] = await Promise.all(
@@ -1688,7 +1712,7 @@ export function registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, r
     } catch (err) { serverError(res, err); }
   });
   // For the Command Center: the ticket site's lock and the tickets paid for today (Antigua's day).
-  app.get('/api/admin/tickets/summary', requireAdmin, async (req, res) => {
+  app.get('/api/admin/tickets/summary', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     try {
       const [locked, r] = await Promise.all([lock.lockedNow(), pool.query(
         `SELECT COALESCE(SUM(i.qty * i.tickets_included), 0)::int AS sold FROM ticket_order_items i JOIN ticket_orders o ON o.id = i.order_id

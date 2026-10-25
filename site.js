@@ -155,7 +155,7 @@ function parseSponsors(raw) {
   return list.slice(0, MAX_SPONSORS).map((s, i) => checkSponsor(s, i + 1).sponsor).filter(Boolean);
 }
 
-export function registerSite({ app, pool, express, requireAdmin, lock, FRONTEND_URL = process.env.FRONTEND_URL || 'https://controlfrontend.onrender.com' }) {
+export function registerSite({ app, pool, express, requireRole, lock, FRONTEND_URL = process.env.FRONTEND_URL || 'https://controlfrontend.onrender.com' }) {
   const json = express.json({ limit: '100kb' }); // the terms and FAQ can be longer than the app-wide 10kb limit
   const KEYS = ['contact_whatsapp', 'contact_instagram', 'contact_email', 'terms', 'terms_updated_at', 'faq', 'sponsors'];
   // The admin page previews logos like "sponsors/acme.png" from the guest site, where they're served.
@@ -193,12 +193,12 @@ export function registerSite({ app, pool, express, requireAdmin, lock, FRONTEND_
     } catch (err) { fail(res, err); }
   });
 
-  app.get('/api/admin/site', requireAdmin, async (req, res) => {
+  app.get('/api/admin/site', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     try { res.json({ ...(await getSite()), default_terms: DEFAULT_TERMS, default_faq: DEFAULT_FAQ }); } catch (err) { fail(res, err); }
   });
 
   // Saves any of { contact: { whatsapp, instagram, email } }, { terms }, { faq } and { sponsors: [{ name, logo, url }] }.
-  app.post('/api/admin/site', requireAdmin, json, async (req, res) => {
+  app.post('/api/admin/site', requireRole('OWNER', 'ADMIN'), json, async (req, res) => {
     const b = req.body || {};
     const bad = (error) => res.status(400).json({ error });
     try {
@@ -752,7 +752,7 @@ $('sp-save').addEventListener('click', function () {
 });
 </script></body></html>`;
 
-  app.get('/admin/site', requireAdmin, (req, res) => res.type('html').send(PAGE));
+  app.get('/admin/site', requireRole('OWNER', 'ADMIN'), (req, res) => res.type('html').send(PAGE));
 
   return { refresh };
 }

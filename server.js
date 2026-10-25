@@ -18,6 +18,9 @@ import { CUR, INVITES_LEFT_SQL, migrateEvents, registerEvents } from './events.j
 import { registerPromoters } from './promoter.js';
 import { registerTickets, ensureTicketSchema, createTicketDoor, TICKETS_URL } from './tickets.js';
 import { WM_LITE, WM_PNG } from './brand.js';
+import { createAuth, ensureAuthSchema } from './auth.js';
+import { createAudit, ensureAuditSchema } from './audit.js';
+import { createAdminApp, ensureAppSchema } from './adminapp.js';
 
 const { Pool } = pkg;
 // DATE columns (guests.birth_date) come back as their 'YYYY-MM-DD' text. pg would otherwise turn them into a JS Date
@@ -208,37 +211,6 @@ const requireAuth = (req, res, next) => {
   req.userEmail = email;
   next();
 };
-// A browser sends the admin's saved Basic login with any request to this host, including a form another site posts
-// here. So a change made with Basic auth must come from our own admin pages: browsers mark those same-origin
-// (Sec-Fetch-Site, or a matching Origin on older ones), and they send JSON, which a plain form can't.
-const crossSite = (req) => {
-  const site = req.get('sec-fetch-site');
-  if (site) return site !== 'same-origin';
-  const origin = req.get('origin');
-  if (origin) {
-    try { if (new URL(origin).host !== req.get('host')) return true; } catch { return true; }
-  }
-  return !req.is('application/json');
-};
-// Accepts either an x-admin-key header or HTTP Basic auth (password = ADMIN_KEY).
-const requireAdmin = (req, res, next) => {
-  let key = req.get('x-admin-key');
-  const basic = /^Basic (.+)$/.exec(req.get('authorization') || '');
-  const viaBasic = !key && !!basic;
-  if (viaBasic) {
-    const decoded = Buffer.from(basic[1], 'base64').toString();
-    key = decoded.slice(decoded.indexOf(':') + 1);
-  }
-  if (key && safeEqual(key, ADMIN_KEY)) {
-    if (viaBasic && !['GET', 'HEAD', 'OPTIONS'].includes(req.method) && crossSite(req)) {
-      return res.status(403).json({ error: 'Make changes from the admin pages.' });
-    }
-    return next();
-  }
-  res.set('WWW-Authenticate', 'Basic realm="CONTROL Admin"');
-  res.status(401).json({ error: 'Unauthorized' });
-};
-
 // The answer to a sign-up request that's still waiting for approval, or was declined.
 const notApproved = (approval) => ({
   error: approval === 'DECLINED' ? "Your request to join wasn't approved." : "You're not approved yet. We'll email you when you are.",
@@ -271,6 +243,22 @@ const rateLimit = (max, windowMs, keyOf = (req) => req.ip) => {
   };
 };
 
+// The backend's own address, for links in emails (pass images, the admin's "Review requests" button, sign-in alerts).
+// '' if unknown.
+const PUBLIC_URL = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
+const ADMIN_EMAIL = normalizeEmail(process.env.ADMIN_EMAIL); // optional: gets refund requests and new sign-up requests
+
+// ---------- Admin accounts, roles and the audit log (see auth.js and audit.js) ----------
+// requireRole(...roles) guards every admin page and API route below and in each module; every admin write it lets
+// through is written to the audit log. mail is set up further down, so it's reached through a wrapper.
+const audit = createAudit({ pool });
+const auth = createAuth({ pool, TOKEN_SECRET, ADMIN_KEY, safeEqual, mail: { send: (...a) => mail.send(...a) }, renderEmail, audit, rateLimit, PUBLIC_URL });
+const { requireRole } = auth;
+// The admin app's alerts and push notifications (see adminapp.js). notify() is called where things happen.
+const adminApp = createAdminApp({ pool, ADMIN_EMAIL, PUBLIC_URL });
+const { notify } = adminApp;
+const firstName = (name) => String(name || '').trim().split(/\s+/)[0] || '';
+
 // ---------- App ----------
 const app = express();
 app.set('trust proxy', 1); // Render sits behind a proxy
@@ -289,45 +277,53 @@ app.use(lock.guard);
 // a phone coming back online can upload a batch of offline check-ins at once.
 // The ticket site's side of the door (tickets.js): ticket events, their lists and check-ins.
 const ticketDoor = createTicketDoor({ pool, TOKEN_SECRET });
-registerDoor({ app, pool, express, ADMIN_KEY, TOKEN_SECRET, safeEqual, rateLimit, requireAdmin, ticketDoor });
+registerDoor({ app, pool, express, ADMIN_KEY, TOKEN_SECRET, safeEqual, rateLimit, requireRole, ticketDoor, auth, onRefused: adminApp.doorRefused });
 // Contact details and terms (see site.js). Also before the 10kb limit: the terms can be longer than that.
-const site = registerSite({ app, pool, express, requireAdmin, lock });
+const site = registerSite({ app, pool, express, requireRole, lock });
 // The ticket site (see tickets.js): its own lock (registered here, so it guards /api/tickets/* before any route), its API
 // and /admin/tickets. Before the 10kb limit too: its routes bring their own body parsers. mail is set up further down,
 // so it's reached through a wrapper.
-const tickets = registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, requireAdmin, rateLimit, renderEmail,
+const tickets = registerTickets({ app, pool, express, TOKEN_SECRET, safeEqual, requireRole, rateLimit, renderEmail, notify,
   mail: { send: (...a) => mail.send(...a) }, normalizeEmail, isValidEmail, cleanName, cleanBirthDate,
   SITE_URL: process.env.FRONTEND_URL ? FRONTEND_URL : 'https://ondroad.xyz', PUBLIC_URL: (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '') });
 // The emails' watermark tile (see brand.js and emails.js).
 app.get('/brand/wm.png', (req, res) => res.type('png').set('Cache-Control', 'public, max-age=604800').send(WM_PNG));
 app.use(express.json({ limit: '10kb' }));
 // The site lock's admin routes: GET/POST /api/admin/site-lock and POST /api/admin/site-lock/preview-reset.
-lock.register({ app, requireAdmin });
+lock.register({ app, requireRole });
+// Sign-in, setup, recovery, your account and the team (auth.js); the audit log page (audit.js); the admin app, its
+// manifest, service worker and push (adminapp.js).
+auth.register({ app, express });
+audit.register({ app, requireRole });
+adminApp.register({ app, requireRole, publicRoute: auth.publicRoute, lock, ticketsLock: tickets.lock, ticketDoor, express });
 
 // Payment instructions, pay-by deadline, auto-expiry and reminders (see payments.js).
 // Registered before the other routes on purpose: it replaces /api/my-order below.
 // The same job runs the ticket site's checks (holds, PayPal, balance reminders and deadlines; see tickets.js).
-const mail = registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, TOKEN_SECRET, requireAuth, requireAdmin, escapeHtml,
+const mail = registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, TOKEN_SECRET, requireAuth, requireRole, escapeHtml,
   beforeExpire: async (payDays) => {
     await paypal.syncDue(payDays).catch((err) => console.error('PayPal check error:', err.message));
     await tickets.sweep().catch((err) => console.error('Ticket job error:', err.message));
   } });
 // Event details in guests' accounts and email updates to groups of guests (see event.js).
-registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, requireAuth, requireAdmin, mail });
+registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, requireAuth, requireRole, mail });
 // Paying online with PayPal (see paypal.js). Off until the PAYPAL_* settings are added.
-const paypal = registerPayPal({ app, pool, requireAuth, requireApproved, requireAdmin, rateLimit, perUser,
-  onPaid: (o) => sendPaidEmail(o.guest_email, o.package_name, o.reference_code) });
+const paypal = registerPayPal({ app, pool, requireAuth, requireApproved, requireRole, rateLimit, perUser,
+  onPaid: (o) => {
+    sendPaidEmail(o.guest_email, o.package_name, o.reference_code);
+    notify('sales', { title: 'Pass sold', body: `${o.package_name} · paid online · ${money(o.price_cents, o.currency)}`, url: '/admin/app#home' });
+  } });
 // Price tiers and promo codes (see pricing.js). A code that makes an unpaid reservation free confirms it straight away.
-registerPricing({ app, pool, requireAuth, requireApproved, requireAdmin, rateLimit, perUser,
-  onComp: (o) => sendPaidEmail(o.guest_email, o.package_name, o.reference_code, { free: true }) });
+registerPricing({ app, pool, requireAuth, requireApproved, requireRole, rateLimit, perUser,
+  onComp: (o) => {
+    notify('sales', { title: 'Free pass claimed', body: `${o.package_name} · with a code`, url: '/admin/app#home' });
+    return sendPaidEmail(o.guest_email, o.package_name, o.reference_code, { free: true });
+  } });
 // Size lock and package pickup tracking (see pickup.js).
-registerPickup({ app, pool, requireAdmin });
+registerPickup({ app, pool, requireRole });
 // Clearing guest data (or everything) to start over (see reset.js). A full reset also clears the email footer's contact
 // details, and deletes the site lock settings, so the site is locked again (the lock's cache is cleared too).
-registerReset({ app, pool, requireAdmin, rateLimit, afterReset: () => { lock.forget(); tickets.lock.forget(); return site.refresh(); } });
-const ADMIN_EMAIL = normalizeEmail(process.env.ADMIN_EMAIL); // optional: gets refund requests and new sign-up requests
-// The backend's own address, for links in emails (pass images, the admin's "Review requests" button). '' if unknown.
-const PUBLIC_URL = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
+registerReset({ app, pool, requireRole, rateLimit, afterReset: () => { lock.forget(); tickets.lock.forget(); return site.refresh(); } });
 // Where the "You're approved" email sends guests.
 const SITE_URL = process.env.FRONTEND_URL ? FRONTEND_URL : 'https://ondroad.xyz';
 
@@ -509,6 +505,11 @@ async function ensureSchema() {
   await migrateEvents(pool);
   // The ticket site's tables (see tickets.js).
   await ensureTicketSchema(pool);
+  // Admin accounts and sessions (auth.js), the audit log (audit.js), push subscriptions, alerts and the door's refused
+  // scans (adminapp.js).
+  await ensureAuthSchema(pool);
+  await ensureAuditSchema(pool);
+  await ensureAppSchema(pool);
   // Each order stores what it costs. Orders from before that keep the package price.
   await pool.query(
     `UPDATE orders o SET list_cents = p.price_cents, amount_cents = p.price_cents, currency = p.currency
@@ -880,12 +881,15 @@ app.post('/api/invite/accept', rateLimit(40, 15 * 60 * 1000), async (req, res) =
     client?.release();
   }
   res.json({ success: true, token: createToken(email), user: { email, approval: guest?.approval || 'APPROVED' } });
-  // Sent after responding so a slow email never holds up the guest.
-  if (guest && guest.approval === 'PENDING') sendRequestEmail(guest);
+  // Sent after responding so a slow email never holds up the guest. The admin app's alert carries only the first name.
+  if (guest && guest.approval === 'PENDING') {
+    sendRequestEmail(guest);
+    notify('requests', { title: `New request: ${firstName(guest.full_name) || 'someone'}`, body: 'Waiting for your approval.', url: '/admin/app#requests' });
+  }
 });
 
 // --- ADMIN: create an invite without using anyone's allowance; returns the link ---
-app.post('/api/admin/create-invite', requireAdmin, async (req, res) => {
+app.post('/api/admin/create-invite', requireRole('OWNER', 'ADMIN'), async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   const note = typeof req.body?.note === 'string' ? req.body.note.trim().slice(0, 300) : '';
   if (!isValidEmail(email)) return res.status(400).json({ error: 'A valid email is required.' });
@@ -937,7 +941,7 @@ app.get('/api/packages', async (req, res) => {
 });
 
 // The current event's packages (?event=all: every event's, for the reset page's copy).
-app.get('/api/admin/packages', requireAdmin, async (req, res) => {
+app.get('/api/admin/packages', requireRole('OWNER', 'ADMIN'), async (req, res) => {
   try {
     const all = req.query.event === 'all';
     const r = await pool.query(
@@ -984,7 +988,7 @@ function packageInput(b) {
   return { fields: out };
 }
 
-app.post('/api/admin/packages', requireAdmin, async (req, res) => {
+app.post('/api/admin/packages', requireRole('OWNER', 'ADMIN'), async (req, res) => {
   const { error, fields: f } = packageInput({ ...req.body, price_cents: req.body?.price_cents ?? '' });
   if (error || !f.name) return res.status(400).json({ error: error || 'Give the package a name.' });
   const currency = ['XCD', 'USD'].includes(req.body?.currency) ? req.body.currency : 'XCD';
@@ -1000,7 +1004,7 @@ app.post('/api/admin/packages', requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/api/admin/packages/:id', requireAdmin, async (req, res) => {
+app.post('/api/admin/packages/:id', requireRole('OWNER', 'ADMIN'), async (req, res) => {
   const id = idOf(req.params.id);
   const { error, fields: f } = packageInput(req.body || {});
   if (error) return res.status(400).json({ error });
@@ -1017,7 +1021,7 @@ app.post('/api/admin/packages/:id', requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/api/admin/packages/:id/delete', requireAdmin, async (req, res) => {
+app.post('/api/admin/packages/:id/delete', requireRole('OWNER', 'ADMIN'), async (req, res) => {
   const id = idOf(req.params.id);
   if (!id) return res.status(400).json({ error: 'Invalid package.' });
   try {
@@ -1161,6 +1165,7 @@ app.post('/api/orders', requireAuth, rateLimit(10, 60 * 60 * 1000, perUser), rat
     // Sent after responding so a slow email never holds up the guest.
     if (free) {
       sendPaidEmail(req.userEmail, p.name, ref, { free: true });
+      notify('sales', { title: 'Free pass claimed', body: `${p.name}${promo ? ' · with a code' : ''}`, url: '/admin/app#home' });
     } else {
       sendOrderReceivedEmail(req.userEmail, {
         package_name: p.name, reference_code: ref, list_cents: list, discount_cents: discount, amount_cents: amount,
@@ -1243,6 +1248,7 @@ app.post('/api/orders/request-refund', requireAuth, rateLimit(5, 60 * 60 * 1000,
       cta: { text: 'Open my account', url: FRONTEND_URL },
       fine: 'Changed your mind? You can withdraw the request from your account.'
     }));
+    notify('refunds', { title: o.free ? 'Cancellation requested' : 'Refund requested', body: `${o.package_name} · ${o.reference_code}`, url: '/admin#orders' });
     if (ADMIN_EMAIL) {
       mail.send(ADMIN_EMAIL, `${o.free ? 'Cancellation' : 'Refund'} requested: ${o.reference_code}`, renderEmail({
         tone: 'warn', tag: o.free ? 'Cancellation request' : 'Refund request', title: 'Action needed',
@@ -1271,7 +1277,7 @@ app.post('/api/orders/withdraw-refund', requireAuth, async (req, res) => {
 });
 
 // The current event's orders; ?event=<id> for another event's, ?event=all for every event's (the reset page's copy).
-app.get('/api/admin/orders', requireAdmin, async (req, res) => {
+app.get('/api/admin/orders', requireRole('OWNER', 'ADMIN'), async (req, res) => {
   const all = req.query.event === 'all';
   const id = /^\d{1,9}$/.test(String(req.query.event || '')) ? Number(req.query.event) : null;
   try {
@@ -1279,7 +1285,7 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
       `SELECT o.id, o.package_id, o.guest_email, o.status, o.reference_code, o.created_at, o.paid_at,
               o.cancel_requested_at, o.cancel_reason, o.refunded_at, o.checked_in_at, o.checked_in_by, o.size,
               o.paid_via, o.paypal_status, o.paypal_amount, o.paypal_refund_id, o.tier_name, o.promo_code,
-              o.discount_cents, o.picked_up_at, o.picked_up_by,
+              o.discount_cents, o.picked_up_at, o.picked_up_by, o.marked_paid_by,
               COALESCE(o.amount_cents, p.price_cents) AS amount_cents, COALESCE(o.list_cents, p.price_cents) AS list_cents,
               COALESCE(o.amount_cents, p.price_cents) AS price_cents, COALESCE(o.currency, p.currency) AS currency,
               NOT EXISTS (SELECT 1 FROM guests g WHERE LOWER(g.email) = LOWER(o.guest_email)) AS removed_guest,
@@ -1334,12 +1340,13 @@ async function sendPaidEmail(to, packageName, ref, { free } = {}) {
   }));
 }
 
-app.post('/api/admin/orders/:id/mark-paid', requireAdmin, async (req, res) => {
+app.post('/api/admin/orders/:id/mark-paid', requireRole('OWNER', 'ADMIN'), async (req, res) => {
   const id = idOf(req.params.id);
   try {
     const r = await pool.query(
-      `UPDATE orders SET status = 'PAID', paid_at = NOW(), paid_via = 'MANUAL' WHERE id = $1 AND status = 'RESERVED' AND event_id = ${CUR}
-       RETURNING guest_email, reference_code, (SELECT name FROM packages WHERE id = orders.package_id) AS package_name`, [id]);
+      `UPDATE orders SET status = 'PAID', paid_at = NOW(), paid_via = 'MANUAL', marked_paid_by = $2, marked_paid_by_id = $3
+       WHERE id = $1 AND status = 'RESERVED' AND event_id = ${CUR}
+       RETURNING guest_email, reference_code, (SELECT name FROM packages WHERE id = orders.package_id) AS package_name`, [id, req.admin.name, req.admin.id]);
     if (!r.rowCount) return res.status(400).json({ error: 'Order not found or already resolved.' });
     const { guest_email, reference_code, package_name } = r.rows[0];
     const emailError = await sendPaidEmail(guest_email, package_name, reference_code);
@@ -1350,7 +1357,7 @@ app.post('/api/admin/orders/:id/mark-paid', requireAdmin, async (req, res) => {
 });
 
 // Cancels an unpaid reservation. Paid orders go through approve-refund instead.
-app.post('/api/admin/orders/:id/cancel', requireAdmin, async (req, res) => {
+app.post('/api/admin/orders/:id/cancel', requireRole('OWNER', 'ADMIN'), async (req, res) => {
   const id = idOf(req.params.id);
   try {
     const r = await pool.query(
@@ -1373,7 +1380,7 @@ app.post('/api/admin/orders/:id/cancel', requireAdmin, async (req, res) => {
 
 // Cancels a paid order and records the refund. The guest's pass stops working immediately.
 // A PayPal payment is refunded through PayPal first; if PayPal refuses, nothing changes here.
-app.post('/api/admin/orders/:id/approve-refund', requireAdmin, async (req, res) => {
+app.post('/api/admin/orders/:id/approve-refund', requireRole('OWNER', 'ADMIN'), async (req, res) => {
   const id = idOf(req.params.id);
   try {
     const cur = await pool.query(
@@ -1422,7 +1429,7 @@ app.post('/api/admin/orders/:id/approve-refund', requireAdmin, async (req, res) 
 // ---------- Admin ----------
 // Every guest with their age today (Antigua), who invited them and the invite's note, and their invites for the
 // current event (invites_left, invite_bonus and invites_sent), in one query.
-app.get('/api/admin/guests', requireAdmin, async (req, res) => {
+app.get('/api/admin/guests', requireRole('OWNER', 'ADMIN'), async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT g.*, date_part('year', age((NOW() AT TIME ZONE 'America/Antigua')::date, g.birth_date))::int AS age,
@@ -1440,7 +1447,7 @@ app.get('/api/admin/guests', requireAdmin, async (req, res) => {
 
 // Approves a sign-up request, pending or declined, and emails the guest. A second click finds nothing left to
 // approve, so the email goes once.
-app.post('/api/admin/guests/approve', requireAdmin, async (req, res) => {
+app.post('/api/admin/guests/approve', requireRole('OWNER', 'ADMIN'), async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   if (!isValidEmail(email)) return res.status(400).json({ error: 'A valid email is required.' });
   try {
@@ -1467,7 +1474,7 @@ app.post('/api/admin/guests/approve', requireAdmin, async (req, res) => {
 });
 
 // Declines a pending request. Nothing is sent, the invite stays used, and the inviter doesn't get it back.
-app.post('/api/admin/guests/decline', requireAdmin, async (req, res) => {
+app.post('/api/admin/guests/decline', requireRole('OWNER', 'ADMIN'), async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   if (!isValidEmail(email)) return res.status(400).json({ error: 'A valid email is required.' });
   try {
@@ -1486,7 +1493,7 @@ app.post('/api/admin/guests/decline', requireAdmin, async (req, res) => {
 });
 
 // The admin can always change a guest's name, date of birth and Instagram, paid or not. '' clears a field.
-app.post('/api/admin/guests/profile', requireAdmin, async (req, res) => {
+app.post('/api/admin/guests/profile', requireRole('OWNER', 'ADMIN'), async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   if (!isValidEmail(email)) return res.status(400).json({ error: 'A valid email is required.' });
   const { fields, error } = profileInput(req.body || {}, 'admin');
@@ -1511,7 +1518,7 @@ const setInviteBonus = (db, email, bonus) => db.query(
    ON CONFLICT (email, event_id) DO UPDATE SET invite_bonus = EXCLUDED.invite_bonus`, [email, bonus]);
 
 // Back to the event's standard allowance: no bonus.
-app.post('/api/admin/reset-invites', requireAdmin, async (req, res) => {
+app.post('/api/admin/reset-invites', requireRole('OWNER', 'ADMIN'), async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   if (!isValidEmail(email)) return res.status(400).json({ error: 'A valid email is required.' });
   try {
@@ -1522,7 +1529,7 @@ app.post('/api/admin/reset-invites', requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/api/admin/add-guest', requireAdmin, async (req, res) => {
+app.post('/api/admin/add-guest', requireRole('OWNER', 'ADMIN'), async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   if (!isValidEmail(email)) return res.status(400).json({ error: 'A valid email is required.' });
   try {
@@ -1540,7 +1547,7 @@ app.post('/api/admin/add-guest', requireAdmin, async (req, res) => {
 
 // The current event's invites, plus pending ones from past events (their links still work, so they can be revoked).
 // ?event=all: every invite. promoter_name is set on a promoter's invite (inviter_email 'PROMOTER').
-app.get('/api/admin/invites', requireAdmin, async (req, res) => {
+app.get('/api/admin/invites', requireRole('OWNER', 'ADMIN'), async (req, res) => {
   const all = req.query.event === 'all';
   try {
     const r = await pool.query(
@@ -1554,7 +1561,7 @@ app.get('/api/admin/invites', requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/api/admin/revoke-invite', requireAdmin, async (req, res) => {
+app.post('/api/admin/revoke-invite', requireRole('OWNER', 'ADMIN'), async (req, res) => {
   const id = idOf(req.body?.id);
   if (!id) return res.status(400).json({ error: 'Invalid invite.' });
   let client;
@@ -1579,7 +1586,7 @@ app.post('/api/admin/revoke-invite', requireAdmin, async (req, res) => {
 
 // How many invites a guest can still send for the current event: stored as their bonus, so that the event's invites
 // per guest + bonus - invites sent = count.
-app.post('/api/admin/set-invites', requireAdmin, async (req, res) => {
+app.post('/api/admin/set-invites', requireRole('OWNER', 'ADMIN'), async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   const count = parseInt(req.body?.count, 10);
   if (!isValidEmail(email) || !(count >= 0 && count <= 20)) return res.status(400).json({ error: 'Invalid email or count (0-20).' });
@@ -1606,7 +1613,7 @@ app.post('/api/admin/set-invites', requireAdmin, async (req, res) => {
     client?.release();
   }
 });
-app.post('/api/admin/remove-guest', requireAdmin, async (req, res) => {
+app.post('/api/admin/remove-guest', requireRole('OWNER', 'ADMIN'), async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   if (!isValidEmail(email)) return res.status(400).json({ error: 'A valid email is required.' });
   // A paid guest must be refunded first, or their pass would keep working at the door.
@@ -1959,6 +1966,11 @@ dialog .btn.danger-solid:hover { background: #941c15; border-color: #941c15; }
     <a class="top-link" href="/admin/event">Event &amp; messages</a>
     <a class="top-link" href="/admin/site">Site, contact, terms &amp; FAQ</a>
     <a class="top-link" href="/admin/tickets">Tickets &amp; tables</a>
+    <a class="top-link" href="/admin/audit">Audit log</a>
+    <a class="top-link owner-only" href="/admin/team">Team</a>
+    <a class="top-link" href="/admin/app">App</a>
+    <a class="top-link" href="/admin/account" id="nav-account">Your account</a>
+    <a class="top-link" href="/admin/login" data-logout>Log out</a>
     <a class="top-link" href="${FRONTEND_URL}" target="_blank" rel="noopener">View site &#8599;</a>
     <span id="clock" class="clock"></span>
   </nav>
@@ -2078,7 +2090,7 @@ dialog .btn.danger-solid:hover { background: #941c15; border-color: #941c15; }
     <div class="scroll"><table class="cards"><thead><tr><th>Guest</th><th>Event</th><th>Package</th><th>Time</th><th>Phone</th><th>Reference</th></tr></thead><tbody id="doorlist"></tbody></table></div>
   </section>
 
-  <footer class="danger-zone">
+  <footer class="danger-zone owner-only">
     <span>Starting over after testing?</span>
     <a class="btn small danger" id="reset-link" href="/admin/reset">Reset data&hellip;</a>
   </footer>
@@ -2608,6 +2620,7 @@ function renderOrders() {
       st.appendChild(el('span', o.paid_via === 'COMP' ? 'Confirmed ' + shortDate(o.paid_at)
         : 'Paid ' + (o.paid_via === 'PAYPAL' ? 'with PayPal (USD ' + o.paypal_amount + ') ' : '') + shortDate(o.paid_at), 'subtext'));
     }
+    if (o.marked_paid_by && (o.status === 'PAID' || o.refunded_at)) st.appendChild(el('span', 'Marked paid by ' + o.marked_paid_by, 'subtext marked-by'));
     if (o.picked_up_at) st.appendChild(el('span', 'Package collected ' + timeOf(o.picked_up_at) + (o.picked_up_by ? ' · ' + o.picked_up_by : ''), 'subtext'));
     if (o.checked_in_at) st.appendChild(el('span', 'Checked in ' + timeOf(o.checked_in_at) + (o.checked_in_by ? ' · ' + o.checked_in_by : ''), 'subtext'));
     td(tr, o.reference_code, 'mono');
@@ -2881,13 +2894,18 @@ refresh();
 </html>`;
 
 // Events (see events.js): /admin/events and its API.
-registerEvents({ app, pool, requireAdmin });
+registerEvents({ app, pool, requireRole });
 // Promoters (see promoter.js): their private pages, their API and the admin routes. Registered here, after the invite
 // helpers it shares with /api/send-invite.
-registerPromoters({ app, pool, TOKEN_SECRET, safeEqual, requireAdmin, rateLimit, lock, mail, renderEmail, normalizeEmail, isValidEmail,
+registerPromoters({ app, pool, TOKEN_SECRET, safeEqual, requireRole, rateLimit, lock, mail, renderEmail, normalizeEmail, isValidEmail,
   hashToken, newInviteToken, inviteLink, inviteBlocked, SITE_URL, PUBLIC_URL });
 
-app.get('/admin', requireAdmin, (req, res) => res.send(ADMIN_PAGE));
+app.get('/admin', requireRole('OWNER', 'ADMIN'), (req, res) => res.send(ADMIN_PAGE));
+
+// Every /admin and /api/admin route above (and in the modules) must carry requireRole(...) or the public marker: the
+// server refuses to start otherwise. PRINT_ROUTES=1 prints the route → role table.
+const ROUTE_TABLE = auth.checkRoutes(app);
+if (process.env.PRINT_ROUTES === '1') console.log(ROUTE_TABLE.map((r) => `${r.method.padEnd(5)} ${r.path}  ${r.roles.join(', ')}`).join('\n'));
 
 // Malformed JSON and other uncaught errors
 app.use((err, req, res, next) => {

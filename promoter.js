@@ -22,7 +22,7 @@ const idOf = (v) => { const n = toInt(v); return n > 0 && n <= 2147483647 ? n : 
 // What a code does, as the promoter and the owner read it.
 export const codeLabel = (c, currency) => (c.kind === 'TRACK' ? 'Tracking only (full price)' : promoLabel(c, currency));
 
-export function registerPromoters({ app, pool, TOKEN_SECRET, safeEqual, requireAdmin, rateLimit, lock, mail, renderEmail,
+export function registerPromoters({ app, pool, TOKEN_SECRET, safeEqual, requireRole, rateLimit, lock, mail, renderEmail,
   normalizeEmail, isValidEmail, hashToken, newInviteToken, inviteLink, inviteBlocked, SITE_URL, PUBLIC_URL }) {
   const fail = (res, err) => { console.error('Promoter error:', err); res.status(500).json({ error: 'Server error.' }); };
   const sig = (id, version) => crypto.createHmac('sha256', TOKEN_SECRET).update(`promoter:${id}:${version}`).digest('base64url');
@@ -239,7 +239,7 @@ export function registerPromoters({ app, pool, TOKEN_SECRET, safeEqual, requireA
     `INSERT INTO promoter_event (promoter_id, event_id, invites) VALUES ($1, $2, $3)
      ON CONFLICT (promoter_id, event_id) DO UPDATE SET invites = EXCLUDED.invites`, [id, eventId, n]);
 
-  app.get('/api/admin/promoters', requireAdmin, async (req, res) => {
+  app.get('/api/admin/promoters', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     try {
       const ev = await currentEvent(pool);
       const list = (await pool.query('SELECT * FROM promoters ORDER BY active DESC, LOWER(name), id')).rows;
@@ -252,7 +252,7 @@ export function registerPromoters({ app, pool, TOKEN_SECRET, safeEqual, requireA
     } catch (err) { fail(res, err); }
   });
 
-  app.post('/api/admin/promoters', requireAdmin, async (req, res) => {
+  app.post('/api/admin/promoters', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     const { error, fields: f, invites } = promoterInput(req.body || {}, false);
     if (error) return res.status(400).json({ error });
     let client;
@@ -272,7 +272,7 @@ export function registerPromoters({ app, pool, TOKEN_SECRET, safeEqual, requireA
   });
 
   // Partial edit: name, note, active, and invites (their allowance for the current event).
-  app.post('/api/admin/promoters/:id', requireAdmin, async (req, res) => {
+  app.post('/api/admin/promoters/:id', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     const id = idOf(req.params.id);
     const { error, fields: f, invites } = promoterInput(req.body || {}, true);
     if (error) return res.status(400).json({ error });
@@ -301,7 +301,7 @@ export function registerPromoters({ app, pool, TOKEN_SECRET, safeEqual, requireA
   });
 
   // A new link: the old one stops working at once.
-  app.post('/api/admin/promoters/:id/reset-link', requireAdmin, async (req, res) => {
+  app.post('/api/admin/promoters/:id/reset-link', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     const id = idOf(req.params.id);
     try {
       const r = await pool.query('UPDATE promoters SET token_version = token_version + 1 WHERE id = $1 RETURNING *', [id]);

@@ -31,12 +31,12 @@ const sizeList = (v) => {
 const NO_SIZE = 'No size';
 const fmt = (d) => new Date(d).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'America/Antigua' });
 
-export function registerPickup({ app, pool, requireAdmin }) {
+export function registerPickup({ app, pool, requireRole }) {
   const fail = (res, err) => { console.error('Pickup error:', err); res.status(500).json({ error: 'Server error.' }); };
   const orderId = (v) => (/^\d{1,9}$/.test(String(v)) ? Number(v) : null);
 
   // Size counts per package (what to order) and the pickup list (paid orders, newest first).
-  app.get('/api/admin/pickup', requireAdmin, async (req, res) => {
+  app.get('/api/admin/pickup', requireRole('OWNER', 'ADMIN', 'DOOR'), async (req, res) => {
     try {
       const [lock, pkgs, counts, orders] = await Promise.all([
         getSizeLock(pool),
@@ -86,7 +86,7 @@ export function registerPickup({ app, pool, requireAdmin }) {
     } catch (err) { fail(res, err); }
   });
 
-  app.post('/api/admin/size-lock', requireAdmin, async (req, res) => {
+  app.post('/api/admin/size-lock', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     const lock = req.body?.size_lock;
     if (!SIZE_LOCKS.includes(lock)) return res.status(400).json({ error: 'Choose how sizes are locked.' });
     try {
@@ -97,7 +97,7 @@ export function registerPickup({ app, pool, requireAdmin }) {
   });
 
   // The admin can change a size even when sizes are locked for guests.
-  app.post('/api/admin/orders/:id/size', requireAdmin, async (req, res) => {
+  app.post('/api/admin/orders/:id/size', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     const id = orderId(req.params.id);
     if (!id) return res.status(404).json({ error: 'Order not found.' });
     try {
@@ -118,7 +118,7 @@ export function registerPickup({ app, pool, requireAdmin }) {
   });
 
   // Marks a paid order's package collected from admin, or undoes it. Logged in the door log like a scan.
-  app.post('/api/admin/orders/:id/pickup', requireAdmin, async (req, res) => {
+  app.post('/api/admin/orders/:id/pickup', requireRole('OWNER', 'ADMIN', 'DOOR'), async (req, res) => {
     const id = orderId(req.params.id);
     if (!id) return res.status(404).json({ error: 'Order not found.' });
     const undo = req.body?.undo === true;
@@ -157,7 +157,7 @@ export function registerPickup({ app, pool, requireAdmin }) {
     }
   });
 
-  app.get('/admin/pickup', requireAdmin, (req, res) => res.type('html').send(PAGE));
+  app.get('/admin/pickup', requireRole('OWNER', 'ADMIN', 'DOOR'), (req, res) => res.type('html').send(PAGE));
 }
 
 // ---------- Sizes & pickup page ----------
@@ -300,7 +300,7 @@ td.act { text-align: right; white-space: nowrap; }
   <h1>Sizes &amp; pickup</h1>
   <p class="lead">Lock sizes before you order costumes, see how many of each size to order, and track who has collected their package.</p>
 
-  <section class="card" aria-labelledby="lock-h">
+  <section class="card admin-only" aria-labelledby="lock-h">
     <h2 id="lock-h">Size lock</h2>
     <p>Whether guests can still change their size from their account.</p>
     <div class="locks" role="radiogroup" aria-labelledby="lock-h">
@@ -504,7 +504,8 @@ function row(o) {
   who.appendChild(el('span', o.reference_code, 'mono'));
   cell(tr, o.package_name);
   var sz = cell(tr, ''), sizes = sizesOf(o);
-  if (sizes.length) {
+  // Door accounts hand packages out; changing a size is for the admins.
+  if (sizes.length && document.documentElement.getAttribute('data-role') !== 'DOOR') {
     // The admin can change a size even when sizes are locked for guests.
     var sel = el('select');
     sel.setAttribute('aria-label', 'Size for ' + (name || o.guest_email));

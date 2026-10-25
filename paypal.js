@@ -74,7 +74,7 @@ export async function refundCapture(captureId, ref) {
   return { ok: false, error: paypalIssue(r) };
 }
 
-export function registerPayPal({ app, pool, requireAuth, requireApproved, requireAdmin, rateLimit, perUser, onPaid }) {
+export function registerPayPal({ app, pool, requireAuth, requireApproved, requireRole, rateLimit, perUser, onPaid }) {
   const enabledFor = paypalEnabledFor;
   const fail = (res, err) => { console.error('PayPal error:', err); res.status(500).json({ error: 'Server error.' }); };
   const api = paypalApi, issue = paypalIssue;
@@ -236,7 +236,7 @@ export function registerPayPal({ app, pool, requireAuth, requireApproved, requir
   });
 
   // For the Payment settings page.
-  app.get('/api/admin/paypal', requireAdmin, (req, res) => {
+  app.get('/api/admin/paypal', requireRole('OWNER', 'ADMIN'), (req, res) => {
     res.json({ configured: CONFIGURED, live: LIVE, testers: LIVE ? [] : TESTERS });
   });
 

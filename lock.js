@@ -79,16 +79,17 @@ export function createLock({ pool, TOKEN_SECRET, safeEqual, SITE_URL,
   const fail = (res, err) => { console.error(err); res.status(500).json({ error: 'Server error.' }); };
 
   // The admin routes: GET/POST <adminPath> and POST <adminPath>/preview-reset. json: a body parser for routes
-  // registered before the app-wide one (the ticket lock's); the main lock's are registered after it.
-  function register({ app, requireAdmin, json = (req, res, next) => next() }) {
-    app.get(adminPath, requireAdmin, async (req, res) => {
+  // registered before the app-wide one (the ticket lock's); the main lock's are registered after it. Seeing the lock is
+  // for OWNER and ADMIN; switching it, its unlock time and resetting the preview link are the owner's (auth.js).
+  function register({ app, requireRole, json = (req, res, next) => next() }) {
+    app.get(adminPath, requireRole('OWNER', 'ADMIN'), async (req, res) => {
       try { forget(); res.json(state(await settings())); } catch (err) { fail(res, err); }
     });
 
     // { site_lock: 'on' | 'off', site_unlock_at: ISO time | '' } (either one). The time must be in the future.
     // Switching it off clears the time (the site is open, nothing to wait for), and switching it on drops a time that
     // has already passed, which would otherwise open it again straight away.
-    app.post(adminPath, requireAdmin, json, async (req, res) => {
+    app.post(adminPath, requireRole('OWNER'), json, async (req, res) => {
       const b = req.body || {};
       const bad = (error) => res.status(400).json({ error });
       if (b.site_lock === undefined && b.site_unlock_at === undefined) return bad('Nothing to change.');
@@ -117,7 +118,7 @@ export function createLock({ pool, TOKEN_SECRET, safeEqual, SITE_URL,
     });
 
     // A new preview link. The old one stops working at once.
-    app.post(`${adminPath}/preview-reset`, requireAdmin, json, async (req, res) => {
+    app.post(`${adminPath}/preview-reset`, requireRole('OWNER'), json, async (req, res) => {
       try {
         await pool.query(
           `INSERT INTO settings (key, value) VALUES ($1, '1') ON CONFLICT (key) DO UPDATE

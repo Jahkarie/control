@@ -631,7 +631,7 @@ function orderDetail(o) {
   a.appendChild(ul); g.appendChild(a);
   var b = el('div'); b.appendChild(el('h3', 'Payments')); var ul2 = el('ul');
   if (!o.payments.length) ul2.appendChild(el('li', 'None yet.'));
-  o.payments.forEach(function (p) { ul2.appendChild(el('li', (p.kind === 'DEPOSIT' ? 'Deposit' : p.kind === 'BALANCE' ? 'Balance' : 'In full') + ' · ' + money(p.amount_cents, o.currency) + (p.usd_amount ? ' (US$' + p.usd_amount + ')' : '') + ' · ' + (p.via === 'PAYPAL' ? 'PayPal' : 'by hand' + (p.note ? ': ' + p.note : '')) + ' · ' + when(p.created_at) + (p.refunded_at ? ' · refunded' : ''))); });
+  o.payments.forEach(function (p) { ul2.appendChild(el('li', (p.kind === 'DEPOSIT' ? 'Deposit' : p.kind === 'BALANCE' ? 'Balance' : 'In full') + ' · ' + money(p.amount_cents, o.currency) + (p.usd_amount ? ' (US$' + p.usd_amount + ')' : '') + ' · ' + (p.via === 'PAYPAL' ? 'PayPal' : 'by hand' + (p.note ? ': ' + p.note : '') + (p.by_name ? ' · Marked paid by ' + p.by_name : '')) + ' · ' + when(p.created_at) + (p.refunded_at ? ' · refunded' : ''))); });
   b.appendChild(ul2);
   var lnk = el('a', 'Open the buyer' + String.fromCharCode(39) + 's order page'); lnk.href = o.order_url; lnk.target = '_blank'; lnk.rel = 'noopener'; b.appendChild(lnk);
   g.appendChild(b);

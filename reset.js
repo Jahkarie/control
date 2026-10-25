@@ -16,7 +16,9 @@ import crypto from 'crypto';
 import { createDefaultEvent } from './events.js';
 
 const TTL_MS = 10 * 60 * 1000;
-const GUEST_TABLES = ['ticket_checkins', 'tickets', 'ticket_payments', 'ticket_order_items', 'ticket_orders',
+// The admin app's alerts and the door's refused scans (adminapp.js) go with the guest data. Admin accounts, their
+// sessions and passkeys, push subscriptions and the audit log are never reset: the reset itself is in the audit log.
+const GUEST_TABLES = ['admin_alerts', 'door_refusals', 'ticket_checkins', 'tickets', 'ticket_payments', 'ticket_order_items', 'ticket_orders',
   'checkins', 'orders', 'login_links', 'invites', 'guest_event', 'guests', 'broadcasts'];
 // In this order: each table only points at tables after it.
 const SETUP_TABLES = ['ticket_tiers', 'ticket_products', 'ticket_events', 'chasers', 'chaser_groups', 'bottles',
@@ -26,7 +28,7 @@ const SCOPES = ['guests', 'everything'];
 
 // afterReset() runs after an 'everything' reset (server.js clears the site lock's cache and calls site.refresh, which
 // clears the email footer's cached contact details).
-export function registerReset({ app, pool, requireAdmin, rateLimit, afterReset }) {
+export function registerReset({ app, pool, requireRole, rateLimit, afterReset }) {
   let pending = null; // { code, scope, expires }
   const fail = (res, err) => { console.error('Reset error:', err); res.status(500).json({ error: 'Server error. Nothing was deleted.' }); };
 
@@ -62,12 +64,12 @@ export function registerReset({ app, pool, requireAdmin, rateLimit, afterReset }
     return { ...r.rows[0], received: money.rows.map((m) => ({ currency: m.currency, cents: Number(m.cents) })) };
   }
 
-  app.get('/api/admin/reset', requireAdmin, async (req, res) => {
+  app.get('/api/admin/reset', requireRole('OWNER'), async (req, res) => {
     try { res.json(await counts(pool)); } catch (err) { fail(res, err); }
   });
 
   // Step 1: a fresh confirmation number for a scope (replaces any earlier one).
-  app.post('/api/admin/reset/start', requireAdmin, rateLimit(20, 15 * 60 * 1000), async (req, res) => {
+  app.post('/api/admin/reset/start', requireRole('OWNER'), rateLimit(20, 15 * 60 * 1000), async (req, res) => {
     const scope = req.body?.scope;
     if (!SCOPES.includes(scope)) return res.status(400).json({ error: 'Choose what to reset.' });
     try {
@@ -77,7 +79,7 @@ export function registerReset({ app, pool, requireAdmin, rateLimit, afterReset }
   });
 
   // Step 2: the number typed back, for the same scope. Deletes in one transaction, so it's all or nothing.
-  app.post('/api/admin/reset', requireAdmin, rateLimit(20, 15 * 60 * 1000), async (req, res) => {
+  app.post('/api/admin/reset', requireRole('OWNER'), rateLimit(20, 15 * 60 * 1000), async (req, res) => {
     const typed = String(req.body?.code ?? '').replace(/\s/g, '');
     const scope = req.body?.scope;
     const ok = pending && Date.now() < pending.expires && scope === pending.scope &&
@@ -111,7 +113,7 @@ export function registerReset({ app, pool, requireAdmin, rateLimit, afterReset }
     }
   });
 
-  app.get('/admin/reset', requireAdmin, (req, res) => res.type('html').send(PAGE));
+  app.get('/admin/reset', requireRole('OWNER'), (req, res) => res.type('html').send(PAGE));
 }
 
 const PAGE = `<!DOCTYPE html>

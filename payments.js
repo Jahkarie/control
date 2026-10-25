@@ -19,7 +19,7 @@ export const dueSql = (p) => `COALESCE(o.pay_by, CASE WHEN COALESCE(o.pay_days, 
 // The "How to pay" text: the general instructions, then the package's own cash details.
 const howToPay = (instructions, payNote) => [instructions, payNote].map((t) => (t || '').trim()).filter(Boolean).join('\n\n');
 
-export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, TOKEN_SECRET, requireAuth, requireAdmin, escapeHtml, beforeExpire }) {
+export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, TOKEN_SECRET, requireAuth, requireRole, escapeHtml, beforeExpire }) {
   // pay_rule 'days': pay within pay_days days of reserving (0 = no deadline).
   // pay_rule 'weekday': pay by the next pay_weekday (0 = Sunday) at pay_time, Antigua time.
   async function getSettings() {
@@ -160,7 +160,7 @@ export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, 
     }
   });
 
-  app.get('/api/admin/payment-settings', requireAdmin, async (req, res) => {
+  app.get('/api/admin/payment-settings', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     try {
       const s = await getSettings();
       res.json({ instructions: s.instructions, pay_days: s.payDays, pay_rule: s.payRule, pay_weekday: s.payWeekday, pay_time: s.payTime });
@@ -171,7 +171,7 @@ export function registerPayments({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, 
   });
 
   // Everything but the instructions is optional: a setting left out keeps its current value.
-  app.post('/api/admin/payment-settings', requireAdmin, async (req, res) => {
+  app.post('/api/admin/payment-settings', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     const b = req.body || {};
     const instructions = typeof b.instructions === 'string' ? b.instructions.trim().slice(0, 2000) : '';
     const days = b.pay_days === undefined ? null : parseInt(b.pay_days, 10);
@@ -408,7 +408,7 @@ $('save').addEventListener('click', function () {
 });
 </script></body></html>`;
 
-  app.get('/admin/payments', requireAdmin, (req, res) => res.type('html').send(PAGE));
+  app.get('/admin/payments', requireRole('OWNER', 'ADMIN'), (req, res) => res.type('html').send(PAGE));
 
   // Shared with server.js so every order email uses the same look and new orders get the same deadline.
   return { getSettings, deadlineFor, payBy, fmt, send, howToPay };

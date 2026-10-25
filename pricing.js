@@ -194,7 +194,7 @@ function promoEdits(b) {
 
 // Routes. onComp(order) is called after a code makes an existing reservation free (the order is then PAID);
 // order has { guest_email, package_name, reference_code }.
-export function registerPricing({ app, pool, requireAuth, requireApproved, requireAdmin, rateLimit, perUser, onComp }) {
+export function registerPricing({ app, pool, requireAuth, requireApproved, requireRole, rateLimit, perUser, onComp }) {
   const fail = (res, err) => { console.error(err); res.status(500).json({ error: 'Server error.' }); };
   const invalid = (res, error) => res.status(400).json({ error, code: 'PROMO_INVALID' });
 
@@ -291,7 +291,7 @@ export function registerPricing({ app, pool, requireAuth, requireApproved, requi
 
   // ---------- Admin ----------
 
-  app.get('/api/admin/pricing', requireAdmin, async (req, res) => {
+  app.get('/api/admin/pricing', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     try {
       // The current event's packages and codes. Past events keep theirs, read-only (see events.js).
       const [pk, codes, promoters, ev] = await Promise.all([
@@ -326,7 +326,7 @@ export function registerPricing({ app, pool, requireAuth, requireApproved, requi
   });
 
   // A new tier goes after the package's other tiers.
-  app.post('/api/admin/tiers', requireAdmin, async (req, res) => {
+  app.post('/api/admin/tiers', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     const b = req.body || {};
     const packageId = idOf(b.package_id);
     const { error, fields: f } = tierInput(b, false);
@@ -343,7 +343,7 @@ export function registerPricing({ app, pool, requireAuth, requireApproved, requi
   });
 
   // Partial edit. ends_at or quantity sent as null or '' clears it.
-  app.post('/api/admin/tiers/:id', requireAdmin, async (req, res) => {
+  app.post('/api/admin/tiers/:id', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     const id = idOf(req.params.id);
     const { error, fields: f } = tierInput(req.body || {}, true);
     if (error) return res.status(400).json({ error });
@@ -360,7 +360,7 @@ export function registerPricing({ app, pool, requireAuth, requireApproved, requi
   });
 
   // Swaps a tier with the one above or below it, then numbers the package's tiers 1, 2, 3... again.
-  app.post('/api/admin/tiers/:id/move', requireAdmin, async (req, res) => {
+  app.post('/api/admin/tiers/:id/move', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     const id = idOf(req.params.id);
     const dir = req.body?.dir;
     if (!id || !['up', 'down'].includes(dir)) return res.status(400).json({ error: 'Move it up or down.' });
@@ -397,7 +397,7 @@ export function registerPricing({ app, pool, requireAuth, requireApproved, requi
   });
 
   // Only a tier no order has ever used can be deleted; the orders keep their tier for the records.
-  app.post('/api/admin/tiers/:id/delete', requireAdmin, async (req, res) => {
+  app.post('/api/admin/tiers/:id/delete', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     const id = idOf(req.params.id);
     if (!id) return res.status(400).json({ error: 'Invalid tier.' });
     let client;
@@ -427,7 +427,7 @@ export function registerPricing({ app, pool, requireAuth, requireApproved, requi
     }
   });
 
-  app.post('/api/admin/promos', requireAdmin, async (req, res) => {
+  app.post('/api/admin/promos', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     const b = req.body || {};
     const code = cleanCode(b.code);
     if (!CODE_RE.test(code)) return res.status(400).json({ error: 'A code is 3 to 24 letters, numbers or dashes, starting with a letter or number.' });
@@ -465,7 +465,7 @@ export function registerPricing({ app, pool, requireAuth, requireApproved, requi
   });
 
   // Partial edit: active, max_uses, expires_at, note. What a code gives can't change once guests may have it.
-  app.post('/api/admin/promos/:code', requireAdmin, async (req, res) => {
+  app.post('/api/admin/promos/:code', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     const code = cleanCode(req.params.code);
     const { error, fields: f } = promoEdits(req.body || {});
     if (error) return res.status(400).json({ error });
@@ -481,7 +481,7 @@ export function registerPricing({ app, pool, requireAuth, requireApproved, requi
   });
 
   // Only a code no order has ever used can be deleted, so every order can still say what it took off.
-  app.post('/api/admin/promos/:code/delete', requireAdmin, async (req, res) => {
+  app.post('/api/admin/promos/:code/delete', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     const code = cleanCode(req.params.code);
     let client;
     try {
@@ -509,7 +509,7 @@ export function registerPricing({ app, pool, requireAuth, requireApproved, requi
     }
   });
 
-  app.get('/admin/pricing', requireAdmin, (req, res) => res.type('html').send(PAGE));
+  app.get('/admin/pricing', requireRole('OWNER', 'ADMIN'), (req, res) => res.type('html').send(PAGE));
 }
 
 // ---------- "Prices, codes & promoters" admin page ----------

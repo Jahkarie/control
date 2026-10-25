@@ -115,7 +115,7 @@ const csvCell = (v) => {
 // same rule the payments job uses before it cancels anything.
 const PAYPAL_BUSY = `o.paypal_order_id IS NOT NULL AND (o.paypal_status = 'PENDING' OR o.paypal_started_at > NOW() - INTERVAL '30 minutes')`;
 
-export function registerEvents({ app, pool, requireAdmin }) {
+export function registerEvents({ app, pool, requireRole }) {
   const fail = (res, err) => { console.error('Events error:', err); res.status(500).json({ error: 'Server error.' }); };
 
   // Each event with its totals: reserved, paid, cancelled, checked in, the money received per currency and packages.
@@ -161,7 +161,7 @@ export function registerEvents({ app, pool, requireAdmin }) {
     return r.rows[0];
   }
 
-  app.get('/api/admin/events', requireAdmin, async (req, res) => {
+  app.get('/api/admin/events', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     try {
       const all = (await pool.query("SELECT * FROM events ORDER BY (status = 'current') DESC, started_at DESC NULLS LAST, id DESC")).rows;
       const list = await withTotals(pool, all);
@@ -170,7 +170,7 @@ export function registerEvents({ app, pool, requireAdmin }) {
   });
 
   // Renames the current event, or changes how many invites each guest gets for it (their bonuses stay).
-  app.post('/api/admin/events/current', requireAdmin, async (req, res) => {
+  app.post('/api/admin/events/current', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     const { error, fields: f } = eventInput(req.body || {}, true);
     if (error) return res.status(400).json({ error });
     const cols = Object.keys(f); // fixed names from eventInput, never from the request
@@ -188,7 +188,7 @@ export function registerEvents({ app, pool, requireAdmin }) {
   // PENDING, the current event becomes past and the new one current. Copied packages start hidden, with their tiers
   // (end dates only when still to come), sizes and pay notes; codes stay with the old event. Refused while a refund
   // request is open or a PayPal payment is in flight.
-  app.post('/api/admin/events/start', requireAdmin, async (req, res) => {
+  app.post('/api/admin/events/start', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     const b = req.body || {};
     const { error, fields: f } = eventInput(b, false);
     if (error) return res.status(400).json({ error });
@@ -245,7 +245,7 @@ export function registerEvents({ app, pool, requireAdmin }) {
   });
 
   // Every order of one event (past or current), as a CSV that opens in Excel with accented names intact.
-  app.get('/api/admin/events/:id/orders.csv', requireAdmin, async (req, res) => {
+  app.get('/api/admin/events/:id/orders.csv', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     const id = idOf(req.params.id);
     if (!id) return res.status(404).json({ error: 'Event not found.' });
     try {
@@ -275,7 +275,7 @@ export function registerEvents({ app, pool, requireAdmin }) {
     } catch (err) { fail(res, err); }
   });
 
-  app.get('/admin/events', requireAdmin, (req, res) => res.type('html').send(PAGE));
+  app.get('/admin/events', requireRole('OWNER', 'ADMIN'), (req, res) => res.type('html').send(PAGE));
 }
 
 // ---------- "Events" admin page ----------

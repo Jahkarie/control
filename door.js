@@ -1,5 +1,7 @@
 // door.js: door check-in for event night.
-// Staff open /door on their phones and sign in with DOOR_KEY (the admin key also works).
+// Staff open /door on their phones and sign in with their own staff account (a DOOR account, or any admin account: the
+// same sign-in as the admin, at /admin/login?next=/door) or, for now, with DOOR_KEY. The admin key only works here when
+// ALLOW_ADMIN_KEY_API=1 (the test harness). A scan made with an account records the phone's name and the person's first name.
 // Each phone keeps a copy of the guest list, so scanning still works with no signal;
 // check-ins made offline sync to the server as soon as the phone is back online.
 // The same scanner has a Pickup mode for handing out packages: a scan marks the package collected
@@ -20,21 +22,38 @@ import { CUR } from './events.js';
 import { qrSecret, codeOk, BROWSER_CODE } from './liveqr.js';
 import { WM_LITE, WM_INK } from './brand.js';
 
-export function registerDoor({ app, pool, express, ADMIN_KEY, TOKEN_SECRET, safeEqual, rateLimit, requireAdmin, ticketDoor }) {
+export function registerDoor({ app, pool, express, ADMIN_KEY, TOKEN_SECRET, safeEqual, rateLimit, requireRole, ticketDoor, auth, onRefused = async () => {} }) {
   const DOOR_KEY = process.env.DOOR_KEY || '';
+  const keyOk = (key) => !!key && ((auth?.allowKey && safeEqual(key, ADMIN_KEY)) || (!!DOOR_KEY && safeEqual(key, DOOR_KEY)));
   const json = express.json({ limit: '256kb' });
   const limit = rateLimit(600, 60 * 1000);
 
   // Wrong passwords are counted per IP so the key can't be guessed by brute force.
   const fails = new Map();
   setInterval(() => fails.clear(), 15 * 60 * 1000).unref();
-  const requireDoor = (req, res, next) => {
-    if ((fails.get(req.ip) || 0) >= 20) return res.status(429).json({ error: 'Too many wrong passwords. Try again in 15 minutes.' });
+  const requireDoor = async (req, res, next) => {
     const key = req.get('x-door-key') || '';
-    if (key && (safeEqual(key, ADMIN_KEY) || (DOOR_KEY && safeEqual(key, DOOR_KEY)))) return next();
-    fails.set(req.ip, (fails.get(req.ip) || 0) + 1);
-    res.status(401).json({ error: 'Wrong staff password.' });
+    if (!key && auth) {
+      try {
+        const who = await auth.doorIdentity(req);
+        if (who?.forbidden) return res.status(403).json({ error: 'Reload the scanner and try again.', code: 'CSRF' });
+        if (who?.admin) { req.admin = who.admin; return next(); }
+      } catch (err) { return fail(res, err); }
+    }
+    if ((fails.get(req.ip) || 0) >= 20) return res.status(429).json({ error: 'Too many wrong passwords. Try again in 15 minutes.' });
+    if (keyOk(key)) return next();
+    if (key) fails.set(req.ip, (fails.get(req.ip) || 0) + 1);
+    res.status(401).json({ error: key ? 'Wrong staff password.' : 'Sign in again.', code: key ? undefined : 'AUTH_REQUIRED' });
   };
+  // With an account, the scan's "device" is the phone's name and the person's first name ("Front gate · Kai").
+  const withStaff = (req, ev) => {
+    if (!req.admin || !ev || typeof ev !== 'object') return ev;
+    const who = String(req.admin.name || '').trim().split(/\s+/)[0];
+    const device = String(ev.device || '').trim().slice(0, 40) || 'Door';
+    return who && !device.endsWith(' · ' + who) ? { ...ev, device: (device.slice(0, 40 - who.length - 3) + ' · ' + who) } : ev;
+  };
+  // Every scan's result; a refused one is counted for the admin app's live door.
+  const scan = async (req, ev) => { const e = withStaff(req, ev); const r = await applyScan(e); await onRefused(e, r); return r; };
 
   // sized: the package has sizes, so an order without one shows "No size picked" at pickup.
   // full_name is the guest's name as on their ID, for the Pickup desk's name search and Check ID screen (Entry never
@@ -182,7 +201,7 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, TOKEN_SECRET, safe
   });
 
   app.post('/api/door/checkin', limit, requireDoor, json, async (req, res) => {
-    try { res.json(await applyScan(req.body)); } catch (err) { fail(res, err); }
+    try { res.json(await scan(req, req.body)); } catch (err) { fail(res, err); }
   });
 
   // Check-ins a phone made while offline, in the order they happened.
@@ -190,14 +209,14 @@ export function registerDoor({ app, pool, express, ADMIN_KEY, TOKEN_SECRET, safe
     const events = Array.isArray(req.body?.events) ? req.body.events.slice(0, 200) : [];
     const results = [];
     for (const ev of events) {
-      try { results.push({ client_id: ev?.client_id || null, ...(await applyScan(ev)) }); }
+      try { results.push({ client_id: ev?.client_id || null, ...(await scan(req, ev)) }); }
       catch (err) { console.error('Door sync error:', err); results.push({ client_id: ev?.client_id || null, result: 'ERROR' }); }
     }
     res.json({ results });
   });
 
   // Door log for the Command Center: the current event's (?event=<id> for another one, ?event=all for every event).
-  app.get('/api/admin/checkins', requireAdmin, async (req, res) => {
+  app.get('/api/admin/checkins', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     const all = req.query.event === 'all';
     const id = /^\d{1,9}$/.test(String(req.query.event || '')) ? Number(req.query.event) : null;
     try {
@@ -373,6 +392,14 @@ input:focus { outline: 2px solid var(--mode); outline-offset: 0; border-color: t
 .signin form input:focus { outline: 2px solid var(--ink); border-color: var(--ink); background: var(--paper); }
 .signin form :focus-visible { outline-color: var(--ink); }
 .signin .btn { width: 100%; margin-top: 26px; box-shadow: 0 0 0 1px var(--ink); }
+/* Staff accounts: the main way in. The door password stays for now, below it. */
+.acct { margin: 0 0 22px; }
+.acct .btn { margin-top: 0; box-shadow: none; text-decoration: none; }
+.acct .or { display: flex; align-items: center; gap: 12px; margin: 20px 0 0; font: 400 11px/1.2 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
+.acct .or::before, .acct .or::after { content: ''; flex: 1; height: 1px; background: var(--line-2); }
+.staff-who { margin: 0 0 4px; font-size: 15px; color: var(--ink); }
+.staff-who b { font-weight: 800; }
+.staff-who button { margin-left: 6px; min-height: 44px; padding: 0 4px; background: none; border: 0; color: var(--ink-2); font: 600 14px var(--body); text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
 .msg { min-height: 22px; margin: 14px 0 0; font-size: 14.5px; font-weight: 600; color: #a3140c; }
 .sig-data { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 16px; margin-top: 26px; padding-top: 14px; border-top: 1px solid var(--line); font: 400 11px/1.2 var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--dim); }
 
@@ -668,8 +695,13 @@ h2 { margin: 34px 0 4px; }
     <h1><b>Staff</b><br><i>sign-in</i></h1>
   </div>
   <p class="lead">Do this once with signal before doors open. The guest list is saved on this phone, so scanning keeps working if the signal drops.</p>
+  <div class="acct" id="acct-row">
+    <a class="btn" id="acct-go" href="/admin/login?next=%2Fdoor">Sign in with your staff account</a>
+    <p class="or">or use the door password</p>
+  </div>
   <form id="signin-form" autocomplete="on">
-    <label for="key">Staff password</label>
+    <p class="staff-who hidden" id="staff-who"></p>
+    <label for="key" id="key-label">Door password</label>
     <input id="key" type="password" autocomplete="current-password" required>
     <label for="device">Name this phone</label>
     <input id="device" placeholder="e.g. Front gate" maxlength="40" required autocomplete="off">
@@ -750,6 +782,11 @@ var store = {
   del: function (k) { try { localStorage.removeItem(k); } catch (e) {} }
 };
 var KEY = store.get('door_key', '');
+// A staff account (the session cookie, plus its CSRF token for scans): { name, csrf }. Kept on the phone so the scanner
+// still opens offline; the server decides whether the session is still good.
+var STAFF = store.get('door_staff', null);
+if (STAFF && !STAFF.csrf) STAFF = null;
+function signedIn() { return !!(KEY || STAFF); }
 var DEVICE = store.get('door_device', '');
 var passes = store.get('door_passes', []);
 var queue = store.get('door_queue', []);
@@ -814,7 +851,7 @@ function api(path, body) {
   var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, 6000);
   return fetch(path, {
     method: body ? 'POST' : 'GET',
-    headers: { 'Content-Type': 'application/json', 'x-door-key': KEY },
+    headers: KEY ? { 'Content-Type': 'application/json', 'x-door-key': KEY } : { 'Content-Type': 'application/json', 'x-csrf': STAFF ? STAFF.csrf : '' },
     body: body ? JSON.stringify(body) : undefined,
     signal: ctrl ? ctrl.signal : undefined,
     cache: 'no-store'
@@ -1369,7 +1406,7 @@ function pushQueue() {
   });
 }
 function syncNow(manual) {
-  if (syncing || !KEY) return Promise.resolve();
+  if (syncing || !signedIn()) return Promise.resolve();
   syncing = true;
   $('sync-btn').disabled = true;
   if (manual) $('sync-text').textContent = 'Syncing...';
@@ -1591,7 +1628,7 @@ document.addEventListener('visibilitychange', function () {
     var live = stream && stream.getVideoTracks().some(function (t) { return t.readyState === 'live'; });
     if (!live) stopCamera(); else keepAwake();
   }
-  if (KEY) syncNow();
+  if (signedIn()) syncNow();
 });
 $('cam-btn').addEventListener('click', startCamera);
 $('cam-stop').addEventListener('click', stopCamera);
@@ -1642,7 +1679,7 @@ function setWork(v) {
   if (changed) { $('q').value = ''; }
   setMode(MODE);
   renderWork();
-  if (changed && ticketMode() && KEY) syncNow(true);
+  if (changed && ticketMode() && signedIn()) syncNow(true);
 }
 $('work').addEventListener('change', function () { setWork(this.value); });
 
@@ -1656,14 +1693,33 @@ function showMain() {
 function showSignin(msg) {
   $('main').classList.add('hidden');
   $('signin').classList.remove('hidden');
-  $('device').value = DEVICE || '';
+  // Signed in with a staff account: only the phone's name is left to give.
+  $('acct-row').classList.toggle('hidden', !!STAFF);
+  $('key-label').classList.toggle('hidden', !!STAFF); $('key').classList.toggle('hidden', !!STAFF); $('key').required = !STAFF;
+  $('staff-who').classList.toggle('hidden', !STAFF);
+  if (STAFF) {
+    $('staff-who').replaceChildren(document.createTextNode('Signed in as '), el('b', STAFF.name));
+    var out = el('button', 'Not you?'); out.type = 'button'; out.onclick = function () { signOut(''); }; $('staff-who').appendChild(out);
+  }
+  $('device').value = DEVICE || (STAFF ? STAFF.name.split(' ')[0] + "'s phone" : '');
   $('signin-msg').textContent = msg || '';
 }
 function signOut(msg) {
   stopCamera();
-  KEY = '';
-  store.del('door_key');
+  if (STAFF) fetch('/api/admin/auth/logout', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-csrf': STAFF.csrf }, body: '{}' }).catch(function () {});
+  KEY = ''; STAFF = null;
+  store.del('door_key'); store.del('door_staff');
   showSignin(msg || '');
+}
+// Whether this phone has a staff session (signed in at /admin/login). Resolves to true/false, or null with no signal.
+function checkStaff() {
+  return fetch('/api/admin/auth/me', { cache: 'no-store' }).then(function (r) {
+    if (r.status === 401) { STAFF = null; store.del('door_staff'); return false; }
+    return r.json().then(function (d) {
+      if (d && d.csrf && d.user) { STAFF = { name: d.user.name, csrf: d.csrf }; store.set('door_staff', STAFF); return true; }
+      STAFF = null; store.del('door_staff'); return false;
+    });
+  }, function () { return null; });
 }
 $('signout').addEventListener('click', function () {
   var what = queue.some(function (e) { return e.kind === 'PICKUP' || e.kind === 'PICKUP_UNDO'; }) ? ' scans' : ' check-ins';
@@ -1675,32 +1731,41 @@ $('signout').addEventListener('click', function () {
 $('signin-form').addEventListener('submit', function (e) {
   e.preventDefault();
   var key = $('key').value.trim(), device = $('device').value.trim();
-  if (!key || !device) return;
+  if ((!key && !STAFF) || !device) return;
   $('signin-msg').textContent = 'Checking...';
-  KEY = key;
+  KEY = STAFF ? '' : key;
   api('/api/door/list').then(function (data) {
     DEVICE = device;
-    store.set('door_key', KEY); store.set('door_device', DEVICE);
+    if (KEY) store.set('door_key', KEY);
+    store.set('door_device', DEVICE);
     takeList(data);
     $('key').value = '';
     showMain();
     if (queue.length || ticketMode()) syncNow();
   }, function (err) {
     KEY = '';
+    if (err.auth && STAFF) { STAFF = null; store.del('door_staff'); showSignin('Your sign-in ended. Sign in again.'); return; }
     $('signin-msg').textContent = err.auth ? 'Wrong staff password.' : 'No connection. You need signal once to sign in and download the guest list.';
   });
 });
 
-window.addEventListener('online', function () { setOnline(true); if (KEY) syncNow(); });
+window.addEventListener('online', function () { setOnline(true); if (signedIn()) syncNow(); });
 window.addEventListener('offline', function () { setOnline(false); });
-setInterval(function () { if (KEY && !busy) syncNow(); }, 20000);
+setInterval(function () { if (signedIn() && !busy) syncNow(); }, 20000);
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/door-sw.js', { scope: '/door' }).catch(function () {});
 
 document.body.classList.toggle('tix', ticketMode());
 renderWork();
 setMode(MODE);
-if (KEY && DEVICE) { showMain(); syncNow(); } else { showSignin(); }
+if (signedIn() && DEVICE) {
+  showMain(); syncNow();
+  // A staff session that ended (idle, or signed out elsewhere) shows the sign-in again; with no signal, keep scanning.
+  if (STAFF && !KEY) checkStaff().then(function (ok) { if (ok === false) { hideResult(); signOut('Your sign-in ended. Sign in again.'); } });
+} else {
+  showSignin();
+  if (!KEY) checkStaff().then(function (ok) { if (ok && DEVICE) { showMain(); syncNow(); } else if (ok) showSignin(); });
+}
 </script>
 </body>
 </html>`;

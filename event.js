@@ -26,7 +26,7 @@ const AUDIENCES = {
 };
 const BATCH = 100; // Resend's batch limit
 
-export function registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, requireAuth, requireAdmin, mail }) {
+export function registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, requireAuth, requireRole, mail }) {
   // Field -> column on the events row (fixed names, never from a request).
   const KEYS = { when: 'event_when', info: 'event_info', paid_info: 'event_paid_info', location: 'event_location', poster: 'event_poster' };
   const LIMITS = { when: 120, info: 3000, paid_info: 3000, location: 300, poster: 500 };
@@ -81,7 +81,7 @@ export function registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, req
   });
 
   // ---------- Admin: event details ----------
-  app.get('/api/admin/event', requireAdmin, async (req, res) => {
+  app.get('/api/admin/event', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     try {
       res.json(await getEvent());
     } catch (err) {
@@ -91,7 +91,7 @@ export function registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, req
   });
 
   // Saves the fields sent. One left out keeps its value, so an older copy of the page can't wipe the newer ones.
-  app.post('/api/admin/event', requireAdmin, async (req, res) => {
+  app.post('/api/admin/event', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     const b = req.body || {};
     const vals = {};
     for (const field of Object.keys(KEYS)) {
@@ -115,7 +115,7 @@ export function registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, req
   });
 
   // ---------- Admin: email updates ----------
-  app.get('/api/admin/broadcasts', requireAdmin, async (req, res) => {
+  app.get('/api/admin/broadcasts', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     try {
       const counts = {};
       for (const [k, q] of Object.entries(AUDIENCES)) {
@@ -133,7 +133,7 @@ export function registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, req
     }
   });
 
-  app.post('/api/admin/broadcast', requireAdmin, async (req, res) => {
+  app.post('/api/admin/broadcast', requireRole('OWNER', 'ADMIN'), async (req, res) => {
     const audience = req.body?.audience;
     const subject = typeof req.body?.subject === 'string' ? req.body.subject.trim().slice(0, 120) : '';
     const message = typeof req.body?.message === 'string' ? req.body.message.trim().slice(0, 5000) : '';
@@ -419,5 +419,5 @@ $('send-btn').addEventListener('click', function () {
 });
 </script></body></html>`;
 
-  app.get('/admin/event', requireAdmin, (req, res) => res.type('html').send(PAGE));
+  app.get('/admin/event', requireRole('OWNER', 'ADMIN'), (req, res) => res.type('html').send(PAGE));
 }
