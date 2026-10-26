@@ -525,6 +525,7 @@ const APP_PAGE = `${baseHead('Admin app', APP_CSS)}
       <li><a href="/admin/pricing">Prices, codes &amp; promoters</a></li>
       <li><a href="/admin/pickup">Sizes &amp; pickup</a></li>
       <li><a href="/admin/event">Event &amp; messages</a></li>
+      <li><a href="/admin/event#guide">Guide</a></li>
       <li><a href="/admin/site">Site, contact, terms &amp; FAQ</a></li>
       <li><a href="/admin/tickets">Tickets &amp; tables</a></li>
       <li><a href="/door">Door scanner</a></li>

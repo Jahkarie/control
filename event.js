@@ -1,11 +1,13 @@
 // event.js: event details guests see in their account, and email updates to groups of guests.
 // The details belong to the current event (columns on its events row, see events.js); its name is the title of the
 // guest's event page. "When", the general details and the poster show to every approved guest. The paid-only details
-// (meetup spot, pickup info) and the location are only sent to guests whose order for this event is paid.
+// (meetup spot, pickup info), the location and the event guide (guide.js, once published) are only sent to guests whose
+// order for this event is paid.
 // Guests still waiting for approval, or declined, get nothing.
 import { WM_LITE } from './brand.js';
 import { renderEmail } from './emails.js';
 import { CUR } from './events.js';
+import { publishedGuide, guideAdmin } from './guide.js';
 
 // The poster is an https:// link, or an image in the guest site repo like "art/poster.jpg": the same checks site.js
 // uses for sponsor logos, so the guest site can load it the same way.
@@ -64,6 +66,9 @@ export function registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, req
       if (!g.rowCount || (g.rows[0].approval && g.rows[0].approval !== 'APPROVED')) return res.json(NOTHING);
       const ev = await getEvent();
       const paid = await pool.query(`SELECT 1 FROM orders WHERE LOWER(guest_email) = $1 AND status = 'PAID' AND event_id = ${CUR} LIMIT 1`, [req.userEmail]);
+      // The guide: the published copy, for a paid guest of this event only (a free pass counts). Everyone else gets no
+      // guide key at all, and an older guest site ignores it.
+      const guide = paid.rowCount ? await publishedGuide(pool) : null;
       res.json({
         name: ev.name,
         when: ev.when, info: ev.info,
@@ -72,7 +77,8 @@ export function registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, req
         has_paid_info: !!ev.paid_info,
         // Like paid_info: only once the guest's order is paid.
         location: paid.rowCount ? ev.location : '',
-        poster: ev.poster
+        poster: ev.poster,
+        ...(guide ? { guide } : {})
       });
     } catch (err) {
       console.error(err);
@@ -124,7 +130,7 @@ export function registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, req
       // The current event's sends (?event=all: every event's, for the reset page's copy).
       const all = req.query.event === 'all';
       const log = await pool.query(
-        `SELECT b.id, b.audience, b.subject, b.recipients, b.sent, b.failed, b.created_at, b.event_id${all ? ', b.message' : ''}
+        `SELECT b.id, b.audience, b.subject, b.recipients, b.sent, b.failed, b.created_at, b.event_id, b.kind${all ? ', b.message' : ''}
          FROM broadcasts b ${all ? '' : `WHERE b.event_id = ${CUR}`} ORDER BY b.id DESC ${all ? '' : 'LIMIT 20'}`);
       res.json({ counts, log: log.rows });
     } catch (err) {
@@ -180,6 +186,8 @@ export function registerEvent({ app, pool, resend, EMAIL_FROM, FRONTEND_URL, req
     }
   });
 
+  // The Guide section (guide.js): its editor, the live preview and the publish bar.
+  const GUIDE = guideAdmin({ FRONTEND_URL, WM: WM_LITE });
   const PAGE = `<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex"><meta name="theme-color" content="#0a0a0b">
@@ -257,6 +265,7 @@ td .bad { color: var(--bad); }
 .poster img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .poster .frame span { font-family: var(--mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--dim); text-align: center; padding: 6px; }
 .poster p { margin: 0; color: var(--muted); font-size: 13px; }
+${GUIDE.css}
 </style></head><body>
 <header class="top">
   <div class="brand"><svg class="mark" viewBox="0 0 30 18" aria-hidden="true" focusable="false"><path fill="#e4e3df" d="M0 6h30v12H0z"/><path fill="#0a0a0b" d="M18.2 0h5.6l-4.6 18h-5.6z"/><path fill="#ff5a1f" d="M19.6 0h2.8l-4.6 18h-2.8z"/></svg><b>ON D<span>'</span> <i>ROAD</i></b><span class="sub">Command Center</span></div>
@@ -286,6 +295,8 @@ td .bad { color: var(--bad); }
     <small id="poster-help">The cover at the top of each approved guest's account. Add the file to the guest site repo and enter its path, like <code>art/poster.jpg</code>, or paste any https:// image link. PNG, JPG, SVG, WebP or GIF; a wide image works best.</small>
     <div class="foot"><button id="ev-save" type="button">Save details</button><span id="ev-msg" class="msg" role="status"></span></div>
   </section>
+
+${GUIDE.html}
 
   <section class="card" aria-labelledby="bc-h">
     <h2 id="bc-h">Email guests</h2>
@@ -371,7 +382,7 @@ function loadLog() {
     var tb = document.createElement('tbody');
     d.log.forEach(function (x) {
       var tr = document.createElement('tr');
-      [fmt(x.created_at), x.subject, LABELS[x.audience] || x.audience].forEach(function (v) { var td = document.createElement('td'); td.textContent = v; tr.appendChild(td); });
+      [fmt(x.created_at), (x.kind === 'GUIDE' ? '[ Guide ] ' : '') + x.subject, LABELS[x.audience] || x.audience].forEach(function (v) { var td = document.createElement('td'); td.textContent = v; tr.appendChild(td); });
       var td = document.createElement('td'); td.className = 'num'; td.textContent = x.sent + ' of ' + x.recipients;
       if (x.failed) { var s = document.createElement('span'); s.className = 'bad'; s.textContent = ' · ' + x.failed + ' failed'; td.appendChild(s); }
       tr.appendChild(td); tb.appendChild(tr);
@@ -417,7 +428,8 @@ $('send-btn').addEventListener('click', function () {
     .catch(function () { say('bc-msg', 'Lost connection. Check the Sent list before trying again.'); })
     .then(function () { b.disabled = false; });
 });
-</script></body></html>`;
+</script>
+<script>${GUIDE.js}</script></body></html>`;
 
   app.get('/admin/event', requireRole('OWNER', 'ADMIN'), (req, res) => res.type('html').send(PAGE));
 }

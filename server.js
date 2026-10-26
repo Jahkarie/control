@@ -7,6 +7,7 @@ import { registerPayments } from './payments.js';
 import { renderEmail } from './emails.js';
 import { registerDoor } from './door.js';
 import { registerEvent } from './event.js';
+import { registerGuide } from './guide.js';
 import { registerSite } from './site.js';
 import { registerPayPal } from './paypal.js';
 import { registerPricing, loadTiers, priceOf, checkPromo, discountFor, withStates, cleanCode,
@@ -280,6 +281,8 @@ const ticketDoor = createTicketDoor({ pool, TOKEN_SECRET });
 registerDoor({ app, pool, express, ADMIN_KEY, TOKEN_SECRET, safeEqual, rateLimit, requireRole, ticketDoor, auth, onRefused: adminApp.doorRefused });
 // Contact details and terms (see site.js). Also before the 10kb limit: the terms can be longer than that.
 const site = registerSite({ app, pool, express, requireRole, lock });
+// The event guide's admin routes (see guide.js). Also before the 10kb limit: a full guide can be bigger.
+registerGuide({ app, pool, express, resend, EMAIL_FROM, FRONTEND_URL, requireRole });
 // The ticket site (see tickets.js): its own lock (registered here, so it guards /api/tickets/* before any route), its API
 // and /admin/tickets. Before the 10kb limit too: its routes bring their own body parsers. mail is set up further down,
 // so it's reached through a wrapper.
@@ -516,6 +519,14 @@ async function ensureSchema() {
     ALTER TABLE invites ADD COLUMN IF NOT EXISTS event_id INTEGER REFERENCES events(id);
     ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS promoter_id INTEGER REFERENCES promoters(id) ON DELETE SET NULL;
     ALTER TABLE invites ADD COLUMN IF NOT EXISTS promoter_id INTEGER REFERENCES promoters(id) ON DELETE SET NULL;
+    -- The event guide (guide.js): the draft, the copy paid guests see, and when it was published, emailed and saved.
+    ALTER TABLE events ADD COLUMN IF NOT EXISTS guide JSONB;
+    ALTER TABLE events ADD COLUMN IF NOT EXISTS guide_published JSONB;
+    ALTER TABLE events ADD COLUMN IF NOT EXISTS guide_published_at TIMESTAMPTZ;
+    ALTER TABLE events ADD COLUMN IF NOT EXISTS guide_notified_at TIMESTAMPTZ;
+    ALTER TABLE events ADD COLUMN IF NOT EXISTS guide_updated_at TIMESTAMPTZ;
+    -- What a group email was: an organizer's message, or the guide's "Your guide is ready" (GUIDE).
+    ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'MESSAGE';
     -- A row written without an event_id (an older backend still running during a deploy, or SQL by hand) belongs to the
     -- current event. A column default can't hold a subquery, so it goes through this function.
     CREATE OR REPLACE FUNCTION current_event_id() RETURNS INTEGER LANGUAGE sql STABLE AS $fn$ SELECT id FROM events WHERE status = 'current' $fn$;
